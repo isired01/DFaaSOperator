@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- dfaas_v1_esperimento.yaml
+#+kubebuilder:scaffold:manifestskustomizesamples

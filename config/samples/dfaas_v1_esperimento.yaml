@@ -1,0 +1,9 @@
+apiVersion: dfaas.dfaas.io/v1
+kind: Esperimento
+metadata:
+  labels:
+    app.kubernetes.io/name: dfaas-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: esperimento-sample
+spec:
+  # TODO(user): Add fields here

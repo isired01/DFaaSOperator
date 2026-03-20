@@ -1,0 +1,154 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.14.0
+  name: esperimentos.dfaas.dfaas.io
+spec:
+  group: dfaas.dfaas.io
+  names:
+    kind: Esperimento
+    listKind: EsperimentoList
+    plural: esperimentos
+    singular: esperimento
+  scope: Namespaced
+  versions:
+  - name: v1
+    schema:
+      openAPIV3Schema:
+        description: Esperimento è lo schema per l'API degli esperimenti
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: EsperimentoSpec definisce lo stato desiderato di Esperimento
+            properties:
+              federazione:
+                properties:
+                  nodi:
+                    items:
+                      properties:
+                        funzioni:
+                          items:
+                            type: string
+                          type: array
+                        idNodo:
+                          type: string
+                        idVicini:
+                          additionalProperties:
+                            type: integer
+                          type: object
+                        tipoNodo:
+                          type: string
+                      required:
+                      - funzioni
+                      - idNodo
+                      - tipoNodo
+                      type: object
+                    type: array
+                  strategia:
+                    type: string
+                required:
+                - nodi
+                - strategia
+                type: object
+              metriche:
+                items:
+                  properties:
+                    commento:
+                      type: string
+                    query:
+                      type: string
+                  required:
+                  - query
+                  type: object
+                type: array
+              nome:
+                type: string
+              profiloCarico:
+                properties:
+                  commonHeaders:
+                    type: string
+                  scenari:
+                    items:
+                      properties:
+                        body:
+                          type: string
+                        dataPath:
+                          type: string
+                        esecutore:
+                          type: string
+                        nomeFunzioneTarget:
+                          type: string
+                        nomeScenario:
+                          type: string
+                        stages:
+                          items:
+                            properties:
+                              durata:
+                                type: string
+                              targetRps:
+                                type: integer
+                            required:
+                            - durata
+                            - targetRps
+                            type: object
+                          type: array
+                        startTime:
+                          type: integer
+                        targetNodeID:
+                          type: string
+                        vuAllocati:
+                          type: integer
+                      required:
+                      - esecutore
+                      - nomeFunzioneTarget
+                      - nomeScenario
+                      - stages
+                      - targetNodeID
+                      - vuAllocati
+                      type: object
+                    type: array
+                required:
+                - scenari
+                type: object
+              versione:
+                type: string
+            required:
+            - federazione
+            - nome
+            - profiloCarico
+            - versione
+            type: object
+          status:
+            description: EsperimentoStatus definisce lo stato osservato di Esperimento
+            properties:
+              fase:
+                description: 'Fase dell''automa: IDLE, VALIDAZIONE_FILE, PROVISIONING,
+                  READY, RUNNING, COOL_DOWN, EXPORT_METRICHE, RESULTS, CLEANUP, FAIL'
+                type: string
+              message:
+                description: Messaggio di dettaglio (es. motivo di un fallimento)
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -1,0 +1,46 @@
+apiVersion: dfaas.dfaas.io/v1
+kind: Esperimento
+metadata:
+  name: exp-saturazione-milano
+spec:
+  nome: "Test"
+  versione: "1.0.0"
+  # 1. METRICHE DA OSSERVARE
+  metriche:
+     -  query: "sum(irate(container_cpu_usage_seconds_total[1m]))"
+        commento: "CPU totale consumata dai pod DFaaS"
+
+  # 2. CONFIGURAZIONE DELLA FEDERAZIONE (I target)
+  federazione:
+    strategia: "NODE_MARGI"
+    nodi:
+      - idNodo: "milano-edge-01"
+        tipoNodo: "MEDIUMl"
+        funzioni: ["image-proc", "face-det"]
+        idVicini:
+          "torino-edge-02": 100 # latenza del link in MS
+      - idNodo: "torino-edge-02"
+        tipoNodo: "LOW"
+        funzioni: ["image-proc"]
+
+  # 3. PROFILO DI CARICO (Cosa deve fare il controller)
+  profiloCarico:
+    commonHeaders: "headers.."
+    scenari:
+      - nomeScenario: "test1"
+        targetNodeID: "milano-edge-01"
+        nomeFunzioneTarget: "image-proc"
+        body: '{"image": "test.jpg"}'
+        esecutore: "RAMPING_ARRIVAL_RATE"
+        vuAllocati: 100
+        startTime: 0
+        stages:
+          - durata: "30s"
+            targetRps: 10
+          - durata: "1m"
+            targetRps: 50
+          - durata: "30s"
+            targetRps: 0
+
+---
+# Lo Status non lo scriviamo noi, lo scriverà il Controller!
