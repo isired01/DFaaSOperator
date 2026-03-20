@@ -22,9 +22,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"time"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	dfaasv1 "dfaas-operator/api/v1"
 )
@@ -62,40 +62,38 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// CONTROLLO SE L'OGGETTO È IN FASE DI CANCELLAZIONE
-    if esperimento.ObjectMeta.DeletionTimestamp.IsZero() {
-        // L'oggetto NON è in fase di cancellazione, quindi aggiungiamo il finalizer
-        if !controllerutil.ContainsFinalizer(&esperimento, esperimentoFinalizer) {
-            controllerutil.AddFinalizer(&esperimento, esperimentoFinalizer)
-            if err := r.Update(ctx, &esperimento); err != nil {
-                return ctrl.Result{}, err
-            }
-        }
-    } else {
-        // L'oggetto È in fase di cancellazione
-        if controllerutil.ContainsFinalizer(&esperimento, esperimentoFinalizer) {
-            // ESEGUIAMO LA PULIZIA DELLE VM
-            log.Info("🗑️ Risorsa in cancellazione: pulizia VM in corso...")
-            r.cancellaMacchineVirtuali(esperimento)
+	if esperimento.ObjectMeta.DeletionTimestamp.IsZero() {
+		// L'oggetto NON è in fase di cancellazione, quindi aggiungiamo il finalizer
+		if !controllerutil.ContainsFinalizer(&esperimento, esperimentoFinalizer) {
+			controllerutil.AddFinalizer(&esperimento, esperimentoFinalizer)
+			if err := r.Update(ctx, &esperimento); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	} else {
+		// L'oggetto È in fase di cancellazione(lancio k delete)
+		if controllerutil.ContainsFinalizer(&esperimento, esperimentoFinalizer) {
+			// ESEGUIAMO LA PULIZIA DELLE VM
+			log.Info("🗑️ Risorsa in cancellazione: pulizia VM in corso...")
 
-            // Rimuoviamo il finalizer per permettere a K8s di eliminare l'oggetto
-            controllerutil.RemoveFinalizer(&esperimento, esperimentoFinalizer)
-            if err := r.Update(ctx, &esperimento); err != nil {
-                return ctrl.Result{}, err
-            }
-        }
-        return ctrl.Result{}, nil
-    }
+			// Rimuoviamo il finalizer per permettere a K8s di eliminare l'oggetto
+			controllerutil.RemoveFinalizer(&esperimento, esperimentoFinalizer)
+			if err := r.Update(ctx, &esperimento); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
 
 	//Monitoraggio dello spegnimento dell'operatore
 	go func() {
-	    <-ctx.Done() // Si sblocca solo quando premi CTRL+C
-	    // Qui inserisci la logica di emergenza
-	    log.Info("⚠️ Shutdown rilevato! Avvio cancellazione d'emergenza VM...")
-	    r.cancellaMacchineVirtuali(esperimento)
+		<-ctx.Done() // Si sblocca solo quando premi CTRL+C
+		// Qui inserisci la logica di emergenza
+		log.Info("⚠️ Shutdown rilevato! Avvio cancellazione d'emergenza VM...")
 	}()
 
 	// 2. Log di cortesia per vedere che sta funzionando
-	log.Info("🔍 Rilevato Esperimento:", "Fase Attuale", esperimento.Status.Fase)
+	//log.Info("🔍 Rilevato Esperimento:", "Fase Attuale", esperimento.Status.Fase)
 
 	// 3. LOGICA DELL'AUTOMA A STATI
 	switch esperimento.Status.Fase {
