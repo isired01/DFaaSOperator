@@ -25,12 +25,12 @@ spec:
 
   # 3. PROFILO DI CARICO (Cosa deve fare il controller)
   profiloCarico:
-    commonHeaders: "headers.."
+    commonHeaders: "'Content-Type':'text/plain'"
     scenari:
       - nomeScenario: "test1"
-        targetNodeID: "milano-edge-01"
-        nomeFunzioneTarget: "image-proc"
-        body: '{"image": "test.jpg"}'
+        targetNodeID: "192.168.64.3:31112"
+        nomeFunzioneTarget: "figlet"
+        body: 'test carico da venticinque'
         esecutore: "RAMPING_ARRIVAL_RATE"
         vuAllocati: 100
         startTime: 0

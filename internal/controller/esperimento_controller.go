@@ -17,14 +17,19 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
+	"text/template"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"                   // Per ConfigMap
+	"k8s.io/apimachinery/pkg/api/errors"          // Per errors.IsAlreadyExists
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // Per ObjectMeta
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"time"
 
 	dfaasv1 "dfaas-operator/api/v1"
 )
@@ -113,7 +118,35 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		log.Info("🚀 L'esperimento è pronto. Devo lanciare k6...")
 		log.Info(" Lancio k6: READY -> RUNNING")
 		time.Sleep(3 * time.Second)
-		// Qui aggiungeremo la logica per creare il Job di k6
+
+		log.Info("🛠️ Generazione script k6...")
+
+		scriptJS, err := r.generaScriptK6(&esperimento)
+		if err != nil {
+			log.Error(err, "Errore nella generazione dello script")
+			return r.updateStatus(ctx, &esperimento, "FAILED")
+		}
+
+		// Definiamo la ConfigMap
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      esperimento.Name + "-script-k6",
+				Namespace: esperimento.Namespace,
+			},
+			Data: map[string]string{
+				"test.js": scriptJS,
+			},
+		}
+
+		// La creiamo su Kubernetes
+		if err := r.Create(ctx, cm); err != nil {
+			if !errors.IsAlreadyExists(err) {
+				log.Error(err, "Errore creazione ConfigMap")
+				return r.updateStatus(ctx, &esperimento, "FAILED")
+			}
+		}
+
+		log.Info("✅ ConfigMap creata con successo!")
 		return r.updateStatus(ctx, &esperimento, "RUNNING")
 
 	case "RUNNING":
@@ -164,4 +197,56 @@ func (r *EsperimentoReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&dfaasv1.Esperimento{}).
 		Complete(r)
+}
+
+const k6Template = `
+import http from 'k6/http';
+import { sleep } from 'k6';
+
+{{- $scenario := index .Spec.Profilo.Scenari 0 }}
+{{- $profilo := .Spec.Profilo }}
+
+export const options = {
+  scenarios: {
+    "{{ $scenario.NomeScenario }}": {
+      executor: 'ramping-arrival-rate',
+      startRate: {{ $scenario.StartTime }},
+      timeUnit: '1s',
+      preAllocatedVUs: {{ $scenario.VuAllocati }},
+      stages: [
+        {{- range $scenario.Stages }}
+        { duration: '{{ .Durata }}', target: {{ .TargetRps }} },
+        {{- end }}
+      ],
+    },
+  },
+};
+
+export default function () {
+  const url = 'http://{{ $scenario.TargetNodeID }}/function/{{ $scenario.NomeFunzioneTarget }}';
+  const payload = '{{ $scenario.Body }}';
+	const params = {
+	    headers: {
+	      {{ $profilo.CommonHeaders }} 
+	    },
+	  };
+
+  http.post(url, payload, params);
+}
+`
+
+func (r *EsperimentoReconciler) generaScriptK6(exp *dfaasv1.Esperimento) (string, error) {
+	// Crea il template
+	tmpl, err := template.New("k6").Parse(k6Template)
+	if err != nil {
+		return "", err
+	}
+
+	// Esegue il template usando l'oggetto 'exp' come sorgente dati
+	var script bytes.Buffer
+	if err := tmpl.Execute(&script, exp); err != nil {
+		return "", err
+	}
+
+	return script.String(), nil
 }
