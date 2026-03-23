@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-central
+  namespace: monitoring
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+        # CONTAINER 1: Prometheus
+        - name: prometheus
+          image: quay.io/prometheus/prometheus:v3.5.0
+
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--web.enable-lifecycle" # Abilita il ricaricamento via HTTP
+            - "--storage.tsdb.retention.size=4GB"
+            - "--web.enable-remote-write-receiver"
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+            - name: targets-volume
+              mountPath: /etc/prometheus/targets
+            - name: storage-volume
+              mountPath: /prometheus
+
+        # CONTAINER 2: Config-Reloader (Sidecar)
+        - name: config-reloader
+          image: jimmidyson/configmap-reload:v0.5.0
+          args:
+            - "--volume-dir=/etc/prometheus/targets"
+            - "--webhook-url=http://localhost:9090/-/reload"
+          volumeMounts:
+            - name: targets-volume
+              mountPath: /etc/prometheus/targets
+
+      volumes:
+        - name: config-volume
+          configMap:
+            name: prometheus-main-config
+        - name: targets-volume
+          configMap:
+            name: prometheus-targets
+        - name: storage-volume
+          persistentVolumeClaim:
+            claimName: prometheus-pvc # Assicurati di avere un PVC creato!

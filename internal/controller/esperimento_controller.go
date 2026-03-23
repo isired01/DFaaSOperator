@@ -19,9 +19,11 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"text/template"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"                   // Per ConfigMap
 	"k8s.io/apimachinery/pkg/api/errors"          // Per errors.IsAlreadyExists
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // Per ObjectMeta
@@ -40,9 +42,18 @@ type EsperimentoReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+type PrometheusTarget struct {
+	Targets []string          `json:"targets"`
+	Labels  map[string]string `json:"labels"`
+}
+
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=esperimentos,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=esperimentos/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=esperimentos/finalizers,verbs=update
+
+//+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=pods,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -53,6 +64,115 @@ type EsperimentoReconciler struct {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.17.3/pkg/reconcile
+
+// reconcilePrometheusTargets gestisce la registrazione dinamica dei target di monitoraggio.
+// Implementa il pattern "File-Based Service Discovery" di Prometheus: invece di modificare
+// la configurazione globale, l'operatore inietta un file JSON dedicato all'esperimento
+// in una ConfigMap condivisa montata nel pod di monitoraggio.
+//
+// Flusso operativo:
+// 1. Definisce i target (IP e Porte) e applica label identificative (id_esperimento)
+//    per permettere a Grafana di filtrare i dati di questo specifico test.
+// 2. Serializza la struttura in formato JSON compatibile con Prometheus SD.
+// 3. Aggiorna la ConfigMap 'prometheus-targets' nel namespace 'monitoring'.
+// 4. Sfrutta il sidecar 'config-reloader' per notificare Prometheus del nuovo file
+//    senza causare il riavvio del servizio, garantendo continuità nella raccolta metriche.
+
+func (r *EsperimentoReconciler) reconcilePrometheusTargets(ctx context.Context, exp *dfaasv1.Esperimento) error {
+	log := log.FromContext(ctx)
+
+	/*
+		// 1. Costruiamo la lista dei target dai nodi della federazione
+		var targets []PrometheusTarget
+
+
+		for _, nodo := range exp.Spec.Federazione.Nodi {
+			// Nota: Assumiamo che l'IP sia raggiungibile e che il Node Exporter sia sulla porta 9100
+			// Se non hai il campo IP esplicito, dovremo ricavarlo o usare l'ID se risolvibile via DNS
+			target := PrometheusTarget{
+				Targets: []string{nodo.IdNodo + ":30903"}, // O usa l'IP se l'hai aggiunto allo struct
+				Labels: map[string]string{					// 30903 è la porta per tutti i prometeus
+					"esperimento": exp.Name,				//su tutti i nodi DFaaS
+					"nodo_id":     nodo.IdNodo,
+					"tipo_nodo":   nodo.TipoNodo,
+				},
+			}
+			targets = append(targets, target)
+		}
+	*/
+
+	staticIP := "192.168.64.3:30662"
+	targets := []PrometheusTarget{
+		{
+			Targets: []string{staticIP},
+			Labels: map[string]string{
+				"esperimento": exp.Name,
+				"nodo_id":     "nodo-test-statico",
+				"tipo_nodo":   "QEMU-VM",
+			},
+		},
+	}
+
+	// 2. Serializziamo in JSON
+	jsonData, err := json.Marshal(targets)
+	if err != nil {
+		return err
+	}
+
+	// 3. Recuperiamo la ConfigMap globale dei target
+	cm := &corev1.ConfigMap{}
+	cmKey := client.ObjectKey{Name: "prometheus-targets", Namespace: "monitoring"}
+	if err := r.Get(ctx, cmKey, cm); err != nil {
+		return err
+	}
+
+	// 4. Inseriamo il file specifico per questo esperimento
+	if cm.Data == nil {
+		cm.Data = make(map[string]string)
+	}
+
+	fileName := exp.Name + ".json"
+	cm.Data[fileName] = string(jsonData)
+
+	// 5. Update su Kubernetes
+	if err := r.Update(ctx, cm); err != nil {
+		log.Error(err, "Impossibile aggiornare la ConfigMap dei target")
+		return err
+	}
+
+	log.Info("🎯 Target di monitoraggio aggiornati in Prometheus", "file", fileName)
+	return nil
+}
+
+// cleanupPrometheusTargets rimuove il file di configurazione specifico dell'esperimento
+// dalla ConfigMap di Prometheus. Questa operazione interrompe il monitoraggio dei nodi
+// associati a questo test, liberando risorse nel database centrale.
+func (r *EsperimentoReconciler) cleanupPrometheusTargets(ctx context.Context, exp *dfaasv1.Esperimento) error {
+	log := log.FromContext(ctx)
+
+	// 1. Recuperiamo la ConfigMap globale dei target
+	cm := &corev1.ConfigMap{}
+	cmKey := client.ObjectKey{Name: "prometheus-targets", Namespace: "monitoring"}
+	if err := r.Get(ctx, cmKey, cm); err != nil {
+		// Se la ConfigMap non esiste, non c'è nulla da pulire
+		return client.IgnoreNotFound(err)
+	}
+
+	// 2. Verifichiamo se il file dell'esperimento esiste e lo rimuoviamo
+	fileName := exp.Name + ".json"
+	if _, esiste := cm.Data[fileName]; esiste {
+		delete(cm.Data, fileName)
+
+		// 3. Update della ConfigMap per notificare il Sidecar della rimozione
+		if err := r.Update(ctx, cm); err != nil {
+			log.Error(err, "Errore durante la rimozione del file JSON da Prometheus targets")
+			return err
+		}
+		log.Info("🗑️ Target di monitoraggio rimossi con successo", "file", fileName)
+	}
+
+	return nil
+}
 
 const esperimentoFinalizer = "dfaas.dfaas.io/finalizer"
 
@@ -74,18 +194,31 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			if err := r.Update(ctx, &esperimento); err != nil {
 				return ctrl.Result{}, err
 			}
+			// FONDAMENTALE: Dopo l'Update, devi uscire dal Reconcile.
+			// Kubernetes ti richiamerà subito con l'oggetto aggiornato.
+			return ctrl.Result{}, nil
 		}
 	} else {
-		// L'oggetto È in fase di cancellazione(lancio k delete)
+		// L'oggetto È in fase di cancellazione (lancio k delete)
 		if controllerutil.ContainsFinalizer(&esperimento, esperimentoFinalizer) {
-			// ESEGUIAMO LA PULIZIA DELLE VM
-			log.Info("🗑️ Risorsa in cancellazione: pulizia VM in corso...")
+			log.Info("🗑️ Risorsa in cancellazione: avvio pulizia...")
 
-			// Rimuoviamo il finalizer per permettere a K8s di eliminare l'oggetto
+			// --- PULIZIA PROMETHEUS ---
+			if err := r.cleanupPrometheusTargets(ctx, &esperimento); err != nil {
+				log.Error(err, "Impossibile pulire i target di Prometheus")
+				return ctrl.Result{}, err
+			}
+
+			// --- PULIZIA VM ---
+			log.Info("☁️ Pulizia infrastruttura VM in corso...")
+
+			// Rimuoviamo il finalizer
 			controllerutil.RemoveFinalizer(&esperimento, esperimentoFinalizer)
 			if err := r.Update(ctx, &esperimento); err != nil {
 				return ctrl.Result{}, err
 			}
+			// Anche qui, dopo aver rimosso il finalizer e fatto Update, usciamo.
+			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, nil
 	}
@@ -115,19 +248,26 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.updateStatus(ctx, &esperimento, "READY")
 
 	case "READY":
-		log.Info("🚀 L'esperimento è pronto. Devo lanciare k6...")
-		log.Info(" Lancio k6: READY -> RUNNING")
-		time.Sleep(3 * time.Second)
+
+		log.Info("🚀 Preparazione Prometheus in corso...")
+
+		// 1. Iniezione Target in Prometheus (NUOVO)
+		log.Info("🎯 Configurazione monitoraggio Prometheus...")
+		if err := r.reconcilePrometheusTargets(ctx, &esperimento); err != nil {
+			log.Error(err, "Errore nella configurazione dei target Prometheus")
+			return r.updateStatus(ctx, &esperimento, "FAILED")
+		}
+
+		log.Info("🚀Devo lanciare k6...")
 
 		log.Info("🛠️ Generazione script k6...")
-
 		scriptJS, err := r.generaScriptK6(&esperimento)
 		if err != nil {
 			log.Error(err, "Errore nella generazione dello script")
 			return r.updateStatus(ctx, &esperimento, "FAILED")
 		}
 
-		// Definiamo la ConfigMap
+		// 1. Crea la ConfigMap
 		cm := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      esperimento.Name + "-script-k6",
@@ -138,7 +278,6 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			},
 		}
 
-		// La creiamo su Kubernetes
 		if err := r.Create(ctx, cm); err != nil {
 			if !errors.IsAlreadyExists(err) {
 				log.Error(err, "Errore creazione ConfigMap")
@@ -146,30 +285,62 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 		}
 
-		log.Info("✅ ConfigMap creata con successo!")
+		// 2. LANCIA IL JOB (Chiamata alla funzione che hai scritto in fondo)
+		log.Info("🚢 Lancio del Job k6...")
+		if err := r.runK6Job(ctx, &esperimento); err != nil {
+			if !errors.IsAlreadyExists(err) {
+				log.Error(err, "Errore creazione Job k6")
+				return r.updateStatus(ctx, &esperimento, "FAILED")
+			}
+		}
+
+		log.Info("✅ ConfigMap e Job creati con successo!")
 		return r.updateStatus(ctx, &esperimento, "RUNNING")
 
 	case "RUNNING":
-		log.Info("⏳ k6 sta generando il carico...")
-		log.Info("RUNNING -> COOLDOWN")
-		time.Sleep(3 * time.Second)
-		// Qui controlleremo se il pod di k6 ha finito
-		return r.updateStatus(ctx, &esperimento, "COOLDOWN")
+		log.Info("⏳ Monitoraggio esecuzione k6...")
+
+		// 1. Recuperiamo il Job dal cluster
+		var job batchv1.Job
+		jobKey := client.ObjectKey{Name: esperimento.Name + "-k6-job", Namespace: esperimento.Namespace}
+
+		if err := r.Get(ctx, jobKey, &job); err != nil {
+			log.Error(err, "Impossibile recuperare lo stato del Job k6")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		// 2. Controlliamo le condizioni del Job
+		if job.Status.Succeeded > 0 {
+			log.Info("✅ k6 ha terminato con successo! Passaggio a COOLDOWN.")
+			return r.updateStatus(ctx, &esperimento, "COOLDOWN")
+		}
+
+		if job.Status.Failed > 0 {
+			log.Error(nil, "❌ Il Job k6 è fallito!")
+			return r.updateStatus(ctx, &esperimento, "FAILED")
+		}
+
+		// 3. Se è ancora in esecuzione, non fare nulla e ricontrolla tra 10 secondi
+		log.Info("... k6 sta ancora generando carico ...")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 
 	case "COOLDOWN":
 		log.Info("⏳ Aspetto che le metriche finiscano di arrivare")
 		log.Info("COOLDOWN -> COMPLETED")
-		time.Sleep(3 * time.Second)
+		time.Sleep(30 * time.Second)
 		return r.updateStatus(ctx, &esperimento, "COMPLETED")
+
+	case "COMPLETED":
+		log.Info("Esperimento completato")
+		time.Sleep(3 * time.Second) // apro grafana e mostro i risultati
+		return r.updateStatus(ctx, &esperimento, "CLEANUP")
 
 	case "CLEANUP":
 		log.Info("🧹 Pulizia risorse...")
 		time.Sleep(3 * time.Second)
-		return r.updateStatus(ctx, &esperimento, "")
+		//canellare prometesu
+		return r.updateStatus(ctx, &esperimento, "ENDED")
 
-	case "COMPLETED":
-		log.Info("Esperimento completato")
-		//da capire che fare qui nel senso che in che stato vado dopo questo?
 	}
 
 	return ctrl.Result{}, nil
@@ -177,11 +348,19 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 // Funzione per aggiornare la fase dell'esperimento
 func (r *EsperimentoReconciler) updateStatus(ctx context.Context, exp *dfaasv1.Esperimento, fase string) (ctrl.Result, error) {
-	exp.Status.Fase = fase
-	if err := r.Status().Update(ctx, exp); err != nil {
+	// 1. Rileggiamo l'oggetto fresco dal cluster per evitare conflitti di versione
+	latestExp := &dfaasv1.Esperimento{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(exp), latestExp); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{Requeue: true}, nil // Richiede un nuovo ciclo subito
+
+	// 2. Aggiorniamo la fase sulla versione appena scaricata
+	latestExp.Status.Fase = fase
+	if err := r.Status().Update(ctx, latestExp); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // Gestione dello stato iniziale
@@ -202,34 +381,44 @@ func (r *EsperimentoReconciler) SetupWithManager(mgr ctrl.Manager) error {
 const k6Template = `
 import http from 'k6/http';
 import { sleep } from 'k6';
+import { scenario } from 'k6/execution';
 
-{{- $scenario := index .Spec.Profilo.Scenari 0 }}
 {{- $profilo := .Spec.Profilo }}
 
 export const options = {
   scenarios: {
-    "{{ $scenario.NomeScenario }}": {
+    {{- range .Spec.Profilo.Scenari }}
+    "{{ .NomeScenario }}": {
       executor: 'ramping-arrival-rate',
-      startRate: {{ $scenario.StartTime }},
+      startRate: {{ .StartTime }},
       timeUnit: '1s',
-      preAllocatedVUs: {{ $scenario.VuAllocati }},
+      preAllocatedVUs: {{ .VuAllocati }},
+      maxVUs: {{ .VuAllocati }},
       stages: [
-        {{- range $scenario.Stages }}
+        {{- range .Stages }}
         { duration: '{{ .Durata }}', target: {{ .TargetRps }} },
         {{- end }}
       ],
+      // Passiamo i dati specifici dello scenario come variabili d'ambiente interne
+      env: { 
+        TARGET_URL: 'http://{{ .TargetNodeID }}/function/{{ .NomeFunzioneTarget }}',
+        BODY_CONTENT: '{{ .Body }}'
+      },
     },
+    {{- end }}
   },
 };
 
 export default function () {
-  const url = 'http://{{ $scenario.TargetNodeID }}/function/{{ $scenario.NomeFunzioneTarget }}';
-  const payload = '{{ $scenario.Body }}';
-	const params = {
-	    headers: {
-	      {{ $profilo.CommonHeaders }} 
-	    },
-	  };
+  // Ogni scenario legge le PROPRIE variabili d'ambiente definite sopra
+  const url = __ENV.TARGET_URL;
+  const payload = __ENV.BODY_CONTENT;
+  
+  const params = {
+    headers: {
+      {{ $profilo.CommonHeaders }} 
+    },
+  };
 
   http.post(url, payload, params);
 }
@@ -249,4 +438,67 @@ func (r *EsperimentoReconciler) generaScriptK6(exp *dfaasv1.Esperimento) (string
 	}
 
 	return script.String(), nil
+}
+
+func (r *EsperimentoReconciler) runK6Job(ctx context.Context, exp *dfaasv1.Esperimento) error {
+	terminate := int64(3000)
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      exp.Name + "-k6-job",
+			Namespace: exp.Namespace,
+		},
+		Spec: batchv1.JobSpec{
+			ActiveDeadlineSeconds: &terminate,
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:  "k6",
+							Image: "grafana/k6:1.4.2",
+							Args:  []string{"run", "/test/test.js", "--out", "experimental-prometheus-rw"},
+							Env: []corev1.EnvVar{
+								{
+									// URL dell'endpoint write di Prometheus (usando il DNS interno di K8s)
+									Name:  "K6_PROMETHEUS_RW_SERVER_URL",
+									Value: "http://prometheus-service.monitoring.svc.cluster.local:9090/api/v1/write",
+								},
+								{
+									// Specifichiamo quali statistiche vogliamo
+									Name:  "K6_PROMETHEUS_RW_TREND_STATS",
+									Value: "p(95),p(99),avg,max",
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "script-volume",
+									MountPath: "/test",
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "script-volume",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: exp.Name + "-script-k6", // Deve combaciare con la CM creata
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Imposta l'Esperimento come "proprietario" del Job (se cancelli l'esperimento, sparisce il job)
+	if err := ctrl.SetControllerReference(exp, job, r.Scheme); err != nil {
+		return err
+	}
+
+	return r.Create(ctx, job)
 }

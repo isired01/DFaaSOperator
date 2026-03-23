@@ -7,6 +7,18 @@ rules:
 - apiGroups:
   - dfaas.dfaas.io
   resources:
+  - configmaps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - dfaas.dfaas.io
+  resources:
   - esperimentos
   verbs:
   - create
@@ -30,3 +42,23 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - dfaas.dfaas.io
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - dfaas.dfaas.io
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
