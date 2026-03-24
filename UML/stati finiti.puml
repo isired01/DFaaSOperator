@@ -1,0 +1,83 @@
+@startuml
+skinparam backgroundColor #FFFFFF
+skinparam state {
+  BackgroundColor<<Error>> #FFCCCC
+  BorderColor<<Error>> #FF0000
+  FontStyle bold
+}
+
+title Automa a Stati Finiti - Lifecycle Esperimento DFaaS
+
+[*] --> IDLE : Accensione Framework
+
+state IDLE {
+  IDLE : PRONTO A RICEVERE FILE
+}
+
+IDLE --> VALIDAZIONE_FILE : CARICAMENTO CONFIG
+
+state VALIDAZIONE_FILE {
+  VALIDAZIONE_FILE : VALIDO?
+}
+
+VALIDAZIONE_FILE --> PROVISIONING : [FILE VALIDO]
+VALIDAZIONE_FILE --> FAIL : [FILE NON VALIDO]
+
+state PROVISIONING {
+  PROVISIONING : CLEANUP PRECEDENTE ESPERIMENTO (Se necessario)
+  PROVISIONING : COSTRUZIONE FEDERAZIONE
+  PROVISIONING : COSTRUZIONE VM (k6 + PROMETHEUS)
+}
+
+PROVISIONING --> READY : [FEDERAZIONE OK]
+PROVISIONING --> FAIL : [FAIL PROVISIONING]
+
+state READY {
+  READY : VMs ON
+  READY : READY
+}
+
+READY --> RUNNING : [TRIGGER START]
+READY --> FAIL : [FAIL READY]
+
+state RUNNING {
+  RUNNING : GENERAZIONE CARICO (k6)
+  RUNNING : LIVE METRICS
+}
+
+RUNNING --> COOL_DOWN : [CARICO FINITO]
+RUNNING --> FAIL : [FAIL RUNNING]
+
+state COOL_DOWN {
+  COOL_DOWN : ASPETTO ULTIME METRICHE
+}
+
+COOL_DOWN --> EXPORT_METRICHE : [METRICHE OK]
+
+state EXPORT_METRICHE {
+  EXPORT_METRICHE : Export metriche da vm con k6 e prometheus e salvo l'esperimento
+}
+
+EXPORT_METRICHE --> COMPLETED : [ESPORTAZIONE OK]
+
+state CLEANUP {
+  CLEANUP : CANCELLO FEDERAZIONE
+  CLEANUP : CANCELLO VM
+}
+
+COMPLETED -->  CLEANUP : [PULIZIA OK]
+
+state COMPLETED {
+  COMPLETED : MOSTRO RISULTATI
+}
+
+CLEANUP --> [*] : [Fine Esperimento]
+
+
+
+state FAIL <<Error>> {
+  FAIL : GESTIONE ERRORE
+}
+
+FAIL --> COMPLETED : Mostro risultati parziali e info su errore
+@enduml

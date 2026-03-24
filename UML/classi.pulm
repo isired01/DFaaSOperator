@@ -1,0 +1,94 @@
+@startuml
+title Classi Esperimento DFaaS (Allineato a v1 API Go)
+
+skinparam class {
+    BackgroundColor<<CRD>> #E1F5FE
+    BorderColor #01579B
+}
+
+class Esperimento <<CRD>> {
+    + metav1.TypeMeta typeMeta
+    + metav1.ObjectMeta metadata
+    + EsperimentoSpec spec
+    + EsperimentoStatus status
+}
+
+class EsperimentoSpec {
+    + String nome
+    + String versione
+    + List<ConfigurazoneMetrica> metriche
+    + ConfigurazioneFederazione federazione
+    + ProfiloCarico profilo
+}
+
+class EsperimentoStatus {
+    + String fase
+    + String message
+}
+
+class ConfigurazoneMetrica {
+    + String query
+    + String commento
+}
+
+class ConfigurazioneFederazione {
+    + String strategia
+    + List<ConfigurazioneNodo> nodi
+}
+
+class ConfigurazioneNodo {
+    + String idNodo
+    + String tipoNodo
+    + List<String> funzioni
+    + Map<String, Integer> idVicini
+}
+
+class ProfiloCarico {
+    + String commonHeaders
+    + List<Scenario> scenari
+}
+
+class Scenario {
+    + String nomeScenario
+    + String targetNodeID
+    + String nomeFunzioneTarget
+    + String body
+    + String dataPath
+    + String esecutore
+    + List<StageK6> stages
+    + Integer vuAllocati
+    + Integer startTime
+}
+
+class StageK6 {
+    + String durata
+    + Integer targetRps
+}
+
+' Relazioni di composizione (Spec/Status)
+Esperimento *-- EsperimentoSpec
+Esperimento *-- EsperimentoStatus
+
+' Relazioni Spec
+EsperimentoSpec *-- "many" ConfigurazoneMetrica
+EsperimentoSpec *-- ConfigurazioneFederazione
+EsperimentoSpec *-- ProfiloCarico
+
+' Relazioni Federazione
+ConfigurazioneFederazione *-- "many" ConfigurazioneNodo
+
+' Relazioni k6
+ProfiloCarico *-- "many" Scenario
+Scenario *-- "many" StageK6
+
+note right of EsperimentoStatus
+  Fasi: IDLE, PROVISIONING, 
+  READY, RUNNING, COOLDOWN, 
+  COMPLETED, FAILED, CLEANUP
+end note
+
+note bottom of ConfigurazioneNodo
+  idVicini mappa IDNodo -> Latenza(ms)
+end note
+
+@enduml
