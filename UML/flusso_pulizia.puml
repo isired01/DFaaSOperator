@@ -1,0 +1,31 @@
+@startuml
+skinparam backgroundColor #FFFFFF
+
+package "Custom Resource" {
+  [Esperimento (Parent)] as Exp #E1F5FE
+}
+
+package "Risorse Generate (Children)" {
+  [ConfigMap (Script k6)] as CM #FFF9C4
+  [Job (Esecutore k6)] as Job #C8E6C9
+}
+
+Exp *-- CM : OwnerReference
+Exp *-- Job : OwnerReference
+
+note bottom of Exp
+  Se l'utente lancia:
+  'kubectl delete esperimento'
+end note
+
+note right of CM
+  Eliminata automaticamente
+  dal Garbage Collector
+end note
+
+note right of Job
+  Eliminato automaticamente
+  (ferma il traffico k6)
+end note
+
+@enduml

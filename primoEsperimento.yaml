@@ -15,7 +15,7 @@ spec:
     strategia: "NODE_MARGI"
     nodi:
       - idNodo: "milano-edge-01"
-        tipoNodo: "MEDIUMl"
+        tipoNodo: "MEDIUM"
         funzioni: ["image-proc", "face-det"]
         idVicini:
           "torino-edge-02": 100 # latenza del link in MS

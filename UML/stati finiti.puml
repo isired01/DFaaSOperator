@@ -40,12 +40,10 @@ state READY {
 }
 
 state RUNNING {
-  StartK6 : Esecuzione Job k6 
-  StartK6 --> LiveObservability : OK
-  LiveObservability : Apertura Dashboard Grafana 
-  LiveObservability --> MonitoraggioJob : Polling
   MonitoraggioJob : Verifica completamento 
   MonitoraggioJob : o fallimento del Job
+
+  LiveObservability : Apertura Dashboard Grafana 
 
 }
 
@@ -55,6 +53,7 @@ state COOLDOWN {
 }
 
 state COMPLETED {
+  CLEANUP : Pulizia risorse
 
 }
 
