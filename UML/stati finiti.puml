@@ -1,79 +1,76 @@
 @startuml
 skinparam backgroundColor #FFFFFF
 skinparam state {
+  BackgroundColor #E1F5FE
+  BorderColor #01579B
   BackgroundColor<<Error>> #FFCCCC
   BorderColor<<Error>> #FF0000
-  FontStyle bold
 }
 
-title Automa a Stati Finiti - Lifecycle Esperimento DFaaS (v2026)
+title Architettura Logica delle Fasi dell'Esperimento
 
-[*] --> IDLE : Deploy Operatore
+[*] --> IDLE 
 
-state IDLE {
-  IDLE : Attesa Risorsa Custom (CR)
+state IDLE{
+  IDLE : Attesa creazione Esperimento (Attesa CDR)
 }
 
-IDLE --> PROVISIONING : [New Esperimento]
+IDLE --> Validazione_file : Esperimento Creato
+
+
+Validazione_file --> PROVISIONING : File Validato
+
 
 state PROVISIONING {
-  PROVISIONING : Verifica Infrastruttura (Prometheus/Grafana)
-  PROVISIONING : Setup Federazione Nodi Edge
-  PROVISIONING : Cleanup Target Residui
-}
+  CLEANUP : Pulizia risorse preesistenti
+  CLEANUP --> CostruzioneFederazione : OK
+  CostruzioneFederazione : Costruisco DFaaS Desiderato
+  CostruzioneFederazione --> VerificaProvisioning : OK
+  VerificaProvisioning : Verifico che tutto sia pronto
+  VerificaProvisioning : (Federazione, pod Prometeus, pod Grafana)
 
-PROVISIONING --> READY : [Infrastruttura OK]
-PROVISIONING --> FAILED : [Errore Provisioning]
+}
 
 state READY {
-  READY : Generazione ConfigMap (k6 script)
-  READY : Configurazione Prometheus (Remote Write)
-  READY : Creazione Job k6
+  PrepMonitoraggio : Aggiorno configurazione Prometheus
+  PrepMonitoraggio : su Prometheus (JSON Injection)
+  PrepMonitoraggio --> PrepCarico : OK
+  PrepCarico : Generazione Script k6 
+  PrepCarico : e lancio del Job
 }
-
-READY --> RUNNING : [Job k6 Created]
-READY --> FAILED : [Errore Config]
 
 state RUNNING {
-  RUNNING : k6 genera carico
-  RUNNING : Polling Status Job (Succeeded/Failed)
-  RUNNING : Live Dashboard Open (Grafana)
-}
+  StartK6 : Esecuzione Job k6 
+  StartK6 --> LiveObservability : OK
+  LiveObservability : Apertura Dashboard Grafana 
+  LiveObservability --> MonitoraggioJob : Polling
+  MonitoraggioJob : Verifica completamento 
+  MonitoraggioJob : o fallimento del Job
 
-RUNNING --> COOLDOWN : [Job k6 Succeeded]
-RUNNING --> FAILED : [Job k6 Failed]
+}
 
 state COOLDOWN {
-  COOLDOWN : Attesa scarico buffer metriche (Remote Write)
-  COOLDOWN : Definizione intervallo di analisi (Time Range)
+  BufferSync : Attesa sincronizzazione 
+  BufferSync : buffer Prometheus (Dati k6)
 }
-
-COOLDOWN --> COMPLETED : [Dati Consistenti]
 
 state COMPLETED {
-  COMPLETED : Export Report Finale
-  COMPLETED : Notifica Fine Esperimento
+
 }
 
-state CLEANUP {
-  CLEANUP : Rimozione Job k6 e ConfigMap effimere
-  CLEANUP : Rimozione Target Prometheus dinamici
-}
+' Transizioni di alto livello
+PROVISIONING --> READY : Successo Infra
+READY --> RUNNING : Carico Pronto
+RUNNING --> COOLDOWN : Fine Test
+COOLDOWN --> COMPLETED : Dati Pronti
 
-COMPLETED --> CLEANUP : [User Delete o Auto-cleanup]
-CLEANUP --> [*]
+' Gestione Errore
+PROVISIONING --> FAILED : Timeout/Errore
+READY --> FAILED : Errore Config
+RUNNING --> FAILED : Crash k6
 
 state FAILED <<Error>> {
-  FAILED : Logging Errore
-  FAILED : Snapshot Stato Parziale
+  FAILED : Snapshot dell'errore
 }
-
-FAILED --> CLEANUP : [Intervento Operatore]
-
-note right of RUNNING
-  In questa fase l'operatore
-  monitora il completamento 
-  del processo k6 nel cluster.
-end note
 
 @enduml
