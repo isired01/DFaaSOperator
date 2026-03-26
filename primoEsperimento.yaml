@@ -1,7 +1,7 @@
 apiVersion: dfaas.dfaas.io/v1
 kind: Esperimento
 metadata:
-  name: exp-saturazione-milano
+  name: exp-seconda-label
 spec:
   nome: "Test"
   versione: "1.0.0"

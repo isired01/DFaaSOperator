@@ -228,12 +228,14 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		<-ctx.Done() // Si sblocca solo quando premi CTRL+C
 		// Qui inserisci la logica di emergenza
 		log.Info("⚠️ Shutdown rilevato! Avvio cancellazione d'emergenza VM...")
+
 	}()
 
 	// 2. Log di cortesia per vedere che sta funzionando
 	//log.Info("🔍 Rilevato Esperimento:", "Fase Attuale", esperimento.Status.Fase)
 
 	// 3. LOGICA DELL'AUTOMA A STATI
+
 	switch esperimento.Status.Fase {
 	case "": // Stato iniziale (Appena creato)
 		log.Info("➡️ Inizio transizione: IDLE -> PROVISIONING")
@@ -278,9 +280,35 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			},
 		}
 
+		if err := ctrl.SetControllerReference(&esperimento, cm, r.Scheme); err != nil {
+			log.Error(err, "Impossibile impostare l'OwnerReference sulla ConfigMap")
+			return r.updateStatus(ctx, &esperimento, "FAILED")
+		}
+
+		// 1. Tenta la creazione se no aggiorna
 		if err := r.Create(ctx, cm); err != nil {
-			if !errors.IsAlreadyExists(err) {
-				log.Error(err, "Errore creazione ConfigMap")
+			if errors.IsAlreadyExists(err) {
+				// --- LOGICA DI UPDATE ---
+				log.Info("🔄 ConfigMap già esistente, avvio aggiornamento contenuto...")
+
+				// Recuperiamo la versione attuale dal cluster
+				existingCm := &corev1.ConfigMap{}
+				if err := r.Get(ctx, client.ObjectKey{Name: cm.Name, Namespace: cm.Namespace}, existingCm); err != nil {
+					return r.updateStatus(ctx, &esperimento, "FAILED")
+				}
+
+				// Sovrascriviamo solo i dati (lo script JS)
+				existingCm.Data = cm.Data
+
+				// Applichiamo l'update
+				if err := r.Update(ctx, existingCm); err != nil {
+					log.Error(err, "Errore durante l'Update della ConfigMap")
+					return r.updateStatus(ctx, &esperimento, "FAILED")
+				}
+				log.Info("✅ ConfigMap aggiornata con l'ultimo script generato")
+				// -------------------------
+			} else {
+				log.Error(err, "Errore fatale creazione ConfigMap")
 				return r.updateStatus(ctx, &esperimento, "FAILED")
 			}
 		}
@@ -333,7 +361,7 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	case "COMPLETED":
 		log.Info("Esperimento completato")
 		time.Sleep(3 * time.Second) // apro grafana e mostro i risultati
-		return r.updateStatus(ctx, &esperimento, "CLEANUP")
+		return r.updateStatus(ctx, &esperimento, "ENDED")
 
 	case "CLEANUP":
 		log.Info("🧹 Pulizia risorse...")
@@ -386,6 +414,9 @@ import { scenario } from 'k6/execution';
 {{- $profilo := .Spec.Profilo }}
 
 export const options = {
+	tags: {
+    esperimento: '{{ .Name }}',
+  },
   scenarios: {
     {{- range .Spec.Profilo.Scenari }}
     "{{ .NomeScenario }}": {
