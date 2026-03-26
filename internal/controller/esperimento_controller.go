@@ -389,17 +389,17 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		log.Info("⏳ Aspetto che le metriche finiscano di arrivare")
 		log.Info("COOLDOWN -> COMPLETED")
 		time.Sleep(30 * time.Second)
+		return r.updateStatus(ctx, &esperimento, "CLEANUP")
+
+	case "CLEANUP":
+		log.Info("🧹 Pulizia risorse...")
+		time.Sleep(3 * time.Second)
+		r.cleanupPrometheusTargets(ctx, &esperimento)
 		return r.updateStatus(ctx, &esperimento, "COMPLETED")
 
 	case "COMPLETED":
 		log.Info("Esperimento completato")
 		time.Sleep(3 * time.Second) // apro grafana e mostro i risultati
-		return r.updateStatus(ctx, &esperimento, "ENDED")
-
-	case "CLEANUP":
-		log.Info("🧹 Pulizia risorse...")
-		time.Sleep(3 * time.Second)
-		//canellare prometesu
 		return r.updateStatus(ctx, &esperimento, "ENDED")
 
 	}
