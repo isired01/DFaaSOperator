@@ -19,7 +19,9 @@ package controller
 import (
 	"bytes"
 	"context"
+	"embed"
 	"encoding/json"
+	"strings"
 	"text/template"
 	"time"
 
@@ -34,7 +36,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/yaml"
 )
+
+//go:embed monitoring/*.yaml
+var monitoringConfig embed.FS
 
 // EsperimentoReconciler reconciles a Esperimento object
 type EsperimentoReconciler struct {
@@ -242,11 +250,36 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		time.Sleep(3 * time.Second)
 		return r.handleInitialState(ctx, &esperimento)
 
-	case "PROVISIONING":
-		//chiamare funz per fare deploy passandoli i dati nel manifest
-		//tradurre da oggetti go a terraform tipo?!
-		log.Info("➡️ Risorse verificate: PROVISIONING -> READY")
-		time.Sleep(3 * time.Second)
+	case "PROVISIONING_INFRA":
+		log.Info("☁️ Fase 1: Provisioning Infrastruttura (VM/Nodi)...")
+		// Qui in futuro chiamerai la logica Terraform o i tuoi script di creazione VM
+		// Per ora simuliamo che sia tutto pronto
+		log.Info("✅ Infrastruttura verificata.")
+		return r.updateStatus(ctx, &esperimento, "PROVISIONING_MONITORING")
+
+	case "PROVISIONING_MONITORING":
+		log.Info("📊 Fase 2: Auto-deploy dello stack di monitoraggio...")
+
+		// 1. Applichiamo gli YAML (Idempotente: se ci sono già non fa nulla)
+		if err := r.deployMonitoringStack(ctx); err != nil {
+			log.Error(err, "❌ Impossibile installare i manifesti di monitoraggio")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+
+		// 2. Verifichiamo se i Pod sono effettivamente pronti (Ready)
+		log.Info("🔍 Verifica readiness dei Pod (Prometheus & Grafana)...")
+		monReady, err := r.checkMonitoringStack(ctx)
+		if err != nil {
+			log.Error(err, "❌ Errore durante il check del monitoraggio")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+
+		if !monReady {
+			log.Info("⏳ Pod non ancora pronti. Re-check tra 10 secondi...")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+
+		log.Info("➡️ Monitoraggio attivo: PROVISIONING -> READY")
 		return r.updateStatus(ctx, &esperimento, "READY")
 
 	case "READY":
@@ -396,7 +429,7 @@ func (r *EsperimentoReconciler) handleInitialState(ctx context.Context, exp *dfa
 	log := log.FromContext(ctx)
 	log.Info("Controllo che non vi siano VM vecchie passo alla fase di PROVISIONING")
 	//se ci sono robe da pulire va i cleanUP e chiamo il metodo per pulire
-	return r.updateStatus(ctx, exp, "PROVISIONING")
+	return r.updateStatus(ctx, exp, "PROVISIONING_INFRA")
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -532,4 +565,91 @@ func (r *EsperimentoReconciler) runK6Job(ctx context.Context, exp *dfaasv1.Esper
 	}
 
 	return r.Create(ctx, job)
+}
+
+func (r *EsperimentoReconciler) deployMonitoringStack(ctx context.Context) error {
+	log := log.FromContext(ctx)
+
+	// Legge i file dalla cartella monitoring (quella con l'embed)
+	entries, err := monitoringConfig.ReadDir("monitoring")
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		fileData, err := monitoringConfig.ReadFile("monitoring/" + entry.Name())
+		if err != nil {
+			return err
+		}
+
+		// Decoder per gestire file multi-oggetto (separati da ---)
+		decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(fileData), 4096)
+		for {
+			unstructuredObj := &unstructured.Unstructured{}
+			if err := decoder.Decode(unstructuredObj); err != nil {
+				break // Fine file
+			}
+
+			if unstructuredObj.Object == nil {
+				continue
+			}
+
+			unstructuredObj.SetNamespace("monitoring")
+
+			// Tenta la creazione. Se esiste già, passa oltre (Idempotenza)
+			err = r.Create(ctx, unstructuredObj)
+			if err != nil {
+				if errors.IsAlreadyExists(err) {
+					continue
+				}
+				if errors.IsInvalid(err) {
+					log.Info("⚠️ Risorsa già configurata o porta occupata, salto...", "file", entry.Name())
+					continue
+				}
+				return err
+			}
+			log.Info("✅ Creato componente monitoraggio:", "kind", unstructuredObj.GetKind(), "name", unstructuredObj.GetName())
+		}
+	}
+	return nil
+}
+
+func (r *EsperimentoReconciler) checkMonitoringStack(ctx context.Context) (bool, error) {
+	podList := &corev1.PodList{}
+	// Prendiamo TUTTI i pod nel namespace monitoring
+	opts := []client.ListOption{
+		client.InNamespace("monitoring"),
+	}
+
+	if err := r.List(ctx, podList, opts...); err != nil {
+		return false, err
+	}
+
+	promReady := false
+	grafanaReady := false
+
+	for _, pod := range podList.Items {
+		// Controlliamo se il Pod è in fase Running e se è "Ready"
+		isReady := false
+		if pod.Status.Phase == corev1.PodRunning {
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+					isReady = true
+					break
+				}
+			}
+		}
+
+		if isReady {
+			// Usiamo una ricerca sul nome del Pod (più affidabile se le label cambiano)
+			if strings.Contains(pod.Name, "prometheus") {
+				promReady = true
+			}
+			if strings.Contains(pod.Name, "grafana") {
+				grafanaReady = true
+			}
+		}
+	}
+
+	return promReady && grafanaReady, nil
 }
