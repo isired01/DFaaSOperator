@@ -6,78 +6,74 @@ skinparam state {
   FontStyle bold
 }
 
-title Automa a Stati Finiti - Lifecycle Esperimento DFaaS
+title Automa a Stati Finiti - Lifecycle Esperimento DFaaS (v2026)
 
-[*] --> IDLE : Accensione Framework
+[*] --> IDLE : Deploy Operatore
 
 state IDLE {
-  IDLE : PRONTO A RICEVERE FILE
+  IDLE : Attesa Risorsa Custom (CR)
 }
 
-IDLE --> VALIDAZIONE_FILE : CARICAMENTO CONFIG
-
-state VALIDAZIONE_FILE {
-  VALIDAZIONE_FILE : VALIDO?
-}
-
-VALIDAZIONE_FILE --> PROVISIONING : [FILE VALIDO]
-VALIDAZIONE_FILE --> FAIL : [FILE NON VALIDO]
+IDLE --> PROVISIONING : [New Esperimento]
 
 state PROVISIONING {
-  PROVISIONING : CLEANUP PRECEDENTE ESPERIMENTO (Se necessario)
-  PROVISIONING : COSTRUZIONE FEDERAZIONE
-  PROVISIONING : COSTRUZIONE VM (k6 + PROMETHEUS)
+  PROVISIONING : Verifica Infrastruttura (Prometheus/Grafana)
+  PROVISIONING : Setup Federazione Nodi Edge
+  PROVISIONING : Cleanup Target Residui
 }
 
-PROVISIONING --> READY : [FEDERAZIONE OK]
-PROVISIONING --> FAIL : [FAIL PROVISIONING]
+PROVISIONING --> READY : [Infrastruttura OK]
+PROVISIONING --> FAILED : [Errore Provisioning]
 
 state READY {
-  READY : VMs ON
-  READY : READY
+  READY : Generazione ConfigMap (k6 script)
+  READY : Configurazione Prometheus (Remote Write)
+  READY : Creazione Job k6
 }
 
-READY --> RUNNING : [TRIGGER START]
-READY --> FAIL : [FAIL READY]
+READY --> RUNNING : [Job k6 Created]
+READY --> FAILED : [Errore Config]
 
 state RUNNING {
-  RUNNING : GENERAZIONE CARICO (k6)
-  RUNNING : LIVE METRICS
+  RUNNING : k6 genera carico
+  RUNNING : Polling Status Job (Succeeded/Failed)
+  RUNNING : Live Dashboard Open (Grafana)
 }
 
-RUNNING --> COOL_DOWN : [CARICO FINITO]
-RUNNING --> FAIL : [FAIL RUNNING]
+RUNNING --> COOLDOWN : [Job k6 Succeeded]
+RUNNING --> FAILED : [Job k6 Failed]
 
-state COOL_DOWN {
-  COOL_DOWN : ASPETTO ULTIME METRICHE
+state COOLDOWN {
+  COOLDOWN : Attesa scarico buffer metriche (Remote Write)
+  COOLDOWN : Definizione intervallo di analisi (Time Range)
 }
 
-COOL_DOWN --> EXPORT_METRICHE : [METRICHE OK]
-
-state EXPORT_METRICHE {
-  EXPORT_METRICHE : Export metriche da vm con k6 e prometheus e salvo l'esperimento
-}
-
-EXPORT_METRICHE --> COMPLETED : [ESPORTAZIONE OK]
-
-state CLEANUP {
-  CLEANUP : CANCELLO FEDERAZIONE
-  CLEANUP : CANCELLO VM
-}
-
-COMPLETED -->  CLEANUP : [PULIZIA OK]
+COOLDOWN --> COMPLETED : [Dati Consistenti]
 
 state COMPLETED {
-  COMPLETED : MOSTRO RISULTATI
+  COMPLETED : Export Report Finale
+  COMPLETED : Notifica Fine Esperimento
 }
 
-CLEANUP --> [*] : [Fine Esperimento]
-
-
-
-state FAIL <<Error>> {
-  FAIL : GESTIONE ERRORE
+state CLEANUP {
+  CLEANUP : Rimozione Job k6 e ConfigMap effimere
+  CLEANUP : Rimozione Target Prometheus dinamici
 }
 
-FAIL --> COMPLETED : Mostro risultati parziali e info su errore
+COMPLETED --> CLEANUP : [User Delete o Auto-cleanup]
+CLEANUP --> [*]
+
+state FAILED <<Error>> {
+  FAILED : Logging Errore
+  FAILED : Snapshot Stato Parziale
+}
+
+FAILED --> CLEANUP : [Intervento Operatore]
+
+note right of RUNNING
+  In questa fase l'operatore
+  monitora il completamento 
+  del processo k6 nel cluster.
+end note
+
 @enduml
