@@ -80,7 +80,8 @@ func (r *EsperimentoReconciler) buildScriptK6(exp *dfaasv1.Esperimento) (string,
 	return script.String(), nil
 }
 
-func (r *EsperimentoReconciler) runK6Job(ctx context.Context, exp *dfaasv1.Esperimento) error {
+func (r *EsperimentoReconciler) runK6Job(ctx context.Context,
+	exp *dfaasv1.Esperimento) error {
 	terminate := int64(3000)
 
 	job := &batchv1.Job{
@@ -143,7 +144,8 @@ func (r *EsperimentoReconciler) runK6Job(ctx context.Context, exp *dfaasv1.Esper
 	return r.Create(ctx, job)
 }
 
-func (r *EsperimentoReconciler) reconcileK6Config(ctx context.Context, exp *dfaasv1.Esperimento, script string) error {
+func (r *EsperimentoReconciler) reconcileK6Config(ctx context.Context,
+	exp *dfaasv1.Esperimento, script string) error {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      exp.Name + "-script-k6",

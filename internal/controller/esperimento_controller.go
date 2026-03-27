@@ -59,7 +59,8 @@ type PrometheusTarget struct {
 
 const esperimentoFinalizer = "dfaas.dfaas.io/finalizer"
 
-func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
+	req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 	var exp dfaasv1.Esperimento
 
@@ -112,7 +113,8 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 }
 
 // Funzione per aggiornare la fase dell'esperimento
-func (r *EsperimentoReconciler) updateStatus(ctx context.Context, exp *dfaasv1.Esperimento, fase string) (ctrl.Result, error) {
+func (r *EsperimentoReconciler) updateStatus(ctx context.Context,
+	exp *dfaasv1.Esperimento, fase string) (ctrl.Result, error) {
 	// 1. Rileggiamo l'oggetto fresco dal cluster per evitare conflitti di versione
 	latestExp := &dfaasv1.Esperimento{}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(exp), latestExp); err != nil {
@@ -129,10 +131,12 @@ func (r *EsperimentoReconciler) updateStatus(ctx context.Context, exp *dfaasv1.E
 }
 
 // Gestione dello stato iniziale
-func (r *EsperimentoReconciler) handleInitialState(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
+func (r *EsperimentoReconciler) handleInitialState(ctx context.Context,
+	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 	log.Info("Controllo che non vi siano VM vecchie passo alla fase di PROVISIONING")
 	//se ci sono robe da pulire va i cleanUP e chiamo il metodo per pulire
+	//Controllo che posso offrire quello che mi è stato richiesto
 	return r.updateStatus(ctx, exp, "PROVISIONING_INFRA")
 }
 

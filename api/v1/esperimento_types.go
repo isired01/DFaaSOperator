@@ -79,7 +79,8 @@ type EsperimentoSpec struct {
 // EsperimentoStatus definisce lo stato osservato di Esperimento
 type EsperimentoStatus struct {
 	// Fase dell'automa: IDLE, VALIDAZIONE_FILE, PROVISIONING, READY, RUNNING, COOL_DOWN, EXPORT_METRICHE, RESULTS, CLEANUP, FAIL
-	Fase string `json:"fase,omitempty"`
+	Fase       string             `json:"fase,omitempty"`
+	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 	// Messaggio di dettaglio (es. motivo di un fallimento)
 	Message string `json:"message,omitempty"`
 }
