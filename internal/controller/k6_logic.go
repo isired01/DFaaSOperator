@@ -3,6 +3,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"text/template"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -15,19 +16,22 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 )
 
+// Definiamo uno struct di supporto per passare dati puliti al template
+type k6TemplateData struct {
+	Exp      *dfaasv1.Esperimento
+	IPMapper map[string]string // Mappa TargetNodeID -> IndirizzoIP
+}
+
 const k6Template = `
 import http from 'k6/http';
 import { sleep } from 'k6';
-import { scenario } from 'k6/execution';
-
-{{- $profilo := .Spec.Profilo }}
 
 export const options = {
-	tags: {
-    esperimento: '{{ .Name }}',
+  tags: {
+    esperimento: '{{ .Exp.Name }}',
   },
   scenarios: {
-    {{- range .Spec.Profilo.Scenari }}
+    {{- range .Exp.Spec.Profilo.Scenari }}
     "{{ .NomeScenario }}": {
       executor: 'ramping-arrival-rate',
       startRate: {{ .StartTime }},
@@ -39,9 +43,9 @@ export const options = {
         { duration: '{{ .Durata }}', target: {{ .TargetRps }} },
         {{- end }}
       ],
-      // Passiamo i dati specifici dello scenario come variabili d'ambiente interne
       env: { 
-        TARGET_URL: 'http://{{ .TargetNodeID }}/function/{{ .NomeFunzioneTarget }}',
+        // Usiamo la mappa per recuperare l'IP corretto tramite l'ID del nodo
+        TARGET_URL: 'http://{{ index $.IPMapper .TargetNodeID }}/function/{{ .NomeFunzioneTarget }}',
         BODY_CONTENT: '{{ .Body }}'
       },
     },
@@ -50,13 +54,12 @@ export const options = {
 };
 
 export default function () {
-  // Ogni scenario legge le PROPRIE variabili d'ambiente definite sopra
   const url = __ENV.TARGET_URL;
   const payload = __ENV.BODY_CONTENT;
   
   const params = {
     headers: {
-      {{ $profilo.CommonHeaders }} 
+      {{ .Exp.Spec.Profilo.CommonHeaders }} 
     },
   };
 
@@ -65,15 +68,31 @@ export default function () {
 `
 
 func (r *EsperimentoReconciler) buildScriptK6(exp *dfaasv1.Esperimento) (string, error) {
-	// Crea il template
+	// 1. Prepariamo la mappa degli IP per il template
+	ipMap := make(map[string]string)
+	for _, nodo := range exp.Spec.Federazione.Nodi {
+		ipMap[nodo.IDNodo] = nodo.IndirizzoIP
+	}
+
+	// 2. Verifichiamo che tutti i nodi usati negli scenari esistano nella federazione
+	for _, scenario := range exp.Spec.Profilo.Scenari {
+		if _, ok := ipMap[scenario.TargetNodeID]; !ok {
+			return "", fmt.Errorf("nodo target %s non trovato nella configurazione federazione", scenario.TargetNodeID)
+		}
+	}
+
+	data := k6TemplateData{
+		Exp:      exp,
+		IPMapper: ipMap,
+	}
+
 	tmpl, err := template.New("k6").Parse(k6Template)
 	if err != nil {
 		return "", err
 	}
 
-	// Esegue il template usando l'oggetto 'exp' come sorgente dati
 	var script bytes.Buffer
-	if err := tmpl.Execute(&script, exp); err != nil {
+	if err := tmpl.Execute(&script, data); err != nil {
 		return "", err
 	}
 
@@ -82,7 +101,7 @@ func (r *EsperimentoReconciler) buildScriptK6(exp *dfaasv1.Esperimento) (string,
 
 func (r *EsperimentoReconciler) runK6Job(ctx context.Context,
 	exp *dfaasv1.Esperimento) error {
-	terminate := int64(3000)
+	terminate := int64(30000000)
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{

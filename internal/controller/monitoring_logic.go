@@ -122,36 +122,19 @@ func (r *EsperimentoReconciler) checkMonitoringStack(ctx context.Context) (bool,
 func (r *EsperimentoReconciler) reconcilePrometheusTargets(ctx context.Context, exp *dfaasv1.Esperimento) error {
 	log := log.FromContext(ctx)
 
-	/*
-		// 1. Costruiamo la lista dei target dai nodi della federazione
-		var targets []PrometheusTarget
+	var targets []PrometheusTarget
 
-
-		for _, nodo := range exp.Spec.Federazione.Nodi {
-			// Nota: Assumiamo che l'IP sia raggiungibile e che il Node Exporter sia sulla porta 9100
-			// Se non hai il campo IP esplicito, dovremo ricavarlo o usare l'ID se risolvibile via DNS
-			target := PrometheusTarget{
-				Targets: []string{nodo.IdNodo + ":30903"}, // O usa l'IP se l'hai aggiunto allo struct
-				Labels: map[string]string{					// 30903 è la porta per tutti i prometeus
-					"esperimento": exp.Name,				//su tutti i nodi DFaaS
-					"nodo_id":     nodo.IdNodo,
-					"tipo_nodo":   nodo.TipoNodo,
-				},
-			}
-			targets = append(targets, target)
-		}
-	*/
-
-	staticIP := "192.168.64.3:30662"
-	targets := []PrometheusTarget{
-		{
-			Targets: []string{staticIP},
+	// Cicliamo sui nodi definiti nell'oggetto Esperimento
+	for _, nodo := range exp.Spec.Federazione.Nodi {
+		target := PrometheusTarget{
+			Targets: []string{nodo.IndirizzoIP + ":30909"}, // Usa l'IP della CRD e la porta di dFaaS
 			Labels: map[string]string{
 				"esperimento": exp.Name,
-				"nodo_id":     "nodo-test-statico",
-				"tipo_nodo":   "QEMU-VM",
+				"nodo_id":     nodo.IDNodo,
+				"tipo_nodo":   nodo.TipoNodo,
 			},
-		},
+		}
+		targets = append(targets, target)
 	}
 
 	// 2. Serializziamo in JSON

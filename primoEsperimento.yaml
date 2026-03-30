@@ -1,36 +1,37 @@
 apiVersion: dfaas.dfaas.io/v1
 kind: Esperimento
 metadata:
-  name: exp-seconda-label
+  name: test-milano-torino
 spec:
-  nome: "Test"
-  versione: "1.0.0"
   # 1. METRICHE DA OSSERVARE
   metriche:
-     -  query: "sum(irate(container_cpu_usage_seconds_total[1m]))"
-        commento: "CPU totale consumata dai pod DFaaS"
+    - query: "sum(irate(container_cpu_usage_seconds_total[1m]))"
+      commento: "CPU totale consumata dai pod DFaaS"
 
-  # 2. CONFIGURAZIONE DELLA FEDERAZIONE (I target)
+  # 2. CONFIGURAZIONE DELLA FEDERAZIONE (I target fisici/VM)
   federazione:
-    strategia: "NODE_MARGI"
+    strategia: "NODE_MARGIN"
     nodi:
-      - idNodo: "milano-edge-01"
-        tipoNodo: "MEDIUMl"
-        funzioni: ["image-proc", "face-det"]
+      - idNodo: "milano-edge-01" # Il tuo nodo principale
+        indirizzoIP: "192.168.64.3" # Inserisci l'IP reale della prima VM
+        tipoNodo: "MEDIUM"
+        funzioni: ["image-proc", "face-det", "figlet"]
         idVicini:
-          "torino-edge-02": 100 # latenza del link in MS
-      - idNodo: "torino-edge-02"
-        tipoNodo: "LOW"
-        funzioni: ["image-proc"]
+          "torino-edge-02": 100
 
-  # 3. PROFILO DI CARICO (Cosa deve fare il controller)
+      - idNodo: "torino-edge-02"
+        indirizzoIP: "192.168.64.5"
+        tipoNodo: "LOW"
+        funzioni: ["image-proc", "figlet"]
+
+  # 3. PROFILO DI CARICO (Generato da k6 verso i nodi sopra)
   profiloCarico:
     commonHeaders: "'Content-Type':'text/plain'"
     scenari:
-      - nomeScenario: "test1"
-        targetNodeID: "192.168.64.3:31112"
+      - nomeScenario: "test-carico-principale"
+        targetNodeID: "milano-edge-01" # Punta al primo nodo tramite ID
         nomeFunzioneTarget: "figlet"
-        body: 'test carico da venticinque'
+        body: "test carico da venticinque"
         esecutore: "RAMPING_ARRIVAL_RATE"
         vuAllocati: 100
         startTime: 0
@@ -41,6 +42,3 @@ spec:
             targetRps: 50
           - durata: "30s"
             targetRps: 0
-
----
-# Lo Status non lo scriviamo noi, lo scriverà il Controller!

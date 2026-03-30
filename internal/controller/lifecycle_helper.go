@@ -4,56 +4,47 @@ import (
 	"context"
 	"time"
 
+	dfaasv1 "dfaas-operator/api/v1"
+	"fmt"
+
 	batchv1 "k8s.io/api/batch/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // Ecco il colpevole dell'errore
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-
-	dfaasv1 "dfaas-operator/api/v1"
 )
-
-func (r *EsperimentoReconciler) reconcileFinalizers(ctx context.Context,
-	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
-	log := log.FromContext(ctx)
-
-	// Caso A: L'oggetto NON è in fase di cancellazione
-	if exp.ObjectMeta.DeletionTimestamp.IsZero() {
-		if !controllerutil.ContainsFinalizer(exp, esperimentoFinalizer) {
-			controllerutil.AddFinalizer(exp, esperimentoFinalizer)
-			log.Info("🔒 Aggiunta Finalizer", "finalizer", esperimentoFinalizer)
-			return ctrl.Result{}, r.Update(ctx, exp)
-		}
-		return ctrl.Result{}, nil // Nulla da fare, procedi col Reconcile
-	}
-
-	// Caso B: L'oggetto È in fase di cancellazione
-	if controllerutil.ContainsFinalizer(exp, esperimentoFinalizer) {
-		log.Info("🗑️ Risorsa in cancellazione: avvio pulizia...")
-
-		// Pulizia Prometheus
-		if err := r.cleanupPrometheusTargets(ctx, exp); err != nil {
-			log.Error(err, "❌ Fallimento pulizia Prometheus")
-			return ctrl.Result{}, err
-		}
-
-		// Qui aggiungerai la logica per spegnere le VM
-		log.Info("☁️ Pulizia infrastruttura VM completata")
-
-		// Rimuovi finalizer e aggiorna
-		controllerutil.RemoveFinalizer(exp, esperimentoFinalizer)
-		return ctrl.Result{}, r.Update(ctx, exp)
-	}
-
-	return ctrl.Result{}, nil
-}
 
 func (r *EsperimentoReconciler) handleDeletion(ctx context.Context,
 	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
-	r.cleanupPrometheusTargets(ctx, exp)
-	controllerutil.RemoveFinalizer(exp, esperimentoFinalizer)
-	return ctrl.Result{}, r.Update(ctx, exp)
+	log := log.FromContext(ctx)
+
+	if controllerutil.ContainsFinalizer(exp, esperimentoFinalizer) {
+		log.Info("🗑️ Finalizer rilevato, avvio procedure di pulizia...")
+
+		// 1. Pulizia Prometheus
+		r.cleanupPrometheusTargets(ctx, exp)
+
+		// 2. CANCELLAZIONE ESPLICITA DEL JOB
+		// Questo risolve l'errore "already exists" se riapplichi velocemente
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      exp.Name + "-k6-job",
+				Namespace: exp.Namespace,
+			},
+		}
+		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+			log.Info("Job k6 non trovato o già cancellato")
+		}
+
+		// 3. Rimuoviamo il finalizer
+		controllerutil.RemoveFinalizer(exp, esperimentoFinalizer)
+		if err := r.Update(ctx, exp); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{}, nil
 }
 
 func (r *EsperimentoReconciler) reconcileReady(ctx context.Context,
@@ -61,40 +52,42 @@ func (r *EsperimentoReconciler) reconcileReady(ctx context.Context,
 	log := log.FromContext(ctx)
 
 	// 1. Iniezione Target Prometheus
+	// Qui la logica interna userà il nuovo loop sugli IP dei nodi
 	if err := r.reconcilePrometheusTargets(ctx, exp); err != nil {
-		r.setCondition(ctx, exp, "PrometheusTargetsReady", metav1.ConditionFalse,
-			"ConfigUpdateFailed", err.Error())
+		log.Error(err, "❌ Fallito aggiornamento target Prometheus")
+		r.setCondition(ctx, exp, "PrometheusTargetsReady", metav1.ConditionFalse, "ConfigUpdateFailed", err.Error())
 		return r.updateStatus(ctx, exp, "FAILED")
 	}
-	r.setCondition(ctx, exp, "PrometheusTargetsReady", metav1.ConditionTrue,
-		"ConfigUpdated", "Target inseriti nella ConfigMap di Prometheus")
+	r.setCondition(ctx, exp, "PrometheusTargetsReady", metav1.ConditionTrue, "ConfigUpdated", "Target inseriti correttamente")
 
-	// 2. Generazione Script e ConfigMap k6
+	// 2. Generazione Script k6 (Ora usa la logica della mappa IP)
 	script, err := r.buildScriptK6(exp)
 	if err != nil {
-		r.setCondition(ctx, exp, "K6ConfigReady", metav1.ConditionFalse,
-			"TemplateError", err.Error())
+		log.Error(err, "❌ Errore nella generazione dello script k6 (probabile IP mancante)")
+		r.setCondition(ctx, exp, "K6ConfigReady", metav1.ConditionFalse, "TemplateError", err.Error())
+		// Fondamentale: aggiorniamo il messaggio di errore visibile all'utente
+		exp.Status.Message = fmt.Sprintf("Errore script: %v", err)
 		return r.updateStatus(ctx, exp, "FAILED")
 	}
 
+	// Creazione ConfigMap per lo script
 	if err := r.reconcileK6Config(ctx, exp, script); err != nil {
-		r.setCondition(ctx, exp, "K6ConfigReady", metav1.ConditionFalse,
-			"ConfigMapCreationFailed", err.Error())
+		log.Error(err, "❌ Fallita creazione ConfigMap k6")
+		r.setCondition(ctx, exp, "K6ConfigReady", metav1.ConditionFalse, "ConfigMapCreationFailed", err.Error())
 		return r.updateStatus(ctx, exp, "FAILED")
 	}
-	r.setCondition(ctx, exp, "K6ConfigReady", metav1.ConditionTrue,
-		"ConfigMapCreated", "Script k6 generato e caricato con successo")
+	r.setCondition(ctx, exp, "K6ConfigReady", metav1.ConditionTrue, "ConfigMapCreated", "Script k6 caricato")
 
 	// 3. Lancio del Job k6
 	if err := r.runK6Job(ctx, exp); err != nil {
-		r.setCondition(ctx, exp, "K6JobLaunched", metav1.ConditionFalse,
-			"JobCreationFailed", err.Error())
+		log.Error(err, "❌ Impossibile avviare il Job k6")
+		r.setCondition(ctx, exp, "K6JobLaunched", metav1.ConditionFalse, "JobCreationFailed", err.Error())
 		return r.updateStatus(ctx, exp, "FAILED")
 	}
-	r.setCondition(ctx, exp, "K6JobLaunched", metav1.ConditionTrue,
-		"JobCreated", "Container k6 avviato correttamente")
 
-	log.Info("🚀 Tutte le risorse sono pronte. Avvio test...")
+	r.setCondition(ctx, exp, "K6JobLaunched", metav1.ConditionTrue, "JobCreated", "Job avviato")
+
+	log.Info("🚀 Esperimento in esecuzione!", "nome", exp.Name)
 	return r.updateStatus(ctx, exp, "RUNNING")
 }
 

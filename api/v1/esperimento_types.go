@@ -23,7 +23,7 @@ import (
 // --- SOTTO-STRUTTURE PER METRICHE ---
 
 type ConfigurazoneMetrica struct {
-	Query    string `json:"query"` // La query PromQL o nome metrica
+	Query    string `json:"query"`
 	Commento string `json:"commento,omitempty"`
 }
 
@@ -35,10 +35,13 @@ type ConfigurazioneFederazione struct {
 }
 
 type ConfigurazioneNodo struct {
-	IDNodo   string         `json:"idNodo"`
-	TipoNodo string         `json:"tipoNodo"` // LOW, MEDIUM, HIGH
-	Funzioni []string       `json:"funzioni"`
-	Vicini   map[string]int `json:"idVicini,omitempty"` // IDNodo -> LinkType(in ms)
+	IDNodo string `json:"idNodo"`
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}$`
+	IndirizzoIP string         `json:"indirizzoIP"`
+	TipoNodo    string         `json:"tipoNodo"` // LOW, MEDIUM, HIGH
+	Funzioni    []string       `json:"funzioni"`
+	Vicini      map[string]int `json:"idVicini,omitempty"` // IDNodo -> LinkType(in ms)
 }
 
 // --- SOTTO-STRUTTURE PER PROFILO CARICO (k6) ---
@@ -69,8 +72,6 @@ type StageK6 struct {
 
 // EsperimentoSpec definisce lo stato desiderato di Esperimento
 type EsperimentoSpec struct {
-	Nome        string                    `json:"nome"`
-	Versione    string                    `json:"versione"`
 	Metriche    []ConfigurazoneMetrica    `json:"metriche,omitempty"`
 	Federazione ConfigurazioneFederazione `json:"federazione"`
 	Profilo     ProfiloCarico             `json:"profiloCarico"`

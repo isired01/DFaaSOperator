@@ -64,10 +64,12 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 	log := log.FromContext(ctx)
 	var exp dfaasv1.Esperimento
 
-	log.Info("Inizio riconciliazione")
-
 	if err := r.Get(ctx, req.NamespacedName, &exp); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if exp.Status.Fase == "" {
+		log.Info("Inizio riconciliazione")
 	}
 
 	// 1. Finalizer & Deletion Logic
@@ -84,29 +86,37 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 	switch exp.Status.Fase {
 
 	case "":
+		log.Info("Inizio handleInitialState")
 		return r.handleInitialState(ctx, &exp)
 
 	case "PROVISIONING_INFRA":
+		log.Info("Inizio PROVISIONING_INFRA")
 		return r.reconcileInfra(ctx, &exp)
 
 	case "PROVISIONING_MONITORING":
+		log.Info("Inizio PROVISIONING_MONITORING")
 		return r.reconcileMonitoring(ctx, &exp)
 
 	case "READY":
+		log.Info("Inizio READY")
 		return r.reconcileReady(ctx, &exp)
 
 	case "RUNNING":
+		log.Info("Inizio RUNNING")
 		return r.reconcileRunning(ctx, &exp)
 
 	case "COOLDOWN":
+		log.Info("Inizio COOLDOWN")
 		return r.updateStatus(ctx, &exp, "CLEANUP") // Transizione rapida
 
 	case "CLEANUP":
+		log.Info("Inizio CLEANUP")
 		r.cleanupPrometheusTargets(ctx, &exp)
 		return r.updateStatus(ctx, &exp, "COMPLETED")
 
 	case "COMPLETED":
-		return r.updateStatus(ctx, &exp, "ENDED")
+		log.Info("Esperimento Completo")
+		return ctrl.Result{}, nil
 	}
 
 	return ctrl.Result{}, nil
@@ -116,6 +126,7 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 func (r *EsperimentoReconciler) updateStatus(ctx context.Context,
 	exp *dfaasv1.Esperimento, fase string) (ctrl.Result, error) {
 	// 1. Rileggiamo l'oggetto fresco dal cluster per evitare conflitti di versione
+
 	latestExp := &dfaasv1.Esperimento{}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(exp), latestExp); err != nil {
 		return ctrl.Result{}, err
