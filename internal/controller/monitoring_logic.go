@@ -5,16 +5,22 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"strings"
+	"time"
+
+	batchv1 "k8s.io/api/batch/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	dfaasv1 "dfaas-operator/api/v1"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/yaml"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-
-	dfaasv1 "dfaas-operator/api/v1"
 )
 
 //go:embed monitoring/*.yaml
@@ -69,7 +75,6 @@ func (r *EsperimentoReconciler) deployMonitoringStack(ctx context.Context) error
 
 func (r *EsperimentoReconciler) checkMonitoringStack(ctx context.Context) (bool, error) {
 	podList := &corev1.PodList{}
-	// Prendiamo TUTTI i pod nel namespace monitoring
 	opts := []client.ListOption{
 		client.InNamespace("monitoring"),
 	}
@@ -80,9 +85,9 @@ func (r *EsperimentoReconciler) checkMonitoringStack(ctx context.Context) (bool,
 
 	promReady := false
 	grafanaReady := false
+	minioReady := false // AGGIUNTO: Check per MinIO
 
 	for _, pod := range podList.Items {
-		// Controlliamo se il Pod è in fase Running e se è "Ready"
 		isReady := false
 		if pod.Status.Phase == corev1.PodRunning {
 			for _, cond := range pod.Status.Conditions {
@@ -100,10 +105,14 @@ func (r *EsperimentoReconciler) checkMonitoringStack(ctx context.Context) (bool,
 			if strings.Contains(pod.Name, "grafana") {
 				grafanaReady = true
 			}
+			if strings.Contains(pod.Name, "minio") { // AGGIUNTO
+				minioReady = true
+			}
 		}
 	}
 
-	return promReady && grafanaReady, nil
+	// L'esperimento parte solo se anche MinIO è pronto a ricevere i dati
+	return promReady && grafanaReady && minioReady, nil
 }
 
 // reconcilePrometheusTargets gestisce la registrazione dinamica dei target di monitoraggio.
@@ -196,4 +205,78 @@ func (r *EsperimentoReconciler) cleanupPrometheusTargets(ctx context.Context, ex
 	}
 
 	return nil
+}
+
+func (r *EsperimentoReconciler) runExporterJob(ctx context.Context, exp *dfaasv1.Esperimento) error {
+	log := log.FromContext(ctx)
+
+	// --- LOG DI DEBUG PER LE DATE ---
+	if exp.Status.StartTime == nil {
+		log.Info("⚠️ DEBUG: StartTime è NIL")
+	} else {
+		log.Info("✅ DEBUG: StartTime è valorizzato", "valore", exp.Status.StartTime.String())
+	}
+
+	if exp.Status.EndTime == nil {
+		log.Info("⚠️ DEBUG: EndTime è NIL")
+	} else {
+		log.Info("✅ DEBUG: EndTime è valorizzato", "valore", exp.Status.EndTime.String())
+	}
+
+	var allQueries []string
+	var step string
+	var outDir string
+
+	if len(exp.Spec.ConfigMetriche) > 0 {
+		conf := exp.Spec.ConfigMetriche[0]
+		step = fmt.Sprintf("%ds", conf.Step)
+		outDir = conf.OutDir
+		for _, m := range conf.Metrics {
+			allQueries = append(allQueries, m.Query)
+		}
+	}
+
+	// Default se non specificato
+	if outDir == "" {
+		outDir = "/tmp/exports"
+	}
+
+	exporterJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      exp.Name + "-exporter-job",
+			Namespace: "monitoring",
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name: "exporter",
+							// AGGIORNATO: Usiamo la v2 su GitHub
+							Image:           "ghcr.io/isired01/dfaas-operator/dfaas-exporter:v2",
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							Env: []corev1.EnvVar{
+								{Name: "PROM_URL", Value: "http://prometheus-service.monitoring:9090"},
+								{Name: "START_TIME", Value: exp.Status.StartTime.Format(time.RFC3339)},
+								{Name: "END_TIME", Value: exp.Status.EndTime.Format(time.RFC3339)},
+								{Name: "STEP", Value: step},
+								{Name: "QUERIES", Value: strings.Join(allQueries, "|")},
+								{Name: "OUT_DIR", Value: outDir},
+								{Name: "EXP_NAME", Value: exp.Name},
+								// --- NUOVE ENV PER MINIO ---
+								{Name: "MINIO_ENDPOINT", Value: "minio-service.monitoring:9000"},
+								{Name: "MINIO_ACCESS_KEY", Value: "admin"},
+								{Name: "MINIO_SECRET_KEY", Value: "password123"},
+							},
+							// NOTA: I VolumeMounts sono stati rimossi perché scriviamo via API su MinIO!
+						},
+					},
+				},
+			},
+		},
+	}
+
+	ctrl.SetControllerReference(exp, exporterJob, r.Scheme)
+	return r.Create(ctx, exporterJob)
 }

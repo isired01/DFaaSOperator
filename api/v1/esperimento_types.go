@@ -23,18 +23,24 @@ import (
 // --- SOTTO-STRUTTURE PER METRICHE ---
 
 type ConfigurazoneMetrica struct {
-	Query    string `json:"query"`
-	Commento string `json:"commento,omitempty"`
+	Step    int      `json:"step"`
+	Metrics []Metric `json:"metrics"`
+	OutDir  string   `json:"outDir,omitempty"`
+}
+
+type Metric struct {
+	Query   string `json:"query"`
+	Comment string `json:"comment,omitempty"`
 }
 
 // --- SOTTO-STRUTTURE PER FEDERAZIONE ---
 
-type ConfigurazioneFederazione struct {
-	Strategia string               `json:"strategia"` // BASE, EQUAL, NODE_MARGIN, etc.
-	Nodi      []ConfigurazioneNodo `json:"nodi"`
+type ConfigFed struct {
+	Strategy string       `json:"strategia"` // BASE, EQUAL, NODE_MARGIN, etc.
+	Nodi     []ConfigNode `json:"nodi"`
 }
 
-type ConfigurazioneNodo struct {
+type ConfigNode struct {
 	IDNodo string `json:"idNodo"`
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Pattern=`^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}$`
@@ -46,7 +52,7 @@ type ConfigurazioneNodo struct {
 
 // --- SOTTO-STRUTTURE PER PROFILO CARICO (k6) ---
 
-type ProfiloCarico struct {
+type LoadProfile struct {
 	CommonHeaders string     `json:"commonHeaders,omitempty"`
 	Scenari       []Scenario `json:"scenari"`
 }
@@ -72,9 +78,9 @@ type StageK6 struct {
 
 // EsperimentoSpec definisce lo stato desiderato di Esperimento
 type EsperimentoSpec struct {
-	Metriche    []ConfigurazoneMetrica    `json:"metriche,omitempty"`
-	Federazione ConfigurazioneFederazione `json:"federazione"`
-	Profilo     ProfiloCarico             `json:"profiloCarico"`
+	ConfigMetriche []ConfigurazoneMetrica `json:"metrics,omitempty"`
+	Federazione    ConfigFed              `json:"federation"`
+	Profilo        LoadProfile            `json:"loadProfile"`
 }
 
 // EsperimentoStatus definisce lo stato osservato di Esperimento
@@ -83,7 +89,9 @@ type EsperimentoStatus struct {
 	Fase       string             `json:"fase,omitempty"`
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 	// Messaggio di dettaglio (es. motivo di un fallimento)
-	Message string `json:"message,omitempty"`
+	Message   string       `json:"message,omitempty"`
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+	EndTime   *metav1.Time `json:"endTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true

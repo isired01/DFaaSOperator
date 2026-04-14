@@ -3,42 +3,38 @@ kind: Esperimento
 metadata:
   name: test-milano-torino
 spec:
-  # 1. METRICHE DA OSSERVARE
-  metriche:
-    - query: "sum(irate(container_cpu_usage_seconds_total[1m]))"
-      commento: "CPU totale consumata dai pod DFaaS"
+  # 1. METRICHE
+  metrics:
+    - step:
+        5 # Nota: nella CRD è un INT, quindi metti solo il numero (secondi),
+        #si può cabiare il formato a 5s tipo
+      metrics:
+        - query: "node_cpu_seconds_total"
+          comment: "CPU totale consumata dai pod DFaaS"
 
-  # 2. CONFIGURAZIONE DELLA FEDERAZIONE (I target fisici/VM)
-  federazione:
+  # 2. FEDERAZIONE
+  federation:
     strategia: "NODE_MARGIN"
     nodi:
-      - idNodo: "milano-edge-01" # Il tuo nodo principale
-        indirizzoIP: "192.168.64.3" # Inserisci l'IP reale della prima VM
+      - idNodo: "milano-edge-01"
+        indirizzoIP: "192.168.64.3"
         tipoNodo: "MEDIUM"
         funzioni: ["image-proc", "face-det", "figlet"]
-        idVicini:
-          "torino-edge-02": 100
 
-      - idNodo: "torino-edge-02"
-        indirizzoIP: "192.168.64.5"
-        tipoNodo: "LOW"
-        funzioni: ["image-proc", "figlet"]
-
-  # 3. PROFILO DI CARICO (Generato da k6 verso i nodi sopra)
-  profiloCarico:
+  # 3. PROFILO CARICO
+  loadProfile:
     commonHeaders: "'Content-Type':'text/plain'"
     scenari:
       - nomeScenario: "test-carico-principale"
-        targetNodeID: "milano-edge-01" # Punta al primo nodo tramite ID
+        targetNodeID: "milano-edge-01"
         nomeFunzioneTarget: "figlet"
         body: "test carico da venticinque"
         esecutore: "RAMPING_ARRIVAL_RATE"
         vuAllocati: 100
-        startTime: 0
         stages:
-          - durata: "30s"
+          - durata: "15s"
             targetRps: 10
-          - durata: "1m"
-            targetRps: 50
           - durata: "30s"
+            targetRps: 50
+          - durata: "15s"
             targetRps: 0

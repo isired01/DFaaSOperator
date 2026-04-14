@@ -2,18 +2,20 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
-	dfaasv1 "dfaas-operator/api/v1"
-	"fmt"
-
 	batchv1 "k8s.io/api/batch/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // Ecco il colpevole dell'errore
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	dfaasv1 "dfaas-operator/api/v1"
 )
 
 func (r *EsperimentoReconciler) handleDeletion(ctx context.Context,
@@ -47,48 +49,25 @@ func (r *EsperimentoReconciler) handleDeletion(ctx context.Context,
 	return ctrl.Result{}, nil
 }
 
-func (r *EsperimentoReconciler) reconcileReady(ctx context.Context,
+func (r *EsperimentoReconciler) reconcileInfra(ctx context.Context,
 	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
+	log.Info("☁️ Fase 1: Provisioning Infrastruttura (VM/Nodi)...")
 
-	// 1. Iniezione Target Prometheus
-	// Qui la logica interna userà il nuovo loop sugli IP dei nodi
-	if err := r.reconcilePrometheusTargets(ctx, exp); err != nil {
-		log.Error(err, "❌ Fallito aggiornamento target Prometheus")
-		r.setCondition(ctx, exp, "PrometheusTargetsReady", metav1.ConditionFalse, "ConfigUpdateFailed", err.Error())
-		return r.updateStatus(ctx, exp, "FAILED")
-	}
-	r.setCondition(ctx, exp, "PrometheusTargetsReady", metav1.ConditionTrue, "ConfigUpdated", "Target inseriti correttamente")
+	// 1. Segnaliamo l'inizio del provisioning (Status: False, Reason: ProvisioningStarted)
+	r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionFalse,
+		"ProvisioningStarted", "Configurazione nodi DFaaS in corso...")
 
-	// 2. Generazione Script k6 (Ora usa la logica della mappa IP)
-	script, err := r.buildScriptK6(exp)
-	if err != nil {
-		log.Error(err, "❌ Errore nella generazione dello script k6 (probabile IP mancante)")
-		r.setCondition(ctx, exp, "K6ConfigReady", metav1.ConditionFalse, "TemplateError", err.Error())
-		// Fondamentale: aggiorniamo il messaggio di errore visibile all'utente
-		exp.Status.Message = fmt.Sprintf("Errore script: %v", err)
-		return r.updateStatus(ctx, exp, "FAILED")
-	}
+	// --- Logica Futura (Terraform / Script SSH) ---
+	// Qui simuleremo il successo immediato per ora.
+	// ----------------------------------------------
 
-	// Creazione ConfigMap per lo script
-	if err := r.reconcileK6Config(ctx, exp, script); err != nil {
-		log.Error(err, "❌ Fallita creazione ConfigMap k6")
-		r.setCondition(ctx, exp, "K6ConfigReady", metav1.ConditionFalse, "ConfigMapCreationFailed", err.Error())
-		return r.updateStatus(ctx, exp, "FAILED")
-	}
-	r.setCondition(ctx, exp, "K6ConfigReady", metav1.ConditionTrue, "ConfigMapCreated", "Script k6 caricato")
+	// 2. Provisioning Completato (Status: True)
+	log.Info("✅ Infrastruttura verificata.")
+	r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionTrue,
+		"ProvisioningSucceeded", "Tutti i nodi DFaaS sono raggiungibili")
 
-	// 3. Lancio del Job k6
-	if err := r.runK6Job(ctx, exp); err != nil {
-		log.Error(err, "❌ Impossibile avviare il Job k6")
-		r.setCondition(ctx, exp, "K6JobLaunched", metav1.ConditionFalse, "JobCreationFailed", err.Error())
-		return r.updateStatus(ctx, exp, "FAILED")
-	}
-
-	r.setCondition(ctx, exp, "K6JobLaunched", metav1.ConditionTrue, "JobCreated", "Job avviato")
-
-	log.Info("🚀 Esperimento in esecuzione!", "nome", exp.Name)
-	return r.updateStatus(ctx, exp, "RUNNING")
+	return r.updateStatus(ctx, exp, "PROVISIONING_MONITORING")
 }
 
 func (r *EsperimentoReconciler) reconcileMonitoring(ctx context.Context,
@@ -113,25 +92,65 @@ func (r *EsperimentoReconciler) reconcileMonitoring(ctx context.Context,
 	return r.updateStatus(ctx, exp, "READY")
 }
 
-func (r *EsperimentoReconciler) reconcileInfra(ctx context.Context,
-	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
+func (r *EsperimentoReconciler) reconcileReady(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
-	log.Info("☁️ Fase 1: Provisioning Infrastruttura (VM/Nodi)...")
 
-	// 1. Segnaliamo l'inizio del provisioning (Status: False, Reason: ProvisioningStarted)
-	r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionFalse,
-		"ProvisioningStarted", "Configurazione nodi DFaaS in corso...")
+	// 1. "Get" della condizione PrometheusTargetsReady
+	cond := meta.FindStatusCondition(exp.Status.Conditions, "PrometheusTargetsReady")
 
-	// --- Logica Futura (Terraform / Script SSH) ---
-	// Qui simuleremo il successo immediato per ora.
-	// ----------------------------------------------
+	// Se la condizione non esiste o non è True, iniettiamo i target
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		if err := r.reconcilePrometheusTargets(ctx, exp); err != nil {
+			log.Error(err, "❌ Fallito aggiornamento target Prometheus")
+			r.setCondition(ctx, exp, "PrometheusTargetsReady", metav1.ConditionFalse, "ConfigUpdateFailed", err.Error())
+			return r.updateStatus(ctx, exp, "FAILED")
+		}
+		r.setCondition(ctx, exp, "PrometheusTargetsReady", metav1.ConditionTrue, "ConfigUpdated", "Target inseriti correttamente")
 
-	// 2. Provisioning Completato (Status: True)
-	log.Info("✅ Infrastruttura verificata.")
-	r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionTrue,
-		"ProvisioningSucceeded", "Tutti i nodi DFaaS sono raggiungibili")
+		if err := r.Status().Update(ctx, exp); err != nil {
+			return ctrl.Result{}, err
+		}
 
-	return r.updateStatus(ctx, exp, "PROVISIONING_MONITORING")
+		log.Info("⏳ Target inseriti. Attendo il ricaricamento (10s)...") //TODO: così non va bene nonn aspetta quasi mai serve una fase in più
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// 2. ORA LANCIA IL LAVORO (Quello che mancava!)
+	log.Info("🎯 Target già verificati, preparo k6...")
+
+	// Genera lo script k6
+	script, err := r.buildScriptK6(exp)
+	if err != nil {
+		return r.updateStatus(ctx, exp, "FAILED")
+	}
+
+	// Crea la ConfigMap con lo script
+	if err := r.reconcileK6Config(ctx, exp, script); err != nil {
+		log.Error(err, "❌ Fallita creazione ConfigMap k6")
+		return r.updateStatus(ctx, exp, "FAILED")
+	}
+
+	// 3. LANCIO EFFETTIVO DEL JOB
+	if err := r.runK6Job(ctx, exp); err != nil {
+		if errors.IsAlreadyExists(err) {
+			log.Info("🏃 Job k6 già presente, procedo...")
+		} else {
+			log.Error(err, "❌ Impossibile avviare il Job k6")
+			return r.updateStatus(ctx, exp, "FAILED")
+		}
+	}
+
+	now := metav1.Now()
+	exp.Status.StartTime = &now
+
+	// Forza il salvataggio di TUTTO lo Status (incluso StartTime) prima di uscire
+	if err := r.Status().Update(ctx, exp); err != nil {
+		log.Error(err, "❌ Impossibile salvare StartTime")
+		return ctrl.Result{}, err
+	}
+
+	log.Info("🚀 StartTime salvato. Passo in RUNNING")
+	return r.updateStatus(ctx, exp, "RUNNING")
 }
 
 func (r *EsperimentoReconciler) reconcileRunning(ctx context.Context,
@@ -151,8 +170,11 @@ func (r *EsperimentoReconciler) reconcileRunning(ctx context.Context,
 	// 2. Controllo successo
 	if job.Status.Succeeded > 0 {
 		log.Info("✅ Test k6 completato con successo")
+		now := metav1.Now()
+		exp.Status.EndTime = &now
 		r.setCondition(ctx, exp, "K6TestExecution", metav1.ConditionTrue,
 			"TestSucceeded", "Il carico è stato generato e inviato a Prometheus")
+
 		return r.updateStatus(ctx, exp, "COOLDOWN")
 	}
 
@@ -172,12 +194,9 @@ func (r *EsperimentoReconciler) reconcileRunning(ctx context.Context,
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-func (r *EsperimentoReconciler) reconcileCooldown(ctx context.Context,
-	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
+func (r *EsperimentoReconciler) reconcileCooldown(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	// 1. Controlliamo se è la prima volta che entriamo in questa funzione per questo stato
-	// Se la condizione non esiste ancora, significa che siamo appena "atterrati" qui.
 	condition := meta.FindStatusCondition(exp.Status.Conditions, "MetricsPersisted")
 
 	if condition == nil {
@@ -185,17 +204,56 @@ func (r *EsperimentoReconciler) reconcileCooldown(ctx context.Context,
 		r.setCondition(ctx, exp, "MetricsPersisted", metav1.ConditionFalse,
 			"AwaitingFlush", "Il test è finito. Attesa 30s per il flush dei dati...")
 
-		// Diciamo a Kubernetes: "Metti questo esperimento in pausa e richiamami tra 30 secondi"
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// 2. Se arriviamo qui, significa che i 30 secondi sono PASSATI
-	// (perché Kubernetes ci ha richiamati dopo il RequeueAfter)
-	log.Info("✅ Cooldown terminato. Passo al Cleanup.")
+	log.Info("✅ Cooldown terminato. Passo a EXPORT_METRICHE.")
 	r.setCondition(ctx, exp, "MetricsPersisted", metav1.ConditionTrue,
 		"FlushComplete", "Metriche consolidate correttamente")
 
-	return r.updateStatus(ctx, exp, "CLEANUP")
+	// Passiamo alla fase di Export, non Cleanup direttamente!
+	return r.updateStatus(ctx, exp, "EXPORT_METRICHE")
+}
+
+func (r *EsperimentoReconciler) reconcileExportMetrics(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	var job batchv1.Job
+	err := r.Get(ctx, client.ObjectKey{Name: exp.Name + "-exporter-job", Namespace: "monitoring"}, &job)
+
+	// SCENARIO 1: Il Job non esiste, lo creiamo
+	if errors.IsNotFound(err) {
+		log.Info("🚀 Job non trovato, lo sto creando...")
+		if errLaunch := r.runExporterJob(ctx, exp); errLaunch != nil {
+			log.Error(errLaunch, "❌ Impossibile lanciare il Job di Export")
+			r.setCondition(ctx, exp, "MetricsPersistedOnCSV", metav1.ConditionFalse,
+				"LaunchFailed", fmt.Sprintf("Errore creazione Job: %v", errLaunch))
+			return ctrl.Result{}, errLaunch
+		}
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	} else if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// SCENARIO 2: Il Job è fallito
+	if job.Status.Failed > 0 {
+		log.Error(nil, "❌ Il Job di Export è fallito")
+		r.setCondition(ctx, exp, "MetricsPersistedOnCSV", metav1.ConditionFalse,
+			"JobFailed", "Il container di export ha terminato con un errore")
+		return r.updateStatus(ctx, exp, "FAIL")
+	}
+
+	// SCENARIO 3: Il Job è finito con successo
+	if job.Status.Succeeded > 0 {
+		log.Info("✅ Job di Export completato con successo")
+		r.setCondition(ctx, exp, "MetricsPersistedOnCSV", metav1.ConditionTrue,
+			"ExportCompleted", "Il file CSV è stato generato correttamente")
+		return r.updateStatus(ctx, exp, "CLEANUP")
+	}
+
+	// SCENARIO 4: In corso
+	log.Info("⏳ Job di Export ancora in corso...")
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
 func (r *EsperimentoReconciler) reconcileCleanup(ctx context.Context,
@@ -204,19 +262,19 @@ func (r *EsperimentoReconciler) reconcileCleanup(ctx context.Context,
 	log.Info("🧹 Pulizia risorse post-esperimento...")
 
 	// 1. Iniziamo la pulizia (Status: False)
-	r.setCondition(ctx, exp, "InfrastructureCleaned", metav1.ConditionFalse,
+	r.setCondition(ctx, exp, "MonitoringCleanUP", metav1.ConditionFalse,
 		"CleanupStarted", "Rimozione target Prometheus e deallocazione risorse...")
 
 	// 2. Esecuzione pulizia Prometheus
 	if err := r.cleanupPrometheusTargets(ctx, exp); err != nil {
 		log.Error(err, "⚠️ Errore durante il cleanup dei target")
-		r.setCondition(ctx, exp, "InfrastructureCleaned", metav1.ConditionFalse,
+		r.setCondition(ctx, exp, "MonitoringCleanUP", metav1.ConditionFalse,
 			"CleanupFailed", err.Error())
 		// Decidiamo di proseguire comunque verso COMPLETED per non bloccare l'oggetto
 		// o potresti restare in CLEANUP per riprovare.
 	} else {
 		// 3. Pulizia completata con successo (Status: True)
-		r.setCondition(ctx, exp, "InfrastructureCleaned", metav1.ConditionTrue,
+		r.setCondition(ctx, exp, "MonitoringCleanUP", metav1.ConditionTrue,
 			"CleanupSucceeded", "Tutte le risorse temporanee sono state rimosse")
 	}
 

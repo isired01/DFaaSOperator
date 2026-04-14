@@ -39,7 +39,7 @@ spec:
           spec:
             description: EsperimentoSpec definisce lo stato desiderato di Esperimento
             properties:
-              federazione:
+              federation:
                 properties:
                   nodi:
                     items:
@@ -72,18 +72,7 @@ spec:
                 - nodi
                 - strategia
                 type: object
-              metriche:
-                items:
-                  properties:
-                    commento:
-                      type: string
-                    query:
-                      type: string
-                  required:
-                  - query
-                  type: object
-                type: array
-              profiloCarico:
+              loadProfile:
                 properties:
                   commonHeaders:
                     type: string
@@ -130,9 +119,32 @@ spec:
                 required:
                 - scenari
                 type: object
+              metrics:
+                items:
+                  properties:
+                    metrics:
+                      items:
+                        properties:
+                          comment:
+                            type: string
+                          query:
+                            type: string
+                        required:
+                        - query
+                        type: object
+                      type: array
+                    outDir:
+                      type: string
+                    step:
+                      type: integer
+                  required:
+                  - metrics
+                  - step
+                  type: object
+                type: array
             required:
-            - federazione
-            - profiloCarico
+            - federation
+            - loadProfile
             type: object
           status:
             description: EsperimentoStatus definisce lo stato osservato di Esperimento
@@ -206,12 +218,18 @@ spec:
                   - type
                   type: object
                 type: array
+              endTime:
+                format: date-time
+                type: string
               fase:
                 description: 'Fase dell''automa: IDLE, VALIDAZIONE_FILE, PROVISIONING,
                   READY, RUNNING, COOL_DOWN, EXPORT_METRICHE, RESULTS, CLEANUP, FAIL'
                 type: string
               message:
                 description: Messaggio di dettaglio (es. motivo di un fallimento)
+                type: string
+              startTime:
+                format: date-time
                 type: string
             type: object
         type: object

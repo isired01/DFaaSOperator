@@ -99,9 +99,12 @@ func (r *EsperimentoReconciler) buildScriptK6(exp *dfaasv1.Esperimento) (string,
 	return script.String(), nil
 }
 
-func (r *EsperimentoReconciler) runK6Job(ctx context.Context,
-	exp *dfaasv1.Esperimento) error {
-	terminate := int64(30000000)
+func (r *EsperimentoReconciler) runK6Job(ctx context.Context, exp *dfaasv1.Esperimento) error {
+	// Teniamo solo il timeout di esecuzione per sicurezza (5 minuti)
+	terminate := int64(300)
+
+	// Percorso temporaneo interno al container per il CSV
+	tempCsvPath := "/tmp/k6_results.csv"
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -110,22 +113,32 @@ func (r *EsperimentoReconciler) runK6Job(ctx context.Context,
 		},
 		Spec: batchv1.JobSpec{
 			ActiveDeadlineSeconds: &terminate,
+			// TTL RIMOSSO: Il Job resta nel cluster finché non lo cancelli tu
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
 					Containers: []corev1.Container{
 						{
-							Name:  "k6",
-							Image: "grafana/k6:1.4.2",
-							Args:  []string{"run", "/test/test.js", "--out", "experimental-prometheus-rw"},
+							Name:            "k6",
+							Image:           "ghcr.io/isired01/dfaas-operator/k6-minio:v1",
+							ImagePullPolicy: corev1.PullAlways,
+							Command:         []string{"/bin/sh", "-c"},
+							Args: []string{
+								fmt.Sprintf(
+									"k6 run /test/test.js --out csv=%s && "+
+										"mc alias set myminio http://minio-service.monitoring.svc.cluster.local:9000 admin password123 && "+
+										// ---Crea il bucket se non c'è ---
+										"mc mb -p myminio/dfaas-results && "+
+										"mc cp %s myminio/dfaas-results/%s/k6_report.csv",
+									tempCsvPath, tempCsvPath, exp.Name,
+								),
+							},
 							Env: []corev1.EnvVar{
 								{
-									// URL dell'endpoint write di Prometheus (usando il DNS interno di K8s)
 									Name:  "K6_PROMETHEUS_RW_SERVER_URL",
 									Value: "http://prometheus-service.monitoring.svc.cluster.local:9090/api/v1/write",
 								},
 								{
-									// Specifichiamo quali statistiche vogliamo
 									Name:  "K6_PROMETHEUS_RW_TREND_STATS",
 									Value: "p(95),p(99),avg,max",
 								},
@@ -144,7 +157,7 @@ func (r *EsperimentoReconciler) runK6Job(ctx context.Context,
 							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
 									LocalObjectReference: corev1.LocalObjectReference{
-										Name: exp.Name + "-script-k6", // Deve combaciare con la CM creata
+										Name: exp.Name + "-script-k6",
 									},
 								},
 							},
@@ -155,7 +168,6 @@ func (r *EsperimentoReconciler) runK6Job(ctx context.Context,
 		},
 	}
 
-	// Imposta l'Esperimento come "proprietario" del Job (se cancelli l'esperimento, sparisce il job)
 	if err := ctrl.SetControllerReference(exp, job, r.Scheme); err != nil {
 		return err
 	}
@@ -163,6 +175,7 @@ func (r *EsperimentoReconciler) runK6Job(ctx context.Context,
 	return r.Create(ctx, job)
 }
 
+// Crea una config map con la config per k6 (lo script)
 func (r *EsperimentoReconciler) reconcileK6Config(ctx context.Context,
 	exp *dfaasv1.Esperimento, script string) error {
 	cm := &corev1.ConfigMap{
