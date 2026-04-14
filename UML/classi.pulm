@@ -7,11 +7,11 @@ skinparam class {
 }
 
 class Esperimento {
-    + String nome
-    + String versione
+    + String name
     + List<ConfigurazoneMetrica> metriche
     + ConfigurazioneFederazione federazione
     + ProfiloCarico profilo
+    + bool isCleanupRequested
 }
 
 class EsperimentoStatus {
@@ -31,6 +31,7 @@ class ConfigurazioneFederazione {
 
 class ConfigurazioneNodo {
     + String idNodo
+    + String indirizzoIP
     + NodeCapacity capacitàNodo
     + List<String> funzioni
     + Map<String, Integer> idVicini

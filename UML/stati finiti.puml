@@ -15,20 +15,19 @@ state IDLE{
   IDLE : Attesa creazione Esperimento (Attesa CDR)
 }
 
-IDLE --> Validazione_file : Esperimento Creato
-
-
-Validazione_file --> PROVISIONING : File Validato
-
-
-state PROVISIONING {
-  CLEANUP : Pulizia risorse preesistenti
-  CLEANUP --> CostruzioneFederazione : OK
+state PROVISIONING_INFRA {
   CostruzioneFederazione : Costruisco DFaaS Desiderato
   CostruzioneFederazione --> VerificaProvisioning : OK
   VerificaProvisioning : Verifico che tutto sia pronto
-  VerificaProvisioning : (Federazione, pod Prometeus, pod Grafana)
+}
 
+state PROVISIONING_MONITORING {
+  ProvisioningPrometheus : Provisioning Prometheus
+  ProvisioningPrometheus --> VerificaProvisioningMonitoring : OK
+  ProvisioningGrafana : Provisioning Grafana
+  ProvisioningGrafana --> VerificaProvisioningMonitoring : OK
+  VerificaProvisioningMonitoring : Verifico che Prometheus e Grafana siano pronti
+  
 }
 
 state READY {
@@ -40,31 +39,34 @@ state READY {
 }
 
 state RUNNING {
-  MonitoraggioJob : Verifica completamento 
-  MonitoraggioJob : o fallimento del Job
-
+  MonitoraggioJobK6 : Verifica completamento 
+  MonitoraggioJobK6 : o fallimento del Job
   LiveObservability : Apertura Dashboard Grafana 
-
 }
 
 state COOLDOWN {
   BufferSync : Attesa sincronizzazione 
   BufferSync : buffer Prometheus (Dati k6)
+  BufferSync --> Estrazioni : OK
+  Estrazioni : Estrazione dati da Prometheus to CSV e salvati in MinIO
 }
 
 state COMPLETED {
-  CLEANUP : Pulizia risorse
-
+  CLEANUP : Pulizia risorse (se richiesto dall'utente)
 }
 
 ' Transizioni di alto livello
-PROVISIONING --> READY : Successo Infra
+IDLE --> Validazione_file : Esperimento Creato
+Validazione_file -->  PROVISIONING_INFRA: File Validato
+PROVISIONING_INFRA --> PROVISIONING_MONITORING : Infra Pronta
+PROVISIONING_MONITORING --> READY : Piattaforma monitoring Pronta
 READY --> RUNNING : Carico Pronto
 RUNNING --> COOLDOWN : Fine Test
 COOLDOWN --> COMPLETED : Dati Pronti
 
 ' Gestione Errore
-PROVISIONING --> FAILED : Timeout/Errore
+PROVISIONING_INFRA --> FAILED : Timeout/Errore
+PROVISIONING_MONITORING --> FAILED : Timeout/Errore
 READY --> FAILED : Errore Config
 RUNNING --> FAILED : Crash k6
 
