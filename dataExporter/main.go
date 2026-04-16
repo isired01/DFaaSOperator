@@ -23,7 +23,7 @@ func main() {
 	startStr := os.Getenv("START_TIME")
 	endStr := os.Getenv("END_TIME")
 	stepStr := os.Getenv("STEP")
-	outDir := os.Getenv("OUT_DIR")
+
 	expName := os.Getenv("EXP_NAME")
 
 	// Credenziali MinIO (Assicurati che l'operatore le passi correttamente)
@@ -44,6 +44,7 @@ func main() {
 	}
 	promAPI := v1.NewAPI(client)
 
+	outDir := "tmp/export"
 	// 4. Creazione File CSV Locale (Temporaneo)
 	_ = os.MkdirAll(outDir, 0755)
 	fileName := fmt.Sprintf("%s/%s_report.csv", outDir, expName)

@@ -14,7 +14,7 @@ spec:
 
   # 2. FEDERAZIONE
   federation:
-    strategia: "NODE_MARGIN"
+    strategy: "NODE_MARGIN"
     nodi:
       - idNodo: "milano-edge-01"
         indirizzoIP: "192.168.64.3"
