@@ -107,12 +107,15 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 
 	case "COOLDOWN":
 		log.Info("Inizio COOLDOWN")
-		return r.updateStatus(ctx, &exp, "CLEANUP") // Transizione rapida
+		return r.reconcileCooldown(ctx, &exp)
+
+	case "EXPORT_METRICHE":
+		log.Info("📊 Fase EXPORT_METRICHE")
+		return r.reconcileExportMetrics(ctx, &exp)
 
 	case "CLEANUP":
 		log.Info("Inizio CLEANUP")
-		r.cleanupPrometheusTargets(ctx, &exp)
-		return r.updateStatus(ctx, &exp, "COMPLETED")
+		return r.reconcileCleanup(ctx, &exp)
 
 	case "COMPLETED":
 		log.Info("Esperimento Completo")
@@ -134,6 +137,7 @@ func (r *EsperimentoReconciler) updateStatus(ctx context.Context,
 
 	// 2. Aggiorniamo la fase sulla versione appena scaricata
 	latestExp.Status.Fase = fase
+
 	if err := r.Status().Update(ctx, latestExp); err != nil {
 		return ctrl.Result{}, err
 	}
