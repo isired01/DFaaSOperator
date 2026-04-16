@@ -225,26 +225,19 @@ func (r *EsperimentoReconciler) runExporterJob(ctx context.Context, exp *dfaasv1
 
 	var allQueries []string
 	var step string
-	var outDir string
 
 	if len(exp.Spec.ConfigMetriche) > 0 {
 		conf := exp.Spec.ConfigMetriche[0]
 		step = fmt.Sprintf("%ds", conf.Step)
-		outDir = conf.OutDir
 		for _, m := range conf.Metrics {
 			allQueries = append(allQueries, m.Query)
 		}
 	}
 
-	// Default se non specificato
-	if outDir == "" {
-		outDir = "/tmp/exports"
-	}
-
 	exporterJob := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      exp.Name + "-exporter-job",
-			Namespace: "monitoring",
+			Namespace: exp.Namespace,
 		},
 		Spec: batchv1.JobSpec{
 			Template: corev1.PodTemplateSpec{
@@ -262,14 +255,12 @@ func (r *EsperimentoReconciler) runExporterJob(ctx context.Context, exp *dfaasv1
 								{Name: "END_TIME", Value: exp.Status.EndTime.Format(time.RFC3339)},
 								{Name: "STEP", Value: step},
 								{Name: "QUERIES", Value: strings.Join(allQueries, "|")},
-								{Name: "OUT_DIR", Value: outDir},
 								{Name: "EXP_NAME", Value: exp.Name},
 								// --- NUOVE ENV PER MINIO ---
 								{Name: "MINIO_ENDPOINT", Value: "minio-service.monitoring:9000"},
 								{Name: "MINIO_ACCESS_KEY", Value: "admin"},
 								{Name: "MINIO_SECRET_KEY", Value: "password123"},
 							},
-							// NOTA: I VolumeMounts sono stati rimossi perché scriviamo via API su MinIO!
 						},
 					},
 				},

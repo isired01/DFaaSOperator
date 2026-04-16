@@ -92,7 +92,8 @@ func (r *EsperimentoReconciler) reconcileMonitoring(ctx context.Context,
 	return r.updateStatus(ctx, exp, "READY")
 }
 
-func (r *EsperimentoReconciler) reconcileReady(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
+func (r *EsperimentoReconciler) reconcileReady(ctx context.Context,
+	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
 	// 1. "Get" della condizione PrometheusTargetsReady
@@ -197,45 +198,58 @@ func (r *EsperimentoReconciler) reconcileRunning(ctx context.Context,
 func (r *EsperimentoReconciler) reconcileCooldown(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	condition := meta.FindStatusCondition(exp.Status.Conditions, "MetricsPersisted")
+	// 2. Calcoliamo quanto tempo è passato da EndTime
+	passato := time.Since(exp.Status.EndTime.Time)
+	attesa := 30 * time.Second
 
-	if condition == nil {
-		log.Info("⏳ Inizio Cooldown di 30s per consolidamento metriche")
-		r.setCondition(ctx, exp, "MetricsPersisted", metav1.ConditionFalse,
-			"AwaitingFlush", "Il test è finito. Attesa 30s per il flush dei dati...")
+	if passato < attesa {
+		rimanente := attesa - passato
+		log.Info("⏳ Cooldown in corso (basato su EndTime)...",
+			"passati", passato.Seconds(),
+			"rimanenti", rimanente.Seconds())
 
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		// Se non aggiorniamo lo Status, Kubernetes NON scatena il Reconcile immediato
+		// e rispetterà finalmente il RequeueAfter.
+		return ctrl.Result{RequeueAfter: rimanente}, nil
 	}
 
-	log.Info("✅ Cooldown terminato. Passo a EXPORT_METRICHE.")
-	r.setCondition(ctx, exp, "MetricsPersisted", metav1.ConditionTrue,
-		"FlushComplete", "Metriche consolidate correttamente")
-
-	// Passiamo alla fase di Export, non Cleanup direttamente!
+	// 3. Se sono passati i 30 secondi, cambiamo fase
+	log.Info("✅ Cooldown di 30s terminato. Passo a EXPORT_METRICHE.")
 	return r.updateStatus(ctx, exp, "EXPORT_METRICHE")
 }
-
 func (r *EsperimentoReconciler) reconcileExportMetrics(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
+	// 1. TENTATIVO DI RECUPERO DEL JOB
 	var job batchv1.Job
-	err := r.Get(ctx, client.ObjectKey{Name: exp.Name + "-exporter-job", Namespace: "monitoring"}, &job)
+	// NOTA: Assicurati che il namespace qui sia lo STESSO usato in runExporterJob
+	err := r.Get(ctx, client.ObjectKey{Name: exp.Name + "-exporter-job", Namespace: exp.Namespace}, &job)
 
-	// SCENARIO 1: Il Job non esiste, lo creiamo
-	if errors.IsNotFound(err) {
-		log.Info("🚀 Job non trovato, lo sto creando...")
-		if errLaunch := r.runExporterJob(ctx, exp); errLaunch != nil {
-			log.Error(errLaunch, "❌ Impossibile lanciare il Job di Export")
-			r.setCondition(ctx, exp, "MetricsPersistedOnCSV", metav1.ConditionFalse,
-				"LaunchFailed", fmt.Sprintf("Errore creazione Job: %v", errLaunch))
-			return ctrl.Result{}, errLaunch
+	if err != nil {
+		if errors.IsNotFound(err) {
+			log.Info("🚀 Job non trovato, lo sto creando...")
+			if errLaunch := r.runExporterJob(ctx, exp); errLaunch != nil {
+				// --- FIX QUI: Se il job è stato creato da un'altra reconcile un istante fa, non dare errore ---
+				if errors.IsAlreadyExists(errLaunch) {
+					log.Info("🏃 Job creato da un'altra istanza proprio ora, attendo il prossimo giro...")
+					return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+				}
+
+				log.Error(errLaunch, "❌ Impossibile lanciare il Job di Export")
+				r.setCondition(ctx, exp, "MetricsPersistedOnCSV", metav1.ConditionFalse,
+					"LaunchFailed", fmt.Sprintf("Errore creazione Job: %v", errLaunch))
+				return ctrl.Result{}, errLaunch
+			}
+			// Job creato con successo, diamogli tempo di apparire in etcd
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-	} else if err != nil {
+		// Altri errori di comunicazione con l'API Server
 		return ctrl.Result{}, err
 	}
 
-	// SCENARIO 2: Il Job è fallito
+	// 2. ANALISI DELLO STATO DEL JOB (Idempotenza)
+
+	// Caso A: Fallimento
 	if job.Status.Failed > 0 {
 		log.Error(nil, "❌ Il Job di Export è fallito")
 		r.setCondition(ctx, exp, "MetricsPersistedOnCSV", metav1.ConditionFalse,
@@ -243,16 +257,18 @@ func (r *EsperimentoReconciler) reconcileExportMetrics(ctx context.Context, exp 
 		return r.updateStatus(ctx, exp, "FAIL")
 	}
 
-	// SCENARIO 3: Il Job è finito con successo
+	// Caso B: Successo
 	if job.Status.Succeeded > 0 {
 		log.Info("✅ Job di Export completato con successo")
 		r.setCondition(ctx, exp, "MetricsPersistedOnCSV", metav1.ConditionTrue,
 			"ExportCompleted", "Il file CSV è stato generato correttamente")
+
+		// Proseguiamo verso la pulizia o i risultati
 		return r.updateStatus(ctx, exp, "CLEANUP")
 	}
 
-	// SCENARIO 4: In corso
-	log.Info("⏳ Job di Export ancora in corso...")
+	// Caso C: In esecuzione
+	log.Info("⏳ Job di Export ancora in corso...", "Succeeded", job.Status.Succeeded, "Active", job.Status.Active)
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
