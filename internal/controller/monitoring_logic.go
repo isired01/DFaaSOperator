@@ -7,8 +7,6 @@ import (
 	"encoding/json"
 	"strings"
 
-	batchv1 "k8s.io/api/batch/v1"
-
 	dfaasv1 "dfaas-operator/api/v1"
 
 	corev1 "k8s.io/api/core/v1"
@@ -136,7 +134,7 @@ func (r *EsperimentoReconciler) reconcilePrometheusTargets(ctx context.Context, 
 			Labels: map[string]string{
 				"esperimento": exp.Name,
 				"nodo_id":     nodo.IDNodo,
-				"tipo_nodo":   nodo.Capacita,
+				"tipo_nodo":   string(nodo.Capacita),
 			},
 		}
 		targets = append(targets, target)

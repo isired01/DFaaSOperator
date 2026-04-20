@@ -14,10 +14,14 @@ spec:
     singular: esperimento
   scope: Namespaced
   versions:
-  - name: v1
+  - additionalPrinterColumns:
+    - jsonPath: .status.fase
+      name: Phase
+      type: string
+    name: v1
     schema:
       openAPIV3Schema:
-        description: Esperimento è lo schema per l'API degli esperimenti
+        description: Esperimento è lo schema per la risorsa singola
         properties:
           apiVersion:
             description: |-
@@ -37,172 +41,81 @@ spec:
           metadata:
             type: object
           spec:
-            description: EsperimentoSpec definisce lo stato desiderato di Esperimento
+            description: EsperimentoSpec definisce i parametri di configurazione del
+              SINGOLO esperimento
             properties:
-              federation:
-                description: Configurazione della strategia di federazione tra nodi
+              federazione:
+                description: Configurazione della federazione dedicata
                 properties:
                   nodi:
-                    description: Configurazione specifica per ogni nodo della federazione
+                    description: Lista dei nodi della federazione per questo specifico
+                      esperimento
                     items:
                       properties:
+                        capacita:
+                          type: string
                         funzioni:
-                          description: Elenco delle funzioni distribuite su questo
-                            nodo
                           items:
                             type: string
-                          minItems: 1
                           type: array
                         idNodo:
-                          description: ID univoco del nodo all'interno della rete
-                          minLength: 1
                           type: string
-                        idVicini:
-                          additionalProperties:
-                            type: integer
-                          description: 'Mappa delle adiacenze: IDNodo -> Latenza stimata
-                            (ms)'
-                          type: object
                         indirizzoIP:
-                          description: Indirizzo IPv4 del nodo
-                          pattern: ^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$
-                          type: string
-                        tipoNodo:
-                          default: MEDIUM
-                          description: Classe di potenza del nodo (capacità computazionale)
                           type: string
                       required:
+                      - capacita
                       - funzioni
                       - idNodo
                       - indirizzoIP
-                      - tipoNodo
                       type: object
                     minItems: 1
                     type: array
-                  strategy:
-                    default: BASE
-                    description: Strategia di federazione del carico
+                  strategia:
+                    description: 'Strategia di load balancing (es: "ROUND_ROBIN")'
                     type: string
                 required:
                 - nodi
-                - strategy
+                - strategia
                 type: object
-              loadProfile:
-                description: Profilo di carico e scenari per il test k6
+              isCleanupRequested:
+                default: false
+                description: Flag per richiedere la pulizia delle risorse a fine test
+                type: boolean
+              name:
+                description: Nome identificativo dell'esperimento (può differire dal
+                  nome della risorsa K8s)
+                type: string
+              topologia:
+                description: Topologia di rete dell'esperimento
                 properties:
-                  commonHeaders:
-                    description: Header comuni a tutte le richieste (formato JSON
-                      string)
-                    type: string
-                  scenari:
-                    description: Elenco degli scenari di carico da eseguire
+                  links:
+                    description: Definizione dei link di rete tra i nodi dell'esperimento
                     items:
                       properties:
-                        body:
-                          description: Body della richiesta (opzionale, per POST/PUT)
-                          type: string
-                        dataPath:
-                          description: Eventuale percorso a un file di dati
-                          type: string
-                        esecutore:
-                          default: CONSTANT_ARRIVAL_RATE
-                          description: Tipo di esecutore k6
-                          enum:
-                          - CONSTANT_ARRIVAL_RATE
-                          - RAMPING_ARRIVAL_RATE
-                          type: string
-                        nomeFunzioneTarget:
-                          description: Nome della funzione da testare sul nodo
-                          type: string
-                        nomeScenario:
-                          description: Nome identificativo dello scenario
-                          minLength: 1
-                          type: string
-                        stages:
-                          description: Definizione dei carichi (fasi del test)
-                          items:
-                            properties:
-                              durata:
-                                description: 'Durata della fase di test (es: "30s",
-                                  "1m", "2h")'
-                                pattern: ^[0-9]+(s|m|h)$
-                                type: string
-                              targetRps:
-                                description: Target di richieste al secondo (RPS)
-                                  da raggiungere in questa fase
-                                minimum: 0
-                                type: integer
-                            required:
-                            - durata
-                            - targetRps
-                            type: object
-                          minItems: 1
-                          type: array
-                        startTime:
-                          default: 0
-                          description: Offset di inizio dello scenario in secondi
-                          minimum: 0
+                        latenzaMs:
                           type: integer
-                        targetNodeID:
-                          description: ID del nodo target della federazione
+                        nodoA:
                           type: string
-                        vuAllocati:
-                          description: Numero di Virtual Users da allocare per questo
-                            scenario
-                          minimum: 1
-                          type: integer
+                        nodoB:
+                          type: string
                       required:
-                      - esecutore
-                      - nomeFunzioneTarget
-                      - nomeScenario
-                      - stages
-                      - targetNodeID
-                      - vuAllocati
+                      - latenzaMs
+                      - nodoA
+                      - nodoB
                       type: object
-                    minItems: 1
                     type: array
                 required:
-                - scenari
+                - links
                 type: object
-              metrics:
-                description: Configurazione delle metriche da monitorare ed esportare
-                items:
-                  properties:
-                    metrics:
-                      description: Lista delle metriche da raccogliere
-                      items:
-                        properties:
-                          comment:
-                            description: Note opzionali per descrivere la metrica
-                            maxLength: 100
-                            type: string
-                          query:
-                            description: 'La query PromQL da eseguire (es: rate(http_requests_total[5m]))'
-                            minLength: 3
-                            type: string
-                        required:
-                        - query
-                        type: object
-                      minItems: 1
-                      type: array
-                    step:
-                      default: 15
-                      description: Step di campionamento (intervallo tra le rilevazioni)
-                      minimum: 1
-                      type: integer
-                  required:
-                  - metrics
-                  - step
-                  type: object
-                minItems: 1
-                type: array
             required:
-            - federation
-            - loadProfile
-            - metrics
+            - federazione
+            - isCleanupRequested
+            - name
+            - topologia
             type: object
           status:
-            description: EsperimentoStatus definisce lo stato osservato di Esperimento
+            description: EsperimentoStatus definisce lo stato osservato dell'istanza
+              (gestito dal Controller)
             properties:
               conditions:
                 description: Conditions rappresenta l'osservazione dello stato attuale
@@ -281,11 +194,10 @@ spec:
                 type: string
               fase:
                 default: IDLE
-                description: Fase attuale dell'esperimento (Macchina a Stati)
+                description: Stato attuale dell'esecuzione
                 type: string
               message:
-                description: Messaggio leggibile dall'utente con dettagli sullo stato
-                  (es. errore specifico)
+                description: Messaggio di dettaglio (es. motivo di un FAILED)
                 type: string
               startTime:
                 description: Timestamp di inizio dell'esecuzione effettiva

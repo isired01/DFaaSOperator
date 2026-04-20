@@ -3,16 +3,16 @@ package main
 import (
 	"context"
 	"encoding/csv"
-	"log"
-	"os"
-	"strings"
-	"time"
-
+	"fmt"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/prometheus/client_golang/api"
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
+	"log"
+	"os"
+	"strings"
+	"time"
 )
 
 func main() {

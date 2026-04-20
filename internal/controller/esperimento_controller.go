@@ -124,7 +124,7 @@ func (r *EsperimentoReconciler) updateStatus(ctx context.Context,
 	}
 
 	// 2. Aggiorniamo la fase sulla versione appena scaricata
-	latestExp.Status.Fase = fase
+	latestExp.Status.Fase = dfaasv1.FaseEsperimento(fase)
 
 	if err := r.Status().Update(ctx, latestExp); err != nil {
 		return ctrl.Result{}, err

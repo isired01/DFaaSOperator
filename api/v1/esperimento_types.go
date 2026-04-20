@@ -13,14 +13,14 @@ import (
 type FaseEsperimento string
 
 const (
-	FaseIdle        FaseEsperimento = "IDLE"
-	FaseProvision   FaseEsperimento = "PROVISIONING"
-	FaseReady       FaseEsperimento = "READY"
-	FaseRunning     FaseEsperimento = "RUNNING"
-	FaseCooldown    FaseEsperimento = "COOLDOWN"
-	FaseCompleted   FaseEsperimento = "COMPLETED"
-	FaseFailed      FaseEsperimento = "FAILED"
-	FaseCleanup     FaseEsperimento = "CLEANUP"
+	FaseIdle      FaseEsperimento = "IDLE"
+	FaseProvision FaseEsperimento = "PROVISIONING"
+	FaseReady     FaseEsperimento = "READY"
+	FaseRunning   FaseEsperimento = "RUNNING"
+	FaseCooldown  FaseEsperimento = "COOLDOWN"
+	FaseCompleted FaseEsperimento = "COMPLETED"
+	FaseFailed    FaseEsperimento = "FAILED"
+	FaseCleanup   FaseEsperimento = "CLEANUP"
 )
 
 type NodeCapacity string

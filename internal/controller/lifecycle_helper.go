@@ -91,7 +91,6 @@ func (r *EsperimentoReconciler) reconcileMonitoring(ctx context.Context,
 	return r.updateStatus(ctx, exp, "READY")
 }
 
-
 func (r *EsperimentoReconciler) reconcileCooldown(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
