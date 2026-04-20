@@ -1,5 +1,5 @@
 @startuml
-title Classi Esperimento DFaaS (Allineato a v1 API Go)
+title CDR per Infrastruttura -- Class Diagram
 
 skinparam class {
     BackgroundColor<<CRD>> #E1F5FE
@@ -8,76 +8,50 @@ skinparam class {
 
 class Esperimento {
     + String name
-    + List<ConfigurazoneMetrica> metriche
-    + ConfigurazioneFederazione federazione
-    + ProfiloCarico profilo
+    + Federazione federazione
     + bool isCleanupRequested
-}
-
-class EsperimentoStatus {
+    + Topologia topologia
     + FaseEsperimento fase
     + String message
 }
 
-class ConfigurazoneMetrica {
-    + String query
-    + String commento
-}
-
-class ConfigurazioneFederazione {
+class Federazione {
     + LoadBalancing strategia
-    + List<ConfigurazioneNodo> nodi
+    + List<Nodo> nodi
 }
 
-class ConfigurazioneNodo {
+class Nodo {
     + String idNodo
     + String indirizzoIP
     + NodeCapacity capacitàNodo
     + List<String> funzioni
-    + Map<String, Integer> idVicini
 }
 
-class ProfiloCarico {
-    + String commonHeaders
-    + List<Scenario> scenari
+class Topologia {
+    + List<Link> links
 }
 
-class Scenario {
-    + String nomeScenario
-    + String targetNodeID
-    + String nomeFunzioneTarget
-    + String body
-    + String dataPath
-    + TipoEsecutore esecutore
-    + List<StageK6> stages
-    + Integer vuAllocati
-    + Integer startTime
+class Link {
+    + String nodoA
+    + String nodoB
+    + int latenzaMs
 }
 
-class StageK6 {
-    + String durata
-    + Integer targetRps
-}
+
+' Relazioni
+Esperimento *-- Topologia
+Topologia *-- "many" Link
+
 
 ' Relazioni di composizione (Spec/Status)
 
-Esperimento *-- EsperimentoStatus
+FaseEsperimento --> Esperimento 
 
 ' Relazioni Spec
-Esperimento *-- "many" ConfigurazoneMetrica
-Esperimento *-- ConfigurazioneFederazione
-Esperimento *-- ProfiloCarico
+Esperimento *-- Federazione
 
 ' Relazioni Federazione
-ConfigurazioneFederazione *-- "many" ConfigurazioneNodo
-
-' Relazioni k6
-ProfiloCarico *-- "many" Scenario
-Scenario *-- "many" StageK6
-
-note bottom of ConfigurazioneNodo
-  idVicini mappa IDNodo -> Latenza(ms)
-end note
+Federazione *-- "many" Nodo
 
 enum FaseEsperimento {
   IDLE
@@ -90,15 +64,6 @@ enum FaseEsperimento {
   CLEANUP
 }
 
-EsperimentoStatus--> FaseEsperimento
-
-
-enum TipoEsecutore {
-    CONSTANT_ARRIVAL_RATE
-    RAMPING_ARRIVAL_RATE
-}
-
-Scenario --> TipoEsecutore
 
 enum NodeCapacity {
     LOW
@@ -106,7 +71,6 @@ enum NodeCapacity {
     HIGH
 }
 
-NodeCapacity --> ConfigurazioneNodo
-
+NodeCapacity --> Nodo
 
 @enduml
