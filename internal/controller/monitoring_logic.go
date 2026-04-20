@@ -140,7 +140,7 @@ func (r *EsperimentoReconciler) reconcilePrometheusTargets(ctx context.Context, 
 			Labels: map[string]string{
 				"esperimento": exp.Name,
 				"nodo_id":     nodo.IDNodo,
-				"tipo_nodo":   nodo.Capacità.Tipo,
+				"tipo_nodo":   nodo.Capacita.Tipo,
 			},
 		}
 		targets = append(targets, target)
@@ -205,4 +205,69 @@ func (r *EsperimentoReconciler) cleanupPrometheusTargets(ctx context.Context, ex
 	}
 
 	return nil
+}
+
+func (r *EsperimentoReconciler) runExporterJob(ctx context.Context, exp *dfaasv1.Esperimento) error {
+	log := log.FromContext(ctx)
+
+	// --- LOG DI DEBUG PER LE DATE ---
+	if exp.Status.StartTime == nil {
+		log.Info("⚠️ DEBUG: StartTime è NIL")
+	} else {
+		log.Info("✅ DEBUG: StartTime è valorizzato", "valore", exp.Status.StartTime.String())
+	}
+
+	if exp.Status.EndTime == nil {
+		log.Info("⚠️ DEBUG: EndTime è NIL")
+	} else {
+		log.Info("✅ DEBUG: EndTime è valorizzato", "valore", exp.Status.EndTime.String())
+	}
+
+	var allQueries []string
+	var step string
+
+	if len(exp.Spec.ConfigMetriche) > 0 {
+		conf := exp.Spec.ConfigMetriche[0]
+		step = fmt.Sprintf("%ds", conf.Step)
+		for _, m := range conf.Metrics {
+			allQueries = append(allQueries, m.Query)
+		}
+	}
+
+	exporterJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      exp.Name + "-exporter-job",
+			Namespace: exp.Namespace,
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name: "exporter",
+							// AGGIORNATO: Usiamo la v2 su GitHub
+							Image:           "ghcr.io/isired01/dfaas-operator/dfaas-exporter:v2",
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							Env: []corev1.EnvVar{
+								{Name: "PROM_URL", Value: "http://prometheus-service.monitoring:9090"},
+								{Name: "START_TIME", Value: exp.Status.StartTime.Format(time.RFC3339)},
+								{Name: "END_TIME", Value: exp.Status.EndTime.Format(time.RFC3339)},
+								{Name: "STEP", Value: step},
+								{Name: "QUERIES", Value: strings.Join(allQueries, "|")},
+								{Name: "EXP_NAME", Value: exp.Name},
+								// --- NUOVE ENV PER MINIO ---
+								{Name: "MINIO_ENDPOINT", Value: "minio-service.monitoring:9000"},
+								{Name: "MINIO_ACCESS_KEY", Value: "admin"},
+								{Name: "MINIO_SECRET_KEY", Value: "password123"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	ctrl.SetControllerReference(exp, exporterJob, r.Scheme)
+	return r.Create(ctx, exporterJob)
 }

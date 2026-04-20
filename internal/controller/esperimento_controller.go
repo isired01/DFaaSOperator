@@ -97,14 +97,6 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 		log.Info("Inizio PROVISIONING_MONITORING")
 		return r.reconcileMonitoring(ctx, &exp)
 
-	case "READY":
-		log.Info("Inizio READY")
-		return r.reconcileReady(ctx, &exp)
-
-	case "RUNNING":
-		log.Info("Inizio RUNNING")
-		return r.reconcileRunning(ctx, &exp)
-
 	case "COOLDOWN":
 		log.Info("Inizio COOLDOWN")
 		return r.reconcileCooldown(ctx, &exp)
