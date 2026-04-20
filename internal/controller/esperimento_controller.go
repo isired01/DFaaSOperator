@@ -101,10 +101,6 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 		log.Info("Inizio COOLDOWN")
 		return r.reconcileCooldown(ctx, &exp)
 
-	case "EXPORT_METRICHE":
-		log.Info("📊 Fase EXPORT_METRICHE")
-		return r.reconcileExportMetrics(ctx, &exp)
-
 	case "CLEANUP":
 		log.Info("Inizio CLEANUP")
 		return r.reconcileCleanup(ctx, &exp)
