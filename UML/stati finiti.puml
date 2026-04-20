@@ -1,83 +1,77 @@
 @startuml
 skinparam backgroundColor #FFFFFF
 skinparam state {
+  BackgroundColor #E1F5FE
+  BorderColor #01579B
   BackgroundColor<<Error>> #FFCCCC
   BorderColor<<Error>> #FF0000
-  FontStyle bold
 }
 
-title Automa a Stati Finiti - Lifecycle Esperimento DFaaS
+title Architettura Logica delle Fasi dell'Esperimento
 
-[*] --> IDLE : Accensione Framework
+[*] --> IDLE 
 
-state IDLE {
-  IDLE : PRONTO A RICEVERE FILE
+state IDLE{
+  IDLE : Attesa creazione Esperimento (Attesa CDR)
 }
 
-IDLE --> VALIDAZIONE_FILE : CARICAMENTO CONFIG
-
-state VALIDAZIONE_FILE {
-  VALIDAZIONE_FILE : VALIDO?
+state PROVISIONING_INFRA {
+  CostruzioneFederazione : Costruisco DFaaS Desiderato
+  CostruzioneFederazione --> VerificaProvisioning : OK
+  VerificaProvisioning : Verifico che tutto sia pronto
 }
 
-VALIDAZIONE_FILE --> PROVISIONING : [FILE VALIDO]
-VALIDAZIONE_FILE --> FAIL : [FILE NON VALIDO]
-
-state PROVISIONING {
-  PROVISIONING : CLEANUP PRECEDENTE ESPERIMENTO (Se necessario)
-  PROVISIONING : COSTRUZIONE FEDERAZIONE
-  PROVISIONING : COSTRUZIONE VM (k6 + PROMETHEUS)
+state PROVISIONING_MONITORING {
+  ProvisioningPrometheus : Provisioning Prometheus
+  ProvisioningPrometheus --> VerificaProvisioningMonitoring : OK
+  ProvisioningGrafana : Provisioning Grafana
+  ProvisioningGrafana --> VerificaProvisioningMonitoring : OK
+  VerificaProvisioningMonitoring : Verifico che Prometheus e Grafana siano pronti
+  
 }
-
-PROVISIONING --> READY : [FEDERAZIONE OK]
-PROVISIONING --> FAIL : [FAIL PROVISIONING]
 
 state READY {
-  READY : VMs ON
-  READY : READY
+  PrepMonitoraggio : Aggiorno configurazione Prometheus
+  PrepMonitoraggio : su Prometheus (JSON Injection)
+  PrepMonitoraggio --> PrepCarico : OK
+  PrepCarico : Generazione Script k6 
+  PrepCarico : e lancio del Job
 }
-
-READY --> RUNNING : [TRIGGER START]
-READY --> FAIL : [FAIL READY]
 
 state RUNNING {
-  RUNNING : GENERAZIONE CARICO (k6)
-  RUNNING : LIVE METRICS
+  MonitoraggioJobK6 : Verifica completamento 
+  MonitoraggioJobK6 : o fallimento del Job
+  LiveObservability : Apertura Dashboard Grafana 
 }
 
-RUNNING --> COOL_DOWN : [CARICO FINITO]
-RUNNING --> FAIL : [FAIL RUNNING]
-
-state COOL_DOWN {
-  COOL_DOWN : ASPETTO ULTIME METRICHE
+state COOLDOWN {
+  BufferSync : Attesa sincronizzazione 
+  BufferSync : buffer Prometheus (Dati k6)
+  BufferSync --> Estrazioni : OK
+  Estrazioni : Estrazione dati da Prometheus to CSV e salvati in MinIO
 }
-
-COOL_DOWN --> EXPORT_METRICHE : [METRICHE OK]
-
-state EXPORT_METRICHE {
-  EXPORT_METRICHE : Export metriche da vm con k6 e prometheus e salvo l'esperimento
-}
-
-EXPORT_METRICHE --> COMPLETED : [ESPORTAZIONE OK]
-
-state CLEANUP {
-  CLEANUP : CANCELLO FEDERAZIONE
-  CLEANUP : CANCELLO VM
-}
-
-COMPLETED -->  CLEANUP : [PULIZIA OK]
 
 state COMPLETED {
-  COMPLETED : MOSTRO RISULTATI
+  CLEANUP : Pulizia risorse (se richiesto dall'utente)
 }
 
-CLEANUP --> [*] : [Fine Esperimento]
+' Transizioni di alto livello
+IDLE --> Validazione_file : Esperimento Creato
+Validazione_file -->  PROVISIONING_INFRA: File Validato
+PROVISIONING_INFRA --> PROVISIONING_MONITORING : Infra Pronta
+PROVISIONING_MONITORING --> READY : Piattaforma monitoring Pronta
+READY --> RUNNING : Carico Pronto
+RUNNING --> COOLDOWN : Fine Test
+COOLDOWN --> COMPLETED : Dati Pronti
 
+' Gestione Errore
+PROVISIONING_INFRA --> FAILED : Timeout/Errore
+PROVISIONING_MONITORING --> FAILED : Timeout/Errore
+READY --> FAILED : Errore Config
+RUNNING --> FAILED : Crash k6
 
-
-state FAIL <<Error>> {
-  FAIL : GESTIONE ERRORE
+state FAILED <<Error>> {
+  FAILED : Snapshot dell'errore
 }
 
-FAIL --> COMPLETED : Mostro risultati parziali e info su errore
 @enduml

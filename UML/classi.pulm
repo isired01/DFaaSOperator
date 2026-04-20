@@ -6,23 +6,16 @@ skinparam class {
     BorderColor #01579B
 }
 
-class Esperimento <<CRD>> {
-    + metav1.TypeMeta typeMeta
-    + metav1.ObjectMeta metadata
-    + EsperimentoSpec spec
-    + EsperimentoStatus status
-}
-
-class EsperimentoSpec {
-    + String nome
-    + String versione
+class Esperimento {
+    + String name
     + List<ConfigurazoneMetrica> metriche
     + ConfigurazioneFederazione federazione
     + ProfiloCarico profilo
+    + bool isCleanupRequested
 }
 
 class EsperimentoStatus {
-    + String fase
+    + FaseEsperimento fase
     + String message
 }
 
@@ -32,13 +25,14 @@ class ConfigurazoneMetrica {
 }
 
 class ConfigurazioneFederazione {
-    + String strategia
+    + LoadBalancing strategia
     + List<ConfigurazioneNodo> nodi
 }
 
 class ConfigurazioneNodo {
     + String idNodo
-    + String tipoNodo
+    + String indirizzoIP
+    + NodeCapacity capacitàNodo
     + List<String> funzioni
     + Map<String, Integer> idVicini
 }
@@ -54,7 +48,7 @@ class Scenario {
     + String nomeFunzioneTarget
     + String body
     + String dataPath
-    + String esecutore
+    + TipoEsecutore esecutore
     + List<StageK6> stages
     + Integer vuAllocati
     + Integer startTime
@@ -66,13 +60,13 @@ class StageK6 {
 }
 
 ' Relazioni di composizione (Spec/Status)
-Esperimento *-- EsperimentoSpec
+
 Esperimento *-- EsperimentoStatus
 
 ' Relazioni Spec
-EsperimentoSpec *-- "many" ConfigurazoneMetrica
-EsperimentoSpec *-- ConfigurazioneFederazione
-EsperimentoSpec *-- ProfiloCarico
+Esperimento *-- "many" ConfigurazoneMetrica
+Esperimento *-- ConfigurazioneFederazione
+Esperimento *-- ProfiloCarico
 
 ' Relazioni Federazione
 ConfigurazioneFederazione *-- "many" ConfigurazioneNodo
@@ -81,14 +75,38 @@ ConfigurazioneFederazione *-- "many" ConfigurazioneNodo
 ProfiloCarico *-- "many" Scenario
 Scenario *-- "many" StageK6
 
-note right of EsperimentoStatus
-  Fasi: IDLE, PROVISIONING, 
-  READY, RUNNING, COOLDOWN, 
-  COMPLETED, FAILED, CLEANUP
-end note
-
 note bottom of ConfigurazioneNodo
   idVicini mappa IDNodo -> Latenza(ms)
 end note
+
+enum FaseEsperimento {
+  IDLE
+  PROVISIONING
+  READY
+  RUNNING
+  COOLDOWN
+  COMPLETED
+  FAILED
+  CLEANUP
+}
+
+EsperimentoStatus--> FaseEsperimento
+
+
+enum TipoEsecutore {
+    CONSTANT_ARRIVAL_RATE
+    RAMPING_ARRIVAL_RATE
+}
+
+Scenario --> TipoEsecutore
+
+enum NodeCapacity {
+    LOW
+    MEDIUM
+    HIGH
+}
+
+NodeCapacity --> ConfigurazioneNodo
+
 
 @enduml
