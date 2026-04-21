@@ -3,38 +3,28 @@ kind: Esperimento
 metadata:
   name: test-milano-torino
 spec:
-  # 1. METRICHE
-  metrics:
-    - step:
-        5 # Nota: nella CRD è un INT, quindi metti solo il numero (secondi),
-        #si può cabiare il formato a 5s tipo
-      metrics:
-        - query: "node_cpu_seconds_total"
-          comment: "CPU totale consumata dai pod DFaaS"
-
-  # 2. FEDERAZIONE
-  federation:
-    strategy: "NODE_MARGIN"
+  # 1. FEDERAZIONE
+  federazione:
+    strategia: "NODE_MARGIN"
     nodi:
       - idNodo: "milano-edge-01"
-        indirizzoIP: "192.168.64.3"
-        tipoNodo: "MEDIUM"
-        funzioni: ["image-proc", "face-det", "figlet"]
+        indirizzoIP: "192.168.64.6"
+        userName: "isaia"
+        password: "root"
+        capacita: "MEDIUM"
+        funzioni:
+          - nome: "shasum"
+            immagine: "ghcr.io/openfaas/shasum:latest"
+            execTimeout: 4
+            maxInflight: 400
+            timeoutMs: 6000
 
-  # 3. PROFILO CARICO
-  loadProfile:
-    commonHeaders: "'Content-Type':'text/plain'"
-    scenari:
-      - nomeScenario: "test-carico-principale"
-        targetNodeID: "milano-edge-01"
-        nomeFunzioneTarget: "figlet"
-        body: "test carico da venticinque"
-        esecutore: "RAMPING_ARRIVAL_RATE"
-        vuAllocati: 100
-        stages:
-          - durata: "15s"
-            targetRps: 10
-          - durata: "30s"
-            targetRps: 50
-          - durata: "15s"
-            targetRps: 0
+  # 2. TOPOLOGIA (Corrected indentation and structure)
+  topologia:
+    links:
+      - nodoA: "milano-edge-01"
+        nodoB: "torino-edge-01"
+        latenzaMs: 54
+
+  # 3. CONFIGURAZIONE CLEANUP
+  isCleanupRequested: false

@@ -55,18 +55,55 @@ spec:
                         capacita:
                           type: string
                         funzioni:
+                          description: Lista di configurazioni per le funzioni da
+                            deployare su questo nodo
                           items:
-                            type: string
+                            properties:
+                              execTimeout:
+                                default: 5
+                                description: Tempo massimo di esecuzione (corrisponde
+                                  a exec_timeout)
+                                type: integer
+                              immagine:
+                                description: |-
+                                  Immagine completa (es: "functions/figlet:latest")
+                                  Necessaria per evitare errore 400 su OpenFaaS CE
+                                type: string
+                              maxInflight:
+                                default: 400
+                                description: Massimo numero di richieste parallele
+                                  (corrisponde a max_inflight)
+                                type: integer
+                              nome:
+                                description: 'Nome della funzione (es: "figlet")'
+                                type: string
+                              timeoutMs:
+                                default: 6000
+                                description: Timeout logico per l'operatore dFaaS
+                                  in millisecondi
+                                type: integer
+                            required:
+                            - execTimeout
+                            - immagine
+                            - maxInflight
+                            - nome
+                            - timeoutMs
+                            type: object
                           type: array
                         idNodo:
                           type: string
                         indirizzoIP:
                           type: string
+                        password:
+                          type: string
+                        userName:
+                          type: string
                       required:
                       - capacita
-                      - funzioni
                       - idNodo
                       - indirizzoIP
+                      - password
+                      - userName
                       type: object
                     minItems: 1
                     type: array
@@ -81,10 +118,6 @@ spec:
                 default: false
                 description: Flag per richiedere la pulizia delle risorse a fine test
                 type: boolean
-              name:
-                description: Nome identificativo dell'esperimento (può differire dal
-                  nome della risorsa K8s)
-                type: string
               topologia:
                 description: Topologia di rete dell'esperimento
                 properties:
@@ -110,7 +143,6 @@ spec:
             required:
             - federazione
             - isCleanupRequested
-            - name
             - topologia
             type: object
           status:
@@ -188,20 +220,12 @@ spec:
                   - type
                   type: object
                 type: array
-              endTime:
-                description: Timestamp di fine dell'esecuzione
-                format: date-time
-                type: string
               fase:
                 default: IDLE
                 description: Stato attuale dell'esecuzione
                 type: string
               message:
                 description: Messaggio di dettaglio (es. motivo di un FAILED)
-                type: string
-              startTime:
-                description: Timestamp di inizio dell'esecuzione effettiva
-                format: date-time
                 type: string
             type: object
         type: object

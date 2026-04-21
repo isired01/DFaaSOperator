@@ -43,11 +43,41 @@ type Federazione struct {
 	Nodi []Nodo `json:"nodi"`
 }
 
+type FunzioneConfig struct {
+	// Nome della funzione (es: "figlet")
+	// +kubebuilder:validation:Required
+	Nome string `json:"nome"`
+
+	// Immagine completa (es: "functions/figlet:latest")
+	// Necessaria per evitare errore 400 su OpenFaaS CE
+	// +kubebuilder:validation:Required
+	Immagine string `json:"immagine"`
+
+	// Tempo massimo di esecuzione (corrisponde a exec_timeout)
+	// +kubebuilder:default=5
+	ExecTimeout int `json:"execTimeout"`
+
+	// Massimo numero di richieste parallele (corrisponde a max_inflight)
+	// +kubebuilder:default=400
+	MaxInflight int `json:"maxInflight"`
+
+	// Timeout logico per l'operatore dFaaS in millisecondi
+	// +kubebuilder:default=6000
+	TimeoutMs int `json:"timeoutMs"`
+}
+
+// --- MODIFICA STRUTTURA NODO ---
+
 type Nodo struct {
 	IDNodo      string       `json:"idNodo"`
-	IndirizzoIP string       `json:"indirizzoIP"` //se non specificato vuol dire che la macchina va creata
+	IndirizzoIP string       `json:"indirizzoIP"`
+	UserName    string       `json:"userName"`
+	Password    string       `json:"password"`
 	Capacita    NodeCapacity `json:"capacita"`
-	Funzioni    []string     `json:"funzioni"`
+
+	// Lista di configurazioni per le funzioni da deployare su questo nodo
+	// +optional
+	Funzioni []FunzioneConfig `json:"funzioni,omitempty"`
 }
 
 type Topologia struct {
@@ -65,9 +95,6 @@ type Link struct {
 
 // EsperimentoSpec definisce i parametri di configurazione del SINGOLO esperimento
 type EsperimentoSpec struct {
-	// Nome identificativo dell'esperimento (può differire dal nome della risorsa K8s)
-	// +kubebuilder:validation:Required
-	Name string `json:"name"`
 
 	// Configurazione della federazione dedicata
 	// +kubebuilder:validation:Required
@@ -98,14 +125,6 @@ type EsperimentoStatus struct {
 	// Messaggio di dettaglio (es. motivo di un FAILED)
 	// +optional
 	Message string `json:"message,omitempty"`
-
-	// Timestamp di inizio dell'esecuzione effettiva
-	// +optional
-	StartTime *metav1.Time `json:"startTime,omitempty"`
-
-	// Timestamp di fine dell'esecuzione
-	// +optional
-	EndTime *metav1.Time `json:"endTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true
