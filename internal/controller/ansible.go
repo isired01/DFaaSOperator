@@ -18,39 +18,20 @@ import (
 
 func (r *EsperimentoReconciler) createAnsibleJob(exp *dfaasv1.Esperimento) (*batchv1.Job, *corev1.Secret) {
 	// 1. Costruiamo l'Inventory di Ansible
+	// Nel controller.go, dentro createAnsibleJob
 	var inventory string
 	inventory += "[target_nodes]\n"
 
-	// Usiamo una mappa per raccogliere configurazioni uniche delle funzioni
-	// La chiave è il Nome della funzione per evitare duplicati nello stesso esperimento
-	uniqueFunctions := make(map[string]dfaasv1.FunzioneConfig)
-
 	for _, node := range exp.Spec.Federazione.Nodi {
 		if node.IndirizzoIP != "" {
-			// Aggiungiamo il nodo all'inventory
-			line := fmt.Sprintf("%s ansible_user=%s ansible_password=%s\n",
-				node.IndirizzoIP, node.UserName, node.Password)
+			// Trasformiamo le funzioni DI QUESTO NODO in JSON
+			nodeFunctionsJson, _ := json.Marshal(node.Funzioni)
+
+			// Passiamo il JSON come variabile specifica del nodo (host var)
+			line := fmt.Sprintf("%s ansible_user=%s ansible_password=%s node_specific_functions='%s'\n",
+				node.IndirizzoIP, node.UserName, node.Password, string(nodeFunctionsJson))
 			inventory += line
-
-			// Raccogliamo le configurazioni complete delle funzioni associate a questo nodo
-			for _, f := range node.Funzioni {
-				uniqueFunctions[f.Nome] = f
-			}
 		}
-	}
-
-	// Convertiamo la mappa in una slice di oggetti FunzioneConfig
-	var functionConfigs []dfaasv1.FunzioneConfig
-	for _, config := range uniqueFunctions {
-		functionConfigs = append(functionConfigs, config)
-	}
-
-	// Trasformiamo l'intera lista di oggetti in JSON
-	// Questo permetterà ad Ansible di accedere a .immagine, .execTimeout, ecc.
-	functionsJson, err := json.Marshal(functionConfigs)
-	if err != nil {
-		// In un caso reale qui dovresti gestire l'errore o loggarlo
-		functionsJson = []byte("[]")
 	}
 
 	// 2. Creiamo il Secret per l'Inventory (hosts)
@@ -72,20 +53,18 @@ func (r *EsperimentoReconciler) createAnsibleJob(exp *dfaasv1.Esperimento) (*bat
 		},
 		Spec: batchv1.JobSpec{
 			// Tentativi massimi in caso di fallimento del Pod
-			BackoffLimit: ptrInt32(2),
+			BackoffLimit:            ptrInt32(2),
+			TTLSecondsAfterFinished: ptrInt32(600),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
 							Name:    "ansible-worker",
-							Image:   "willhallonline/ansible:latest",
-							Command: []string{"ansible-playbook"},
+							Image:   "alpine/ansible:2.20.0",
+							Command: []string{"sh", "-c"},
 							Args: []string{
-								"-i", "/etc/ansible/hosts",
-								"/ansible/playbooks/setup-node.yml",
-								// Passiamo l'oggetto JSON completo come extra-vars
-								"--extra-vars", fmt.Sprintf("requested_functions=%s", string(functionsJson)),
-								"--extra-vars", "ansible_ssh_common_args='-o StrictHostKeyChecking=no'",
+								"ansible-playbook -i /etc/ansible/hosts /ansible/playbooks/setup-node.yml " +
+									"--extra-vars \"ansible_ssh_common_args='-o StrictHostKeyChecking=no'\"",
 							},
 							VolumeMounts: []corev1.VolumeMount{
 								{Name: "inventory-volume", MountPath: "/etc/ansible"},

@@ -8,7 +8,7 @@ spec:
     strategia: "NODE_MARGIN"
     nodi:
       - idNodo: "milano-edge-01"
-        indirizzoIP: "192.168.64.6"
+        indirizzoIP: "192.168.64.7"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
@@ -19,12 +19,43 @@ spec:
             maxInflight: 400
             timeoutMs: 6000
 
+      - idNodo: "milano-edge-02"
+        indirizzoIP: "192.168.64.8"
+        userName: "isaia"
+        password: "root"
+        capacita: "MEDIUM"
+        funzioni:
+          - nome: "shasum"
+            immagine: "ghcr.io/openfaas/shasum:latest"
+            execTimeout: 4
+            maxInflight: 400
+            timeoutMs: 6000
+          - nome: "figlet"
+            immagine: "ghcr.io/openfaas/figlet:latest"
+            execTimeout: 4
+            maxInflight: 400
+            timeoutMs: 6000
+
+      - idNodo: "milano-edge-03"
+        indirizzoIP: "192.168.64.9"
+        userName: "isaia"
+        password: "root"
+        capacita: "MEDIUM"
+        funzioni:
+          - nome: "figlet"
+            immagine: "ghcr.io/openfaas/figlet:latest"
+            execTimeout: 4
+            maxInflight: 400
+            timeoutMs: 6000
+
   # 2. TOPOLOGIA (Corrected indentation and structure)
   topologia:
     links:
       - nodoA: "milano-edge-01"
-        nodoB: "torino-edge-01"
+        nodoB: "torino-edge-02"
         latenzaMs: 54
+      - nodoA: "milano-edge-01"
+        nodoB: "torino-edge-03"
+        latenzaMs: 21
 
-  # 3. CONFIGURAZIONE CLEANUP
   isCleanupRequested: false
