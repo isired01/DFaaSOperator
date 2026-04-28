@@ -104,6 +104,7 @@ const AnsiblePlaybookYaml = `---
         - { name: "haproxy", chart: "haproxytech/haproxy", ns: "haproxy-controller" }
         - { name: "prometheus", chart: "prometheus-community/prometheus", ns: "monitoring" }
         - { name: "openfaas", chart: "openfaas/openfaas", ns: "openfaas", helm_values: { "functionNamespace": "openfaas-fn", "generateBasicAuth": false, "basic_auth": false } }
+        - 
 
     - name: Install faas-cli
       ansible.builtin.shell: "curl -sSL https://cli.openfaas.com | sh"

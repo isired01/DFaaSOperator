@@ -1,0 +1,21 @@
+#cloud-config
+ssh_pwauth: true
+chpasswd:
+  list: |
+    isaia:root
+  expire: False
+
+users:
+  - name: isaia
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+
+package_update: true
+packages:
+  - openssh-server
+  - python3
+
+runcmd:
+  - sed -i 's/^#*PasswordAuthentication no/PasswordAuthentication yes/'
+    /etc/ssh/sshd_config
+  - systemctl restart ssh

@@ -8,7 +8,7 @@ spec:
     strategia: "NODE_MARGIN"
     nodi:
       - idNodo: "milano-edge-01"
-        indirizzoIP: "192.168.64.7"
+        indirizzoIP: " 192.168.252.4"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
@@ -18,9 +18,8 @@ spec:
             execTimeout: 4
             maxInflight: 400
             timeoutMs: 6000
-
       - idNodo: "milano-edge-02"
-        indirizzoIP: "192.168.64.8"
+        indirizzoIP: "192.168.252.5"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
@@ -37,7 +36,7 @@ spec:
             timeoutMs: 6000
 
       - idNodo: "milano-edge-03"
-        indirizzoIP: "192.168.64.9"
+        indirizzoIP: "192.168.252.6"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
@@ -47,8 +46,7 @@ spec:
             execTimeout: 4
             maxInflight: 400
             timeoutMs: 6000
-
-  # 2. TOPOLOGIA (Corrected indentation and structure)
+      # 2. TOPOLOGIA (Corrected indentation and structure)
   topologia:
     links:
       - nodoA: "milano-edge-01"

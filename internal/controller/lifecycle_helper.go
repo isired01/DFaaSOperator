@@ -52,81 +52,71 @@ func (r *EsperimentoReconciler) handleDeletion(ctx context.Context,
 
 func (r *EsperimentoReconciler) reconcileInfra(ctx context.Context,
 	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
+
 	log := log.FromContext(ctx)
-	log.Info("☁️ Fase 1: Provisioning Infrastruttura (VM/Nodi)...")
 
-	// 1. Segnaliamo l'inizio del provisioning (Status: False, Reason: ProvisioningStarted)
-	r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionFalse,
-		"ProvisioningStarted", "Configurazione nodi DFaaS in corso...")
-
-	// --- Logica Futura (Terraform) ---
-	// Qui simuleremo il successo immediato per ora.
-	// ----------------------------------------------
-
-	// 2. Provisioning Completato (Status: True)
-	log.Info("✅ Infrastruttura verificata.")
-	r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionTrue,
-		"ProvisioningSucceeded", "Tutti i nodi DFaaS sono raggiungibili")
-
-	// 1. Cerchiamo se il Job esiste già
+	// 1. Controlliamo se il Job esiste già
 	var job batchv1.Job
 	jobKey := client.ObjectKey{Name: exp.Name + "-infra-job", Namespace: exp.Namespace}
 	err := r.Get(ctx, jobKey, &job)
 
-	// 2. Se il Job NON esiste, lo creiamo insieme al suo Secret
+	// 2. CASO: IL JOB NON ESISTE -> Lo creiamo
 	if apierrors.IsNotFound(err) {
-		log.Info("🚀 Creazione Job Ansible e Secret per provisioning...")
+		log.Info("🚀 Fase 1: Creazione Job Ansible per Provisioning...")
 
 		if err := r.ensureAnsibleConfigMap(ctx, exp); err != nil {
 			return ctrl.Result{}, err
 		}
 
-		// createAnsibleJob deve restituire (Job, Secret)
-		job, secret := r.createAnsibleJob(exp)
+		// Creazione Job e Secret
+		newJob, secret := r.createAnsibleJob(exp)
 
-		// Sync Secret
-		_, err = controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
-			return controllerutil.SetControllerReference(exp, secret, r.Scheme)
-		})
-		if err != nil {
+		if err := r.Create(ctx, secret); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.Create(ctx, newJob); err != nil {
 			return ctrl.Result{}, err
 		}
 
-		// Sync Job
-		_, err = controllerutil.CreateOrUpdate(ctx, r.Client, job, func() error {
-			return controllerutil.SetControllerReference(exp, job, r.Scheme)
-		})
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-
+		// Aggiorniamo lo stato e RESTITUIAMO subito per fermare il ciclo frenetico
 		r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionFalse,
 			"ProvisioningStarted", "Job Ansible avviato per la configurazione nodi")
 
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	} else if err != nil {
-		log.Error(err, "Errore nel recupero del Job Ansible")
+		log.Error(err, "Errore nel recupero del Job")
 		return ctrl.Result{}, err
 	}
 
-	// 3. Se il Job esiste, analizziamo lo stato
+	// 3. CASO: IL JOB È FINITO CON SUCCESSO
 	if job.Status.Succeeded > 0 {
-		log.Info("✅ Ansible ha finito con successo!")
-		r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionTrue,
-			"ProvisioningSucceeded", "Nodi configurati correttamente via Ansible")
+		log.Info("✅ Ansible ha finito! Passo al monitoring.")
 
+		r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionTrue,
+			"ProvisioningSucceeded", "Nodi configurati correttamente")
+
+		// Passiamo alla fase successiva
 		return r.updateStatus(ctx, exp, "PROVISIONING_MONITORING")
 	}
 
-	if job.Status.Failed > 0 {
-		log.Error(nil, "❌ Job Ansible fallito")
+	// 4. CASO: IL JOB È FALLITO DEFINITIVAMENTE
+	// Controlliamo se ha superato il limite di tentativi (BackoffLimit)
+	limit := int32(4)
+	if job.Spec.BackoffLimit != nil {
+		limit = *job.Spec.BackoffLimit
+	}
+	if job.Status.Failed > limit {
+		log.Error(nil, "❌ Job Ansible fallito dopo i tentativi previsti")
+
 		r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionFalse,
 			"ProvisioningFailed", "Il Job Ansible è andato in errore")
 
 		return r.updateStatus(ctx, exp, "FAILED")
 	}
 
-	// 4. Se siamo qui, il Job sta ancora girando
+	// 5. CASO: IL JOB STA ANCORA GIRANDO (Running)
+	// IMPORTANTE: Qui NON cambiamo lo status, logghiamo e basta.
+	// Senza cambi di status, Kubernetes rispetterà il RequeueAfter di 10 secondi.
 	log.Info("⏳ Ansible sta ancora lavorando sulle VM...")
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
