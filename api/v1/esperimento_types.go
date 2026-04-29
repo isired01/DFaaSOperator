@@ -69,11 +69,12 @@ type FunzioneConfig struct {
 // --- MODIFICA STRUTTURA NODO ---
 
 type Nodo struct {
-	IDNodo      string       `json:"idNodo"`
-	IndirizzoIP string       `json:"indirizzoIP"`
-	UserName    string       `json:"userName"`
-	Password    string       `json:"password"`
-	Capacita    NodeCapacity `json:"capacita"`
+	IDNodo        string       `json:"idNodo"`
+	IndirizzoIP   string       `json:"indirizzoIP"`
+	UserName      string       `json:"userName"`
+	Password      string       `json:"password"`
+	Capacita      NodeCapacity `json:"capacita"`
+	ChiavePrivata string       `json:"chiavePrivata"`
 
 	// Lista di configurazioni per le funzioni da deployare su questo nodo
 	// +optional

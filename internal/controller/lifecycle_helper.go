@@ -69,7 +69,10 @@ func (r *EsperimentoReconciler) reconcileInfra(ctx context.Context,
 		}
 
 		// Creazione Job e Secret
-		newJob, secret := r.createAnsibleJob(exp)
+		newJob, secret, err := r.createAnsibleJob(ctx, exp)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 
 		if err := r.Create(ctx, secret); err != nil {
 			return ctrl.Result{}, err

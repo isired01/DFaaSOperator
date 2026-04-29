@@ -69,7 +69,7 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 	}
 
 	if exp.Status.Fase == "" {
-		log.Info("Inizio riconciliazione")
+		log.Info("Inizio Reconcile")
 	}
 
 	// 1. Finalizer & Deletion Logic

@@ -8,10 +8,11 @@ spec:
     strategia: "NODE_MARGIN"
     nodi:
       - idNodo: "milano-edge-01"
-        indirizzoIP: " 192.168.252.4"
+        indirizzoIP: "192.168.252.15"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
+        chiavePrivata: "MC4CAQAwBQYDK2VwBCIEIODgFN+A8KkNvY8ozKDMXdQV2fehNH43Ba+MYpOzihsJ"
         funzioni:
           - nome: "shasum"
             immagine: "ghcr.io/openfaas/shasum:latest"
@@ -19,10 +20,11 @@ spec:
             maxInflight: 400
             timeoutMs: 6000
       - idNodo: "milano-edge-02"
-        indirizzoIP: "192.168.252.5"
+        indirizzoIP: "192.168.252.16"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
+        chiavePrivata: "MC4CAQAwBQYDK2VwBCIEIDK425yPPtvEbZB2ZED5wp2YLn32qmS5Ip5aQzuODfyj"
         funzioni:
           - nome: "shasum"
             immagine: "ghcr.io/openfaas/shasum:latest"
@@ -36,10 +38,11 @@ spec:
             timeoutMs: 6000
 
       - idNodo: "milano-edge-03"
-        indirizzoIP: "192.168.252.6"
+        indirizzoIP: "192.168.252.17"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
+        chiavePrivata: "MC4CAQAwBQYDK2VwBCIEIH2bNnEMT85rlwCD5bHGqjYbaOW8xOrbVfi8MGsEWjDG"
         funzioni:
           - nome: "figlet"
             immagine: "ghcr.io/openfaas/figlet:latest"

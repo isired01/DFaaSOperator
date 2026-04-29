@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 
@@ -14,27 +16,57 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	dfaasv1 "dfaas-operator/api/v1"
+
+	"github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-func (r *EsperimentoReconciler) createAnsibleJob(exp *dfaasv1.Esperimento) (*batchv1.Job, *corev1.Secret) {
-	// 1. Costruiamo l'Inventory di Ansible
-	// Nel controller.go, dentro createAnsibleJob
+func (r *EsperimentoReconciler) createAnsibleJob(ctx context.Context, exp *dfaasv1.Esperimento) (*batchv1.Job, *corev1.Secret, error) {
+
+	// 1. Assicuriamoci che le ConfigMap dei values esistano PRIMA di definire il Job
+	if err := r.ensureHelmValuesConfig(ctx, exp); err != nil {
+		return nil, nil, fmt.Errorf("failed to ensure helm values config: %w", err)
+	}
+
+	err := r.ensureAnsibleConfigMap(ctx, exp)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to ensure ansible config map: %w", err)
+	}
+
 	var inventory string
 	inventory += "[target_nodes]\n"
 
-	for _, node := range exp.Spec.Federazione.Nodi {
+	for i, node := range exp.Spec.Federazione.Nodi {
 		if node.IndirizzoIP != "" {
-			// Trasformiamo le funzioni DI QUESTO NODO in JSON
+			peerID, err := calcolaPeerID(node.ChiavePrivata)
+			if err != nil {
+				peerID = "error-key"
+			}
+
+			isBootstrap := (i == 0)
+			bootstrapAddr := ""
+			if !isBootstrap {
+				firstNode := exp.Spec.Federazione.Nodi[0]
+				firstPeerID, _ := calcolaPeerID(firstNode.ChiavePrivata)
+				bootstrapAddr = fmt.Sprintf("/ip4/%s/tcp/31600/p2p/%s", firstNode.IndirizzoIP, firstPeerID)
+			}
+
 			nodeFunctionsJson, _ := json.Marshal(node.Funzioni)
 
-			// Passiamo il JSON come variabile specifica del nodo (host var)
-			line := fmt.Sprintf("%s ansible_user=%s ansible_password=%s node_specific_functions='%s'\n",
-				node.IndirizzoIP, node.UserName, node.Password, string(nodeFunctionsJson))
+			line := fmt.Sprintf("%s ansible_user=%s ansible_password=%s node_specific_functions='%s' node_priv_key='%s' dfaas_agent_id='%s' is_bootstrap=%t bootstrap_address='%s'\n",
+				node.IndirizzoIP,
+				node.UserName,
+				node.Password,
+				string(nodeFunctionsJson),
+				node.ChiavePrivata,
+				peerID,
+				isBootstrap,
+				bootstrapAddr,
+			)
 			inventory += line
 		}
 	}
 
-	// 2. Creiamo il Secret per l'Inventory (hosts)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      exp.Name + "-ansible-inventory",
@@ -45,16 +77,12 @@ func (r *EsperimentoReconciler) createAnsibleJob(exp *dfaasv1.Esperimento) (*bat
 		},
 	}
 
-	// 3. Definiamo il Job Kubernetes che eseguirà Ansible
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      exp.Name + "-infra-job",
 			Namespace: exp.Namespace,
 		},
 		Spec: batchv1.JobSpec{
-			// Tentativi massimi in caso di fallimento del Pod
-			BackoffLimit:            ptrInt32(2),
-			TTLSecondsAfterFinished: ptrInt32(600),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -69,6 +97,7 @@ func (r *EsperimentoReconciler) createAnsibleJob(exp *dfaasv1.Esperimento) (*bat
 							VolumeMounts: []corev1.VolumeMount{
 								{Name: "inventory-volume", MountPath: "/etc/ansible"},
 								{Name: "playbook-volume", MountPath: "/ansible/playbooks"},
+								{Name: "helm-values-volume", MountPath: "/opt/helm-values"},
 							},
 						},
 					},
@@ -76,18 +105,22 @@ func (r *EsperimentoReconciler) createAnsibleJob(exp *dfaasv1.Esperimento) (*bat
 						{
 							Name: "inventory-volume",
 							VolumeSource: corev1.VolumeSource{
-								Secret: &corev1.SecretVolumeSource{
-									SecretName: secret.Name,
-								},
+								Secret: &corev1.SecretVolumeSource{SecretName: secret.Name},
 							},
 						},
 						{
 							Name: "playbook-volume",
 							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: "ansible-playbooks",
-									},
+									LocalObjectReference: corev1.LocalObjectReference{Name: "ansible-playbooks-" + exp.Name},
+								},
+							},
+						},
+						{
+							Name: "helm-values-volume",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{Name: "helm-values-config-" + exp.Name},
 								},
 							},
 						},
@@ -98,41 +131,94 @@ func (r *EsperimentoReconciler) createAnsibleJob(exp *dfaasv1.Esperimento) (*bat
 		},
 	}
 
-	// Impostiamo l'OwnerReference per la pulizia automatica (Garbage Collection)
 	_ = ctrl.SetControllerReference(exp, secret, r.Scheme)
 	_ = ctrl.SetControllerReference(exp, job, r.Scheme)
 
-	return job, secret
+	return job, secret, nil
 }
 
-func ptrInt32(i int32) *int32 { return &i }
-
 func (r *EsperimentoReconciler) ensureAnsibleConfigMap(ctx context.Context, exp *dfaasv1.Esperimento) error {
-	cm := &corev1.ConfigMap{}
-	// Usiamo un nome fisso o derivato, l'importante è che coincida con quello nel Job
-	cmName := "ansible-playbooks"
-
-	err := r.Get(ctx, types.NamespacedName{Name: cmName, Namespace: exp.Namespace}, cm)
-	if err != nil && apierrors.IsNotFound(err) {
-		// La ConfigMap non esiste, la creiamo
-		newCm := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      cmName,
-				Namespace: exp.Namespace,
-			},
-			Data: map[string]string{
-				"setup-node.yml": AnsiblePlaybookYaml,
-			},
-		}
-
-		// Impostiamo l'OwnerReference così se cancelli l'esperimento,
-		// Kubernetes può pulire (opzionale, dipende se vuoi riutilizzarla)
-		if err := ctrl.SetControllerReference(exp, newCm, r.Scheme); err != nil {
-			return err
-		}
-
-		return r.Create(ctx, newCm)
+	cmName := "ansible-playbooks-" + exp.Name
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cmName,
+			Namespace: exp.Namespace,
+		},
+		Data: map[string]string{
+			"setup-node.yml": AnsiblePlaybookYaml,
+		},
 	}
 
+	if err := ctrl.SetControllerReference(exp, cm, r.Scheme); err != nil {
+		return err
+	}
+
+	found := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Name: cmName, Namespace: exp.Namespace}, found)
+	if err != nil && apierrors.IsNotFound(err) {
+		return r.Create(ctx, cm)
+	} else if err == nil {
+		found.Data = cm.Data
+		return r.Update(ctx, found)
+	}
 	return err
+}
+
+func (r *EsperimentoReconciler) ensureHelmValuesConfig(ctx context.Context, exp *dfaasv1.Esperimento) error {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "helm-values-config-" + exp.Name,
+			Namespace: exp.Namespace,
+		},
+		Data: map[string]string{
+			"haproxy.yaml":    HaproxyValues,
+			"openfaas.yaml":   OpenfaasValues,
+			"prometheus.yaml": PrometheusValues,
+		},
+	}
+
+	if err := ctrl.SetControllerReference(exp, cm, r.Scheme); err != nil {
+		return err
+	}
+
+	found := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Name: cm.Name, Namespace: exp.Namespace}, found)
+	if err != nil && apierrors.IsNotFound(err) {
+		return r.Create(ctx, cm)
+	} else if err == nil {
+		found.Data = cm.Data
+		return r.Update(ctx, found)
+	}
+	return err
+}
+
+func calcolaPeerID(privKeyBase64 string) (string, error) {
+	// 1. Decodifica la stringa Base64 della chiave privata
+	rawKey, err := base64.StdEncoding.DecodeString(privKeyBase64)
+	if err != nil {
+		return "", fmt.Errorf("errore decodifica base64: %v", err)
+	}
+
+	// 2. Verifica la lunghezza per una chiave Ed25519 (deve essere 64 byte: seed + pub)
+	// Se la tua stringa è solo il seed (32 byte), ed25519.NewKeyFromSeed la gestisce
+	var priv crypto.PrivKey
+	if len(rawKey) == 32 {
+		stdPriv := ed25519.NewKeyFromSeed(rawKey)
+		priv, err = crypto.UnmarshalEd25519PrivateKey(stdPriv)
+	} else {
+		priv, err = crypto.UnmarshalEd25519PrivateKey(rawKey)
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("errore unmarshal chiave privata libp2p: %v", err)
+	}
+
+	// 3. Estrai il PeerID dalla chiave pubblica derivata
+	id, err := peer.IDFromPrivateKey(priv)
+	if err != nil {
+		return "", fmt.Errorf("errore generazione PeerID: %v", err)
+	}
+
+	// Ritorna la stringa (es. "12D3KooW...")
+	return id.String(), nil
 }

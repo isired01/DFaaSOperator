@@ -54,6 +54,8 @@ spec:
                       properties:
                         capacita:
                           type: string
+                        chiavePrivata:
+                          type: string
                         funzioni:
                           description: Lista di configurazioni per le funzioni da
                             deployare su questo nodo
@@ -100,6 +102,7 @@ spec:
                           type: string
                       required:
                       - capacita
+                      - chiavePrivata
                       - idNodo
                       - indirizzoIP
                       - password
