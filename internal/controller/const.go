@@ -90,6 +90,21 @@ const AnsiblePlaybookYaml = `---
         - monitoring
         - haproxy-controller
 
+    - name: "Create local config directory on nodes"
+      ansible.builtin.file:
+        path: /opt/dfaas/helm-values
+        state: directory
+        mode: '0755'
+
+    - name: "Copy Helm values from Ansible Pod to Nodes"
+      ansible.builtin.copy:
+        src: "/opt/helm-values/{{ item }}.yaml"
+        dest: "/opt/dfaas/helm-values/{{ item }}.yaml"
+      loop:
+        - haproxy
+        - prometheus
+        - openfaas
+
     - name: Install Helm Charts
       kubernetes.core.helm:
         name: "{{ item.name }}"
