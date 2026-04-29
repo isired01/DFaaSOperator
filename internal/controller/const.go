@@ -114,7 +114,7 @@ const AnsiblePlaybookYaml = `---
         wait: yes
         # 1. Applica i file montati dalla ConfigMap (Percorso definito nel Job Go)
         values_files:
-          - "/opt/helm-values/{{ item.name }}.yaml"
+          - "/opt/dfaas/helm-values/{{ item.name }}.yaml"
         # 2. Mantiene i valori inline (es. per OpenFaaS)
         values: "{{ item.helm_values | default({}) }}"
       environment:
