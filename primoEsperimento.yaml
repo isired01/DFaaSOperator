@@ -3,12 +3,12 @@ kind: Esperimento
 metadata:
   name: test-milano-torino
 spec:
-  # 1. FEDERAZIONE
+  # 1. FEDERAZIONEstrategia
   federazione:
     strategia: "NODE_MARGIN"
     nodi:
       - idNodo: "milano-edge-01"
-        indirizzoIP: "192.168.252.18"
+        indirizzoIP: "192.168.252.42"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
@@ -20,7 +20,7 @@ spec:
             maxInflight: 400
             timeoutMs: 6000
       - idNodo: "milano-edge-02"
-        indirizzoIP: "192.168.252.19"
+        indirizzoIP: "192.168.252.43"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
@@ -38,7 +38,7 @@ spec:
             timeoutMs: 6000
 
       - idNodo: "milano-edge-03"
-        indirizzoIP: "192.168.252.20"
+        indirizzoIP: "192.168.252.44"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
@@ -49,7 +49,7 @@ spec:
             execTimeout: 4
             maxInflight: 400
             timeoutMs: 6000
-      # 2. TOPOLOGIA (Corrected indentation and structure)
+  # 2. TOPOLOGIA (Corrected indentation and structure)
   topologia:
     links:
       - nodoA: "milano-edge-01"

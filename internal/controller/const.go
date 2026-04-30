@@ -122,13 +122,7 @@ const AnsiblePlaybookYaml = `---
       loop:
         - { name: "haproxy", chart: "haproxytech/haproxy", ns: "haproxy-controller" }
         - { name: "prometheus", chart: "prometheus-community/prometheus", ns: "monitoring" }
-        - { name: "openfaas", chart: "openfaas/openfaas", ns: "openfaas", 
-            helm_values: { 
-              "functionNamespace": "openfaas-fn", 
-              "generateBasicAuth": false, 
-              "basic_auth": false 
-            } 
-          }
+        - { name: "openfaas", chart: "openfaas/openfaas", ns: "openfaas"}
 
     - name: Install faas-cli
       ansible.builtin.shell: "curl -sSL https://cli.openfaas.com | sh"
@@ -170,12 +164,6 @@ const AnsiblePlaybookYaml = `---
       loop: "{{ node_specific_functions }}"
       when: node_specific_functions is defined and node_specific_functions | length > 0
 
-
-    - name: "Ensure config directory exists"
-      ansible.builtin.file:
-        path: /opt/dfaas
-        state: directory
-        mode: '0755'
     
     - name: "Make K3s config permanent for root"
       ansible.builtin.shell: |
@@ -222,18 +210,24 @@ const AnsiblePlaybookYaml = `---
 
           config:
             AGENT_DEBUG: "true"
-            AGENT_ID: "{{ dfaas_agent_id }}"
-            AGENT_BOOTSTRAP: "{{ 'false' if is_bootstrap else 'true' }}"
-            AGENT_BOOTSTRAP_LIST: "{{ bootstrap_address if not is_bootstrap else '' }}"
-            AGENT_PRIVATE_KEY_FILE: "/usr/src/dfaasagent/privatekey.pem"
+            AGENT_BOOTSTRAP_NODES: "{{is_bootstrap}}"
+            AGENT_BOOTSTRAP_NODES_LIST: "{{ bootstrap_address}}"
             AGENT_STRATEGY: "staticstrategy"
-          
           
           forecaster:
             enabled: no
-      tags: [ 'agent_only' ]`
+      tags: [ 'agent_only' ]
 
-const HaproxyValues = `image:
+    - name: "Force Prometheus host via kubectl (Workaround non prede la config che passo con helm dallo yaml problema conosciuto issue su github presente)"
+      ansible.builtin.shell: |
+        sudo kubectl set env deployment/gateway -n openfaas \
+        faas_prometheus_host=prometheus.monitoring.svc.cluster.local \
+        faas_prometheus_port=9090
+      environment:
+        KUBECONFIG: /etc/rancher/k3s/k3s.yaml`
+
+const HaproxyValues = `
+image:
   image: docker.io/haproxytech/haproxy-alpine
   tag: "3.2.6"
 
@@ -386,11 +380,13 @@ containerPorts:
   prometheus: 8405
 `
 
-const OpenfaasValues = `alertmanager:
+const OpenfaasValues = `
+alertmanager:
   create: false
 
 prometheus:
   create: false
+
 
 # Disable authentication for the OpenFaaS Gateway, as we are building a
 # prototype. This simplifies the interaction with the gateway.
@@ -404,7 +400,7 @@ generateBasicAuth: false
 # More info here: https://docs.openfaas.com/reference/async/
 async: false
 
-functionNamespace: default
+functionNamespace: openfaas-fn
 
 gatewayExternal:
   annotations:
@@ -415,8 +411,6 @@ gatewayExternal:
     prometheus.io/port: "8081"
 
 gateway:
-  # Increase timeout of liveness and readiness probes to avoid premature crash
-  # of the gateway.
   readinessProbe:
     periodSeconds: 10
     timeoutSeconds: 10
@@ -437,7 +431,8 @@ functions:
 
 `
 
-const PrometheusValues = `# Install only prometheus-node-exporter and alertmanager services.
+const PrometheusValues = `
+# Install only prometheus-node-exporter and alertmanager services.
 prometheus-pushgateway:
   enabled: false
 kube-state-metrics:
@@ -519,7 +514,7 @@ alertmanager:
     receivers:
       - name: "scale-up"
         webhook_configs:
-          - url: http://gateway.default.svc.cluster.local:8080/system/alert
+          - url: http://gateway.openfaas.svc.cluster.local:8080/system/alert
             send_resolved: true
 
 # Extra manifests to deploy as an array.

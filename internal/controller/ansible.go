@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -33,6 +34,8 @@ func (r *EsperimentoReconciler) createAnsibleJob(ctx context.Context, exp *dfaas
 		return nil, nil, fmt.Errorf("failed to ensure ansible config map: %w", err)
 	}
 
+	firstPeerID, _ := calcolaPeerID(exp.Spec.Federazione.Nodi[0].ChiavePrivata)
+
 	var inventory string
 	inventory += "[target_nodes]\n"
 
@@ -43,12 +46,10 @@ func (r *EsperimentoReconciler) createAnsibleJob(ctx context.Context, exp *dfaas
 				peerID = "error-key"
 			}
 
-			isBootstrap := (i == 0)
-			bootstrapAddr := ""
+			isBootstrap := (i != 0)
+			bootstrapAddr := fmt.Sprintf("/ip4/%s/tcp/31600/p2p/%s", exp.Spec.Federazione.Nodi[0].IndirizzoIP, firstPeerID)
 			if !isBootstrap {
-				firstNode := exp.Spec.Federazione.Nodi[0]
-				firstPeerID, _ := calcolaPeerID(firstNode.ChiavePrivata)
-				bootstrapAddr = fmt.Sprintf("/ip4/%s/tcp/31600/p2p/%s", firstNode.IndirizzoIP, firstPeerID)
+				bootstrapAddr = ""
 			}
 
 			nodeFunctionsJson, _ := json.Marshal(node.Funzioni)
@@ -193,32 +194,36 @@ func (r *EsperimentoReconciler) ensureHelmValuesConfig(ctx context.Context, exp 
 }
 
 func calcolaPeerID(privKeyBase64 string) (string, error) {
-	// 1. Decodifica la stringa Base64 della chiave privata
-	rawKey, err := base64.StdEncoding.DecodeString(privKeyBase64)
+	// 1. Decodifica la stringa Base64
+	derBytes, err := base64.StdEncoding.DecodeString(privKeyBase64)
 	if err != nil {
 		return "", fmt.Errorf("errore decodifica base64: %v", err)
 	}
 
-	// 2. Verifica la lunghezza per una chiave Ed25519 (deve essere 64 byte: seed + pub)
-	// Se la tua stringa è solo il seed (32 byte), ed25519.NewKeyFromSeed la gestisce
-	var priv crypto.PrivKey
-	if len(rawKey) == 32 {
-		stdPriv := ed25519.NewKeyFromSeed(rawKey)
-		priv, err = crypto.UnmarshalEd25519PrivateKey(stdPriv)
-	} else {
-		priv, err = crypto.UnmarshalEd25519PrivateKey(rawKey)
-	}
-
+	// 2. Parsing della chiave PKCS#8 (formato standard per le chiavi private Ed25519)
+	rawKey, err := x509.ParsePKCS8PrivateKey(derBytes)
 	if err != nil {
-		return "", fmt.Errorf("errore unmarshal chiave privata libp2p: %v", err)
+		return "", fmt.Errorf("errore parsing PKCS8: %v", err)
 	}
 
-	// 3. Estrai il PeerID dalla chiave pubblica derivata
+	// 3. Cast alla chiave Ed25519 standard di Go
+	edPriv, ok := rawKey.(ed25519.PrivateKey)
+	if !ok {
+		return "", fmt.Errorf("la chiave non è di tipo Ed25519")
+	}
+
+	// 4. Conversione nel formato crypto.PrivKey richiesto da libp2p
+	// Libp2p vuole i byte della chiave privata seguiti da quelli della pubblica (64 byte totali)
+	priv, err := crypto.UnmarshalEd25519PrivateKey(edPriv)
+	if err != nil {
+		return "", fmt.Errorf("errore unmarshal per libp2p: %v", err)
+	}
+
+	// 5. Generazione del PeerID
 	id, err := peer.IDFromPrivateKey(priv)
 	if err != nil {
 		return "", fmt.Errorf("errore generazione PeerID: %v", err)
 	}
 
-	// Ritorna la stringa (es. "12D3KooW...")
 	return id.String(), nil
 }
