@@ -8,7 +8,7 @@ spec:
     strategia: "NODE_MARGIN"
     nodi:
       - idNodo: "milano-edge-01"
-        indirizzoIP: "192.168.252.42"
+        indirizzoIP: "192.168.252.51"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
@@ -20,7 +20,7 @@ spec:
             maxInflight: 400
             timeoutMs: 6000
       - idNodo: "milano-edge-02"
-        indirizzoIP: "192.168.252.43"
+        indirizzoIP: "192.168.252.52"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
@@ -38,7 +38,7 @@ spec:
             timeoutMs: 6000
 
       - idNodo: "milano-edge-03"
-        indirizzoIP: "192.168.252.44"
+        indirizzoIP: "192.168.252.53"
         userName: "isaia"
         password: "root"
         capacita: "MEDIUM"
