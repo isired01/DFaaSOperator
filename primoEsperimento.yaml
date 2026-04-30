@@ -3,38 +3,60 @@ kind: Esperimento
 metadata:
   name: test-milano-torino
 spec:
-  # 1. METRICHE
-  metrics:
-    - step:
-        5 # Nota: nella CRD è un INT, quindi metti solo il numero (secondi),
-        #si può cabiare il formato a 5s tipo
-      metrics:
-        - query: "node_cpu_seconds_total"
-          comment: "CPU totale consumata dai pod DFaaS"
-
-  # 2. FEDERAZIONE
-  federation:
-    strategy: "NODE_MARGIN"
+  # 1. FEDERAZIONEstrategia
+  federazione:
+    strategia: "NODE_MARGIN"
     nodi:
       - idNodo: "milano-edge-01"
-        indirizzoIP: "192.168.64.3"
-        tipoNodo: "MEDIUM"
-        funzioni: ["image-proc", "face-det", "figlet"]
+        indirizzoIP: "192.168.252.51"
+        userName: "isaia"
+        password: "root"
+        capacita: "MEDIUM"
+        chiavePrivata: "MC4CAQAwBQYDK2VwBCIEIODgFN+A8KkNvY8ozKDMXdQV2fehNH43Ba+MYpOzihsJ"
+        funzioni:
+          - nome: "shasum"
+            immagine: "ghcr.io/openfaas/shasum:latest"
+            execTimeout: 4
+            maxInflight: 400
+            timeoutMs: 6000
+      - idNodo: "milano-edge-02"
+        indirizzoIP: "192.168.252.52"
+        userName: "isaia"
+        password: "root"
+        capacita: "MEDIUM"
+        chiavePrivata: "MC4CAQAwBQYDK2VwBCIEIDK425yPPtvEbZB2ZED5wp2YLn32qmS5Ip5aQzuODfyj"
+        funzioni:
+          - nome: "shasum"
+            immagine: "ghcr.io/openfaas/shasum:latest"
+            execTimeout: 4
+            maxInflight: 400
+            timeoutMs: 6000
+          - nome: "figlet"
+            immagine: "ghcr.io/openfaas/figlet:latest"
+            execTimeout: 4
+            maxInflight: 400
+            timeoutMs: 6000
 
-  # 3. PROFILO CARICO
-  loadProfile:
-    commonHeaders: "'Content-Type':'text/plain'"
-    scenari:
-      - nomeScenario: "test-carico-principale"
-        targetNodeID: "milano-edge-01"
-        nomeFunzioneTarget: "figlet"
-        body: "test carico da venticinque"
-        esecutore: "RAMPING_ARRIVAL_RATE"
-        vuAllocati: 100
-        stages:
-          - durata: "15s"
-            targetRps: 10
-          - durata: "30s"
-            targetRps: 50
-          - durata: "15s"
-            targetRps: 0
+      - idNodo: "milano-edge-03"
+        indirizzoIP: "192.168.252.53"
+        userName: "isaia"
+        password: "root"
+        capacita: "MEDIUM"
+        chiavePrivata: "MC4CAQAwBQYDK2VwBCIEIH2bNnEMT85rlwCD5bHGqjYbaOW8xOrbVfi8MGsEWjDG"
+        funzioni:
+          - nome: "figlet"
+            immagine: "ghcr.io/openfaas/figlet:latest"
+            execTimeout: 4
+            maxInflight: 400
+            timeoutMs: 6000
+  # 2. TOPOLOGIA (Corrected indentation and structure)
+  topologia:
+    links:
+      - nodoA: "milano-edge-01"
+        nodoB: "torino-edge-02"
+        latenzaMs: 54
+      - nodoA: "milano-edge-01"
+        nodoB: "torino-edge-03"
+        latenzaMs: 21
+
+  isCleanupRequested: false

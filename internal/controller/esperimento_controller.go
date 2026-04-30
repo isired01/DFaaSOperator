@@ -69,7 +69,7 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 	}
 
 	if exp.Status.Fase == "" {
-		log.Info("Inizio riconciliazione")
+		log.Info("Inizio Reconcile")
 	}
 
 	// 1. Finalizer & Deletion Logic
@@ -97,21 +97,9 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 		log.Info("Inizio PROVISIONING_MONITORING")
 		return r.reconcileMonitoring(ctx, &exp)
 
-	case "READY":
-		log.Info("Inizio READY")
-		return r.reconcileReady(ctx, &exp)
-
-	case "RUNNING":
-		log.Info("Inizio RUNNING")
-		return r.reconcileRunning(ctx, &exp)
-
 	case "COOLDOWN":
 		log.Info("Inizio COOLDOWN")
 		return r.reconcileCooldown(ctx, &exp)
-
-	case "EXPORT_METRICHE":
-		log.Info("📊 Fase EXPORT_METRICHE")
-		return r.reconcileExportMetrics(ctx, &exp)
 
 	case "CLEANUP":
 		log.Info("Inizio CLEANUP")
@@ -136,7 +124,7 @@ func (r *EsperimentoReconciler) updateStatus(ctx context.Context,
 	}
 
 	// 2. Aggiorniamo la fase sulla versione appena scaricata
-	latestExp.Status.Fase = fase
+	latestExp.Status.Fase = dfaasv1.FaseEsperimento(fase)
 
 	if err := r.Status().Update(ctx, latestExp); err != nil {
 		return ctrl.Result{}, err

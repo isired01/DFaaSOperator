@@ -2,11 +2,10 @@ package controller
 
 import (
 	"context"
-	"fmt"
+
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,6 +15,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 func (r *EsperimentoReconciler) handleDeletion(ctx context.Context,
@@ -51,23 +52,76 @@ func (r *EsperimentoReconciler) handleDeletion(ctx context.Context,
 
 func (r *EsperimentoReconciler) reconcileInfra(ctx context.Context,
 	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
+
 	log := log.FromContext(ctx)
-	log.Info("☁️ Fase 1: Provisioning Infrastruttura (VM/Nodi)...")
 
-	// 1. Segnaliamo l'inizio del provisioning (Status: False, Reason: ProvisioningStarted)
-	r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionFalse,
-		"ProvisioningStarted", "Configurazione nodi DFaaS in corso...")
+	// 1. Controlliamo se il Job esiste già
+	var job batchv1.Job
+	jobKey := client.ObjectKey{Name: exp.Name + "-infra-job", Namespace: exp.Namespace}
+	err := r.Get(ctx, jobKey, &job)
 
-	// --- Logica Futura (Terraform / Script SSH) ---
-	// Qui simuleremo il successo immediato per ora.
-	// ----------------------------------------------
+	// 2. CASO: IL JOB NON ESISTE -> Lo creiamo
+	if apierrors.IsNotFound(err) {
+		log.Info("🚀 Fase 1: Creazione Job Ansible per Provisioning...")
 
-	// 2. Provisioning Completato (Status: True)
-	log.Info("✅ Infrastruttura verificata.")
-	r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionTrue,
-		"ProvisioningSucceeded", "Tutti i nodi DFaaS sono raggiungibili")
+		if err := r.ensureAnsibleConfigMap(ctx, exp); err != nil {
+			return ctrl.Result{}, err
+		}
 
-	return r.updateStatus(ctx, exp, "PROVISIONING_MONITORING")
+		// Creazione Job e Secret
+		newJob, secret, err := r.createAnsibleJob(ctx, exp)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		if err := r.Create(ctx, secret); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.Create(ctx, newJob); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// Aggiorniamo lo stato e RESTITUIAMO subito per fermare il ciclo frenetico
+		r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionFalse,
+			"ProvisioningStarted", "Job Ansible avviato per la configurazione nodi")
+
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	} else if err != nil {
+		log.Error(err, "Errore nel recupero del Job")
+		return ctrl.Result{}, err
+	}
+
+	// 3. CASO: IL JOB È FINITO CON SUCCESSO
+	if job.Status.Succeeded > 0 {
+		log.Info("✅ Ansible ha finito! Passo al monitoring.")
+
+		r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionTrue,
+			"ProvisioningSucceeded", "Nodi configurati correttamente")
+
+		// Passiamo alla fase successiva
+		return r.updateStatus(ctx, exp, "PROVISIONING_MONITORING")
+	}
+
+	// 4. CASO: IL JOB È FALLITO DEFINITIVAMENTE
+	// Controlliamo se ha superato il limite di tentativi (BackoffLimit)
+	limit := int32(4)
+	if job.Spec.BackoffLimit != nil {
+		limit = *job.Spec.BackoffLimit
+	}
+	if job.Status.Failed > limit {
+		log.Error(nil, "❌ Job Ansible fallito dopo i tentativi previsti")
+
+		r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionFalse,
+			"ProvisioningFailed", "Il Job Ansible è andato in errore")
+
+		return r.updateStatus(ctx, exp, "FAILED")
+	}
+
+	// 5. CASO: IL JOB STA ANCORA GIRANDO (Running)
+	// IMPORTANTE: Qui NON cambiamo lo status, logghiamo e basta.
+	// Senza cambi di status, Kubernetes rispetterà il RequeueAfter di 10 secondi.
+	log.Info("⏳ Ansible sta ancora lavorando sulle VM...")
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
 func (r *EsperimentoReconciler) reconcileMonitoring(ctx context.Context,
@@ -92,184 +146,14 @@ func (r *EsperimentoReconciler) reconcileMonitoring(ctx context.Context,
 	return r.updateStatus(ctx, exp, "READY")
 }
 
-func (r *EsperimentoReconciler) reconcileReady(ctx context.Context,
-	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
-	log := log.FromContext(ctx)
-
-	// 1. "Get" della condizione PrometheusTargetsReady
-	cond := meta.FindStatusCondition(exp.Status.Conditions, "PrometheusTargetsReady")
-
-	// Se la condizione non esiste o non è True, iniettiamo i target
-	if cond == nil || cond.Status != metav1.ConditionTrue {
-		if err := r.reconcilePrometheusTargets(ctx, exp); err != nil {
-			log.Error(err, "❌ Fallito aggiornamento target Prometheus")
-			r.setCondition(ctx, exp, "PrometheusTargetsReady", metav1.ConditionFalse, "ConfigUpdateFailed", err.Error())
-			return r.updateStatus(ctx, exp, "FAILED")
-		}
-		r.setCondition(ctx, exp, "PrometheusTargetsReady", metav1.ConditionTrue, "ConfigUpdated", "Target inseriti correttamente")
-
-		if err := r.Status().Update(ctx, exp); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		log.Info("⏳ Target inseriti. Attendo il ricaricamento (10s)...") //TODO: così non va bene nonn aspetta quasi mai serve una fase in più
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	// 2. ORA LANCIA IL LAVORO (Quello che mancava!)
-	log.Info("🎯 Target già verificati, preparo k6...")
-
-	// Genera lo script k6
-	script, err := r.buildScriptK6(exp)
-	if err != nil {
-		return r.updateStatus(ctx, exp, "FAILED")
-	}
-
-	// Crea la ConfigMap con lo script
-	if err := r.reconcileK6Config(ctx, exp, script); err != nil {
-		log.Error(err, "❌ Fallita creazione ConfigMap k6")
-		return r.updateStatus(ctx, exp, "FAILED")
-	}
-
-	// 3. LANCIO EFFETTIVO DEL JOB
-	if err := r.runK6Job(ctx, exp); err != nil {
-		if errors.IsAlreadyExists(err) {
-			log.Info("🏃 Job k6 già presente, procedo...")
-		} else {
-			log.Error(err, "❌ Impossibile avviare il Job k6")
-			return r.updateStatus(ctx, exp, "FAILED")
-		}
-	}
-
-	now := metav1.Now()
-	exp.Status.StartTime = &now
-
-	// Forza il salvataggio di TUTTO lo Status (incluso StartTime) prima di uscire
-	if err := r.Status().Update(ctx, exp); err != nil {
-		log.Error(err, "❌ Impossibile salvare StartTime")
-		return ctrl.Result{}, err
-	}
-
-	log.Info("🚀 StartTime salvato. Passo in RUNNING")
-	return r.updateStatus(ctx, exp, "RUNNING")
-}
-
-func (r *EsperimentoReconciler) reconcileRunning(ctx context.Context,
-	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
-
-	log := log.FromContext(ctx)
-	var job batchv1.Job
-	jobKey := client.ObjectKey{Name: exp.Name + "-k6-job", Namespace: exp.Namespace}
-
-	// 1. Recupero del Job
-	if err := r.Get(ctx, jobKey, &job); err != nil {
-		r.setCondition(ctx, exp, "K6TestExecution", metav1.ConditionUnknown,
-			"JobNotFound", "Impossibile recuperare lo stato del Job")
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-
-	// 2. Controllo successo
-	if job.Status.Succeeded > 0 {
-		log.Info("✅ Test k6 completato con successo")
-		now := metav1.Now()
-		exp.Status.EndTime = &now
-		r.setCondition(ctx, exp, "K6TestExecution", metav1.ConditionTrue,
-			"TestSucceeded", "Il carico è stato generato e inviato a Prometheus")
-
-		return r.updateStatus(ctx, exp, "COOLDOWN")
-	}
-
-	// 3. Controllo fallimento
-	if job.Status.Failed > 0 {
-		log.Error(nil, "❌ Test k6 fallito")
-		r.setCondition(ctx, exp, "K6TestExecution", metav1.ConditionFalse,
-			"TestFailed", "Il container k6 è andato in errore durante l'esecuzione")
-		return r.updateStatus(ctx, exp, "FAILED")
-	}
-
-	// 4. Test in corso (Progress)
-	log.Info("⏳ k6 sta ancora generando carico...")
-	r.setCondition(ctx, exp, "K6TestExecution", metav1.ConditionTrue,
-		"TestInBase", "Iniezione di carico in corso...")
-
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-}
-
 func (r *EsperimentoReconciler) reconcileCooldown(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	// 2. Calcoliamo quanto tempo è passato da EndTime
-	passato := time.Since(exp.Status.EndTime.Time)
-	attesa := 30 * time.Second
-
-	if passato < attesa {
-		rimanente := attesa - passato
-		log.Info("⏳ Cooldown in corso (basato su EndTime)...",
-			"passati", passato.Seconds(),
-			"rimanenti", rimanente.Seconds())
-
-		// Se non aggiorniamo lo Status, Kubernetes NON scatena il Reconcile immediato
-		// e rispetterà finalmente il RequeueAfter.
-		return ctrl.Result{RequeueAfter: rimanente}, nil
-	}
+	//TO DO: riprestinare coolDown reale magari manco la facciamo qua
 
 	// 3. Se sono passati i 30 secondi, cambiamo fase
 	log.Info("✅ Cooldown di 30s terminato. Passo a EXPORT_METRICHE.")
 	return r.updateStatus(ctx, exp, "EXPORT_METRICHE")
-}
-func (r *EsperimentoReconciler) reconcileExportMetrics(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
-	log := log.FromContext(ctx)
-
-	// 1. TENTATIVO DI RECUPERO DEL JOB
-	var job batchv1.Job
-	// NOTA: Assicurati che il namespace qui sia lo STESSO usato in runExporterJob
-	err := r.Get(ctx, client.ObjectKey{Name: exp.Name + "-exporter-job", Namespace: exp.Namespace}, &job)
-
-	if err != nil {
-		if errors.IsNotFound(err) {
-			log.Info("🚀 Job non trovato, lo sto creando...")
-			if errLaunch := r.runExporterJob(ctx, exp); errLaunch != nil {
-				// --- FIX QUI: Se il job è stato creato da un'altra reconcile un istante fa, non dare errore ---
-				if errors.IsAlreadyExists(errLaunch) {
-					log.Info("🏃 Job creato da un'altra istanza proprio ora, attendo il prossimo giro...")
-					return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-				}
-
-				log.Error(errLaunch, "❌ Impossibile lanciare il Job di Export")
-				r.setCondition(ctx, exp, "MetricsPersistedOnCSV", metav1.ConditionFalse,
-					"LaunchFailed", fmt.Sprintf("Errore creazione Job: %v", errLaunch))
-				return ctrl.Result{}, errLaunch
-			}
-			// Job creato con successo, diamogli tempo di apparire in etcd
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-		}
-		// Altri errori di comunicazione con l'API Server
-		return ctrl.Result{}, err
-	}
-
-	// 2. ANALISI DELLO STATO DEL JOB (Idempotenza)
-
-	// Caso A: Fallimento
-	if job.Status.Failed > 0 {
-		log.Error(nil, "❌ Il Job di Export è fallito")
-		r.setCondition(ctx, exp, "MetricsPersistedOnCSV", metav1.ConditionFalse,
-			"JobFailed", "Il container di export ha terminato con un errore")
-		return r.updateStatus(ctx, exp, "FAIL")
-	}
-
-	// Caso B: Successo
-	if job.Status.Succeeded > 0 {
-		log.Info("✅ Job di Export completato con successo")
-		r.setCondition(ctx, exp, "MetricsPersistedOnCSV", metav1.ConditionTrue,
-			"ExportCompleted", "Il file CSV è stato generato correttamente")
-
-		// Proseguiamo verso la pulizia o i risultati
-		return r.updateStatus(ctx, exp, "CLEANUP")
-	}
-
-	// Caso C: In esecuzione
-	log.Info("⏳ Job di Export ancora in corso...", "Succeeded", job.Status.Succeeded, "Active", job.Status.Active)
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
 func (r *EsperimentoReconciler) reconcileCleanup(ctx context.Context,

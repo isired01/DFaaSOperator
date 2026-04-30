@@ -26,3 +26,28 @@ go.work
 *.swp
 *.swo
 *~
+
+# --- Ambiente Go ---
+# Dipendenze (se usi 'go mod vendor', altrimenti inutile ma consigliato)
+vendor/
+
+# --- Strumenti di Sviluppo Kubebuilder ---
+# Questa è fondamentale: Kubebuilder scarica binari e asset temporanei qui
+testbin/
+/cover.out
+
+# --- Mac OS ---
+# File di sistema che creano conflitti inutili
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- Variabili d'ambiente (SENSITIVE DATA) ---
+# Se mai userai file .env per chiavi API o password, NON devono finire su Git
+.env
+*.env
+.env.*
+
+# --- Log e temporanei ---
+*.log
+/dist/
