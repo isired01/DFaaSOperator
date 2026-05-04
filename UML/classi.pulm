@@ -1,69 +1,80 @@
 @startuml
-title CDR per Infrastruttura -- Class Diagram
+title CDR per dFaaSOperator -- Class Diagram
 
+' Stili
 skinparam class {
     BackgroundColor<<CRD>> #E1F5FE
     BorderColor #01579B
 }
+skinparam enum {
+    BackgroundColor #FFF9C4
+    BorderColor #FBC02D
+}
 
-class Esperimento {
-    + String name
-    + Federazione federazione
+' Classi Principali (Kubernetes Style)
+class Esperimento <<CRD>> {
+    + metav1.ObjectMeta metadata
+    + ExperimentSpec spec
+    + ExperimentStatus status
+}
+
+class ExperimentSpec {
+    + Federation federation
+    + Topology topology
     + bool isCleanupRequested
-    + Topologia topologia
-    + FaseEsperimento fase
+}
+
+class ExperimentStatus {
+    + FaseEsperimento phase
     + String message
+    + List<metav1.Condition> conditions
 }
 
-class Federazione {
-    + LoadBalancing strategia
-    + List<Nodo> nodi
+' Sotto-strutture Spec
+class Federation {
+    + List<Node> nodes
 }
 
-class Nodo {
-    + String idNodo
-    + String indirizzoIP
-    + NodeCapacity capacitàNodo
-    + List<String> funzioni
+class Node {
+    + String nodeID
+    + String ipAddress
+    + String username
+    + String password
+    + String privateKey
+    + NodeCapacity capacity
+    + BalancingStrategy balancingStrategy
+    + List<Function> functions
 }
 
-class Topologia {
+class Function {
+    + String name
+    + String image
+    + int execTimeout
+    + int maxInflight
+    + int timeoutMs
+}
+
+class Topology {
     + List<Link> links
 }
 
 class Link {
-    + String nodoA
-    + String nodoB
-    + int latenzaMs
+    + String nodeA
+    + String nodeB
+    + int latencyMs
 }
 
-
-' Relazioni
-Esperimento *-- Topologia
-Topologia *-- "many" Link
-
-
-' Relazioni di composizione (Spec/Status)
-
-FaseEsperimento --> Esperimento 
-
-' Relazioni Spec
-Esperimento *-- Federazione
-
-' Relazioni Federazione
-Federazione *-- "many" Nodo
-
+' Enumerazioni
 enum FaseEsperimento {
-  IDLE
-  PROVISIONING
-  READY
-  RUNNING
-  COOLDOWN
-  COMPLETED
-  FAILED
-  CLEANUP
+    IDLE
+    PROVISIONING
+    READY
+    RUNNING
+    COOLDOWN
+    COMPLETED
+    FAILED
+    CLEANUP
 }
-
 
 enum NodeCapacity {
     LOW
@@ -71,6 +82,28 @@ enum NodeCapacity {
     HIGH
 }
 
-NodeCapacity --> Nodo
+enum BalancingStrategy {
+    staticstrategy
+    nodemarginstrategy
+    recalcstrategy
+    alllocalstrategy
+    rlagentstrategy
+}
+
+' Relazioni Gerarchiche
+Esperimento *-- ExperimentSpec
+Esperimento *-- ExperimentStatus
+
+ExperimentSpec *-- Federation
+ExperimentSpec *-- Topology
+
+Federation *-- "many" Node
+Node *-- "many" Function
+Topology *-- "many" Link
+
+' Relazioni con Enums
+ExperimentStatus -- FaseEsperimento
+Node -- NodeCapacity
+Node -- BalancingStrategy
 
 @enduml
