@@ -102,17 +102,10 @@ func (r *EsperimentoReconciler) reconcileInfra(ctx context.Context,
 		return r.updateStatus(ctx, exp, "PROVISIONING_MONITORING")
 	}
 
-	// 4. CASO: IL JOB È FALLITO DEFINITIVAMENTE
-	// Controlliamo se ha superato il limite di tentativi (BackoffLimit)
-	limit := int32(4)
-	if job.Spec.BackoffLimit != nil {
-		limit = *job.Spec.BackoffLimit
-	}
-	if job.Status.Failed > limit {
-		log.Error(nil, "❌ Job Ansible fallito dopo i tentativi previsti")
-
+	if job.Status.Failed > 0 {
+		log.Info("❌ Ansible ha fallito! Controlla i log del Job per dettagli.(kubectl logs -f -l job-name=" + exp.Name + "-infra-job)")
 		r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionFalse,
-			"ProvisioningFailed", "Il Job Ansible è andato in errore")
+			"ProvisioningFailed", "Il Job Ansible è fallito, controlla i log")
 
 		return r.updateStatus(ctx, exp, "FAILED")
 	}

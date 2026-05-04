@@ -6,6 +6,7 @@ const AnsiblePlaybookYaml = `---
   become: true
   vars:
     openfaas_url: "http://127.0.0.1:31112"
+    k3s_config: "/etc/rancher/k3s/k3s.yaml"
   
   tasks:
     - name: Disable APT automatic upgrades
@@ -30,42 +31,68 @@ const AnsiblePlaybookYaml = `---
         state: present
         update_cache: yes
 
-    - name: Disable UFW firewall
-      ansible.builtin.shell: "ufw disable || true"
+    - name: Disable UFW firewall 
+      community.general.ufw:
+        state: disabled
+
+    - name: Ensure netfilter modules are loaded
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - br_netfilter
+        - nf_conntrack
 
     - name: Tune Kernel settings
-      ansible.builtin.copy:
-        dest: /etc/sysctl.d/20-k3s-custom.conf
-        content: |
-          net.core.somaxconn = 8192
-          net.ipv4.tcp_max_syn_backlog = 8192
-          net.ipv4.ip_local_port_range = 1024 65535
-          net.ipv4.tcp_tw_reuse = 1
-          net.netfilter.nf_conntrack_max = 262144
-      register: sysctl_config
+      ansible.builtin.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/20-k3s-custom.conf
+        state: present
+        reload: yes
+        # Evita che il task fallisca se il file in /proc non esiste ancora
+        ignoreerrors: "{{ true if item.key == 'net.netfilter.nf_conntrack_max' else false }}"
+      loop:
+        - { key: "net.core.somaxconn", value: "8192" }
+        - { key: "net.ipv4.tcp_max_syn_backlog", value: "8192" }
+        - { key: "net.ipv4.ip_local_port_range", value: "1024 65535" }
+        - { key: "net.ipv4.tcp_tw_reuse", value: "1" }
+        - { key: "net.netfilter.nf_conntrack_max", value: "262144" }  
 
-    - name: Apply sysctl
-      ansible.builtin.command: sysctl --system
-      when: sysctl_config.changed
+    - name: Check if K3s is already installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: k3s_bin
 
-    - name: Install K3S
-      ansible.builtin.shell: curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --disable servicelb" sh -
-      args:
-        creates: /usr/local/bin/k3s
+    - name: Install K3S (only if missing)
+      ansible.builtin.shell: 
+        cmd: curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --disable servicelb" sh -
+      when: not k3s_bin.stat.exists
 
-    - name: Wait for K3s nodes
-      ansible.builtin.shell: "kubectl get nodes"
-      environment:
-        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-      register: k3s_ready
+    - name: Ensure K3s service is started and enabled
+      ansible.builtin.systemd:
+        name: k3s
+        state: started
+        enabled: yes
+
+    - name: Wait for K3s nodes to be ready
+      kubernetes.core.k8s_info:
+        kind: Node
+        kubeconfig: "{{ k3s_config }}"
+      register: node_list
+      until: node_list.resources | length > 0
       retries: 20
       delay: 5
-      until: k3s_ready.rc == 0
+
+    - name: Check if Helm is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/helm
+      register: helm_bin
 
     - name: Install Helm
-      ansible.builtin.shell: "curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash"
-      args:
-        creates: /usr/local/bin/helm
+      ansible.builtin.shell: 
+        cmd: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      when: not helm_bin.stat.exists
 
     - name: Add Helm Repos
       kubernetes.core.helm_repository:
@@ -82,13 +109,8 @@ const AnsiblePlaybookYaml = `---
         api_version: v1
         kind: Namespace
         state: present
-      environment:
-        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-      loop:
-        - openfaas
-        - openfaas-fn
-        - monitoring
-        - haproxy-controller
+        kubeconfig: "{{ k3s_config }}"
+      loop: [openfaas, openfaas-fn, monitoring, haproxy-controller]
 
     - name: "Create local config directory on nodes"
       ansible.builtin.file:
@@ -96,14 +118,12 @@ const AnsiblePlaybookYaml = `---
         state: directory
         mode: '0755'
 
-    - name: "Copy Helm values from Ansible Pod to Nodes"
+    - name: "Copy Helm values"
       ansible.builtin.copy:
         src: "/opt/helm-values/{{ item }}.yaml"
         dest: "/opt/dfaas/helm-values/{{ item }}.yaml"
-      loop:
-        - haproxy
-        - prometheus
-        - openfaas
+      loop: [haproxy, prometheus, openfaas]
+      register: helm_values_copy
 
     - name: Install Helm Charts
       kubernetes.core.helm:
@@ -112,26 +132,30 @@ const AnsiblePlaybookYaml = `---
         release_namespace: "{{ item.ns }}"
         create_namespace: yes
         wait: yes
-        # 1. Applica i file montati dalla ConfigMap (Percorso definito nel Job Go)
+        kubeconfig: "{{ k3s_config }}"
         values_files:
           - "/opt/dfaas/helm-values/{{ item.name }}.yaml"
-        # 2. Mantiene i valori inline (es. per OpenFaaS)
-        values: "{{ item.helm_values | default({}) }}"
-      environment:
-        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
       loop:
         - { name: "haproxy", chart: "haproxytech/haproxy", ns: "haproxy-controller" }
         - { name: "prometheus", chart: "prometheus-community/prometheus", ns: "monitoring" }
         - { name: "openfaas", chart: "openfaas/openfaas", ns: "openfaas"}
+      register: helm_install_result
+      retries: 5           # Tenta 5 volte prima di fallire
+      delay: 15            # Aspetta 15 secondi tra un tentativo e l'altro
+      until: helm_install_result is succeeded
+
+    - name: Check if faas-cli is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/faas-cli
+      register: faas_cli_bin
 
     - name: Install faas-cli
-      ansible.builtin.shell: "curl -sSL https://cli.openfaas.com | sh"
-      args:
-        creates: /usr/local/bin/faas-cli
+      ansible.builtin.shell: curl -sSL https://cli.openfaas.com | sh
+      when: not faas_cli_bin.stat.exists
 
     - name: "Wait for OpenFaaS Gateway"
       ansible.builtin.uri:
-        url: "http://127.0.0.1:31112/system/functions"
+        url: "{{ openfaas_url }}/system/functions"
         status_code: [200, 401]
       register: gateway_check
       until: gateway_check.status in [200, 401]
@@ -139,13 +163,16 @@ const AnsiblePlaybookYaml = `---
       delay: 10
 
     - name: "Get deployed functions"
-      ansible.builtin.shell: "/usr/local/bin/faas-cli list --gateway={{ openfaas_url }} | tail -n +2 | awk '{print $1}'"
+      ansible.builtin.shell: 
+        cmd: "/usr/local/bin/faas-cli list --gateway={{ openfaas_url }} --quiet"
       register: deployed_functions_raw
-      changed_when: false
+      retries: 5
+      delay: 5
+      until: deployed_functions_raw.rc == 0
 
     - name: "Pruning: Remove old functions"
       ansible.builtin.shell: "/usr/local/bin/faas-cli remove {{ item }} --gateway={{ openfaas_url }}"
-      loop: "{{ deployed_functions_raw.stdout_lines }}"
+      loop: "{{ deployed_functions_raw.stdout_lines | default([]) }}"
       when: 
         - node_specific_functions is defined
         - item != ""
@@ -163,68 +190,65 @@ const AnsiblePlaybookYaml = `---
           --update=true
       loop: "{{ node_specific_functions }}"
       when: node_specific_functions is defined and node_specific_functions | length > 0
+      register: function_deploy
+      changed_when: "'Updating' in function_deploy.stdout or 'Deployed' in function_deploy.stdout"
 
-    
-    - name: "Make K3s config permanent for root"
-      ansible.builtin.shell: |
-        mkdir -p /root/.kube
-        ln -sf /etc/rancher/k3s/k3s.yaml /root/.kube/config
-      args:
-        creates: /root/.kube/config
-      tags: [ 'agent_only' ]
+    - name: "Setup Kubeconfig for root"
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: '0700'
 
-    - name: "Create Secret for dFaaS Agent Key"
-      kubernetes.core.k8s:
-        state: present
-        definition:
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: dfaas-agent-key
-            namespace: default
-          type: Opaque
-          stringData:
-            privatekey.pem: |
-              -----BEGIN PRIVATE KEY-----
-              {{ node_priv_key }}
-              -----END PRIVATE KEY-----
-      environment:
-        KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+    - name: "Link K3s config for root"
+      ansible.builtin.file:
+        src: "{{ k3s_config }}"
+        dest: /root/.kube/config
+        state: link
+        force: yes
 
-      
     - name: "Install dFaaS Agent via Helm"
       kubernetes.core.helm:
         name: "dfaas-agent"
         chart_ref: "oci://ghcr.io/isired01/dfaas-agent-chart"
         chart_version: "0.1.3"
         release_namespace: "default"
+        kubeconfig: "{{ k3s_config }}"
         wait: no
         values:
           image: "ghcr.io/isired01/dfaas-agent:dev"
           imagePullPolicy: "Always"
-
           privateKey: |
             -----BEGIN PRIVATE KEY-----
             {{ node_priv_key }}
             -----END PRIVATE KEY-----
-
           config:
             AGENT_DEBUG: "true"
-            AGENT_BOOTSTRAP_NODES: "{{is_bootstrap}}"
-            AGENT_BOOTSTRAP_NODES_LIST: "{{ bootstrap_address}}"
-            AGENT_STRATEGY: "staticstrategy"
-          
+            AGENT_BOOTSTRAP_NODES: "{{ 'true' if is_bootstrap | bool else 'false' }}" 
+            AGENT_BOOTSTRAP_NODES_LIST: "{{ bootstrap_address }}"
+            AGENT_STRATEGY: "{{ balancing_strategy }}"
           forecaster:
-            enabled: no
-      tags: [ 'agent_only' ]
+            enabled: false
 
-    - name: "Force Prometheus host via kubectl (Workaround non prede la config che passo con helm dallo yaml problema conosciuto issue su github presente)"
-      ansible.builtin.shell: |
-        sudo kubectl set env deployment/gateway -n openfaas \
-        faas_prometheus_host=prometheus.monitoring.svc.cluster.local \
-        faas_prometheus_port=9090
-      environment:
-        KUBECONFIG: /etc/rancher/k3s/k3s.yaml`
+    - name: "Fix Prometheus host in Gateway"
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ k3s_config }}"
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: gateway
+            namespace: openfaas
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: gateway
+                    env:
+                      - name: faas_prometheus_host
+                        value: "prometheus.monitoring.svc.cluster.local"
+                      - name: faas_prometheus_port
+                        value: "9090"`
 
 const HaproxyValues = `
 image:
@@ -446,7 +470,7 @@ server:
     scrape_timeout: 4s
 
   # Decrease the default retention time. This is enough for the DFaaS prototype.
-  retention: "2d"
+  retention: "5d"
 
   # Enable retention size to 85% of the allocated Persistent Volume.
   retentionSize: "5.1GB"

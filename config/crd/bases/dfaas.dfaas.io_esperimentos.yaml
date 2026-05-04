@@ -15,7 +15,7 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .status.fase
+    - jsonPath: .status.phase
       name: Phase
       type: string
     name: v1
@@ -41,22 +41,20 @@ spec:
           metadata:
             type: object
           spec:
-            description: EsperimentoSpec definisce i parametri di configurazione del
-              SINGOLO esperimento
             properties:
-              federazione:
-                description: Configurazione della federazione dedicata
+              federation:
+                description: Configuration of the dedicated federation
                 properties:
-                  nodi:
+                  nodes:
                     description: Lista dei nodi della federazione per questo specifico
                       esperimento
                     items:
                       properties:
-                        capacita:
+                        balancingStrategy:
                           type: string
-                        chiavePrivata:
+                        capacity:
                           type: string
-                        funzioni:
+                        functions:
                           description: Lista di configurazioni per le funzioni da
                             deployare su questo nodo
                           items:
@@ -66,17 +64,15 @@ spec:
                                 description: Tempo massimo di esecuzione (corrisponde
                                   a exec_timeout)
                                 type: integer
-                              immagine:
-                                description: |-
-                                  Immagine completa (es: "functions/figlet:latest")
-                                  Necessaria per evitare errore 400 su OpenFaaS CE
+                              image:
+                                description: 'Immagine completa (es: "functions/figlet:latest")'
                                 type: string
                               maxInflight:
                                 default: 400
                                 description: Massimo numero di richieste parallele
                                   (corrisponde a max_inflight)
                                 type: integer
-                              nome:
+                              name:
                                 description: 'Nome della funzione (es: "figlet")'
                                 type: string
                               timeoutMs:
@@ -86,75 +82,74 @@ spec:
                                 type: integer
                             required:
                             - execTimeout
-                            - immagine
+                            - image
                             - maxInflight
-                            - nome
+                            - name
                             - timeoutMs
                             type: object
                           type: array
-                        idNodo:
+                        ipAddress:
                           type: string
-                        indirizzoIP:
+                        nodeID:
                           type: string
                         password:
                           type: string
-                        userName:
+                        privateKey:
+                          type: string
+                        username:
                           type: string
                       required:
-                      - capacita
-                      - chiavePrivata
-                      - idNodo
-                      - indirizzoIP
+                      - balancingStrategy
+                      - capacity
+                      - ipAddress
+                      - nodeID
                       - password
-                      - userName
+                      - privateKey
+                      - username
                       type: object
                     minItems: 1
                     type: array
-                  strategia:
-                    description: 'Strategia di load balancing (es: "ROUND_ROBIN")'
-                    type: string
                 required:
-                - nodi
-                - strategia
+                - nodes
                 type: object
               isCleanupRequested:
                 default: false
-                description: Flag per richiedere la pulizia delle risorse a fine test
+                description: Flag to request resource cleanup after the test
                 type: boolean
-              topologia:
-                description: Topologia di rete dell'esperimento
+              topology:
+                description: Network topology of the experiment
                 properties:
                   links:
                     description: Definizione dei link di rete tra i nodi dell'esperimento
                     items:
                       properties:
-                        latenzaMs:
+                        latencyMs:
                           type: integer
-                        nodoA:
+                        nodeA:
                           type: string
-                        nodoB:
+                        nodeB:
                           type: string
                       required:
-                      - latenzaMs
-                      - nodoA
-                      - nodoB
+                      - latencyMs
+                      - nodeA
+                      - nodeB
                       type: object
                     type: array
                 required:
                 - links
                 type: object
             required:
-            - federazione
+            - federation
             - isCleanupRequested
-            - topologia
+            - topology
             type: object
           status:
             description: EsperimentoStatus definisce lo stato osservato dell'istanza
               (gestito dal Controller)
             properties:
               conditions:
-                description: Conditions rappresenta l'osservazione dello stato attuale
-                  dell'esperimento
+                description: Conditions represents the observations of the experiment's
+                  current state
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -210,12 +205,12 @@ spec:
                   - type
                   type: object
                 type: array
-              fase:
-                default: IDLE
-                description: Stato attuale dell'esecuzione
-                type: string
               message:
-                description: Messaggio di dettaglio (es. motivo di un FAILED)
+                description: Detailed message (e.g., reason for a FAILED state)
+                type: string
+              phase:
+                default: IDLE
+                description: Current execution phase
                 type: string
             type: object
         type: object
