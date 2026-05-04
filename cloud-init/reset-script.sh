@@ -5,8 +5,8 @@ NODES=("nodoA" "nodoB" "nodoC")
 IPS=("192.168.252.4" "192.168.252.5" "192.168.252.6")
 
 # Risorse VM (modifica in base alla tua RAM totale)
-CPUS="1"
-RAM="2G"
+CPUS="2"
+RAM="4G"
 DISK="20G"
 
 echo "--- Inizio Reset Nodi Multipass ---"

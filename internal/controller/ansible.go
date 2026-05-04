@@ -34,35 +34,36 @@ func (r *EsperimentoReconciler) createAnsibleJob(ctx context.Context, exp *dfaas
 		return nil, nil, fmt.Errorf("failed to ensure ansible config map: %w", err)
 	}
 
-	firstPeerID, _ := calcolaPeerID(exp.Spec.Federazione.Nodi[0].ChiavePrivata)
+	firstPeerID, _ := calcolaPeerID(exp.Spec.Federation.Nodes[0].PrivateKey)
 
 	var inventory string
-	inventory += "[target_nodes]\n"
+	inventory += "[target_Nodess]\n"
 
-	for i, node := range exp.Spec.Federazione.Nodi {
-		if node.IndirizzoIP != "" {
-			peerID, err := calcolaPeerID(node.ChiavePrivata)
+	for i, Nodes := range exp.Spec.Federation.Nodes {
+		if Nodes.IpAddress != "" {
+			peerID, err := calcolaPeerID(Nodes.PrivateKey)
 			if err != nil {
 				peerID = "error-key"
 			}
 
 			isBootstrap := (i != 0)
-			bootstrapAddr := fmt.Sprintf("/ip4/%s/tcp/31600/p2p/%s", exp.Spec.Federazione.Nodi[0].IndirizzoIP, firstPeerID)
+			bootstrapAddr := fmt.Sprintf("/ip4/%s/tcp/31600/p2p/%s", exp.Spec.Federation.Nodes[0].IpAddress, firstPeerID)
 			if !isBootstrap {
 				bootstrapAddr = ""
 			}
 
-			nodeFunctionsJson, _ := json.Marshal(node.Funzioni)
+			NodesFunctionsJson, _ := json.Marshal(Nodes.Functions)
 
-			line := fmt.Sprintf("%s ansible_user=%s ansible_password=%s node_specific_functions='%s' node_priv_key='%s' dfaas_agent_id='%s' is_bootstrap=%t bootstrap_address='%s'\n",
-				node.IndirizzoIP,
-				node.UserName,
-				node.Password,
-				string(nodeFunctionsJson),
-				node.ChiavePrivata,
+			line := fmt.Sprintf("%s ansible_user=%s ansible_password=%s Nodes_specific_functions='%s' node_priv_key='%s' dfaas_agent_id='%s' is_bootstrap=%t bootstrap_address='%s' balancing_strategy='%s'\n",
+				Nodes.IpAddress,
+				Nodes.Username,
+				Nodes.Password,
+				string(NodesFunctionsJson),
+				Nodes.PrivateKey,
 				peerID,
 				isBootstrap,
 				bootstrapAddr,
+				Nodes.BalancingStrategy,
 			)
 			inventory += line
 		}
@@ -84,6 +85,7 @@ func (r *EsperimentoReconciler) createAnsibleJob(ctx context.Context, exp *dfaas
 			Namespace: exp.Namespace,
 		},
 		Spec: batchv1.JobSpec{
+			BackoffLimit: int32Ptr(3), //default se non specificato è 6
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -92,7 +94,7 @@ func (r *EsperimentoReconciler) createAnsibleJob(ctx context.Context, exp *dfaas
 							Image:   "alpine/ansible:2.20.0",
 							Command: []string{"sh", "-c"},
 							Args: []string{
-								"ansible-playbook -i /etc/ansible/hosts /ansible/playbooks/setup-node.yml " +
+								"ansible-playbook -i /etc/ansible/hosts /ansible/playbooks/setup-Nodes.yml " +
 									"--extra-vars \"ansible_ssh_common_args='-o StrictHostKeyChecking=no'\"",
 							},
 							VolumeMounts: []corev1.VolumeMount{
@@ -146,7 +148,7 @@ func (r *EsperimentoReconciler) ensureAnsibleConfigMap(ctx context.Context, exp 
 			Namespace: exp.Namespace,
 		},
 		Data: map[string]string{
-			"setup-node.yml": AnsiblePlaybookYaml,
+			"setup-Nodes.yml": AnsiblePlaybookYaml,
 		},
 	}
 
@@ -226,4 +228,9 @@ func calcolaPeerID(privKeyBase64 string) (string, error) {
 	}
 
 	return id.String(), nil
+}
+
+// Funzione di utilità per creare un puntatore a int32
+func int32Ptr(i int32) *int32 {
+	return &i
 }

@@ -3,60 +3,65 @@ kind: Esperimento
 metadata:
   name: test-milano-torino
 spec:
-  # 1. FEDERAZIONEstrategia
-  federazione:
-    strategia: "NODE_MARGIN"
-    nodi:
-      - idNodo: "milano-edge-01"
-        indirizzoIP: "192.168.252.51"
-        userName: "isaia"
+  # 1. FEDERATION CONFIGURATION
+  federation:
+    nodes:
+      - nodeID: "milano-edge-01"
+        ipAddress: "192.168.252.57"
+        username: "isaia"
         password: "root"
-        capacita: "MEDIUM"
-        chiavePrivata: "MC4CAQAwBQYDK2VwBCIEIODgFN+A8KkNvY8ozKDMXdQV2fehNH43Ba+MYpOzihsJ"
-        funzioni:
-          - nome: "shasum"
-            immagine: "ghcr.io/openfaas/shasum:latest"
-            execTimeout: 4
-            maxInflight: 400
-            timeoutMs: 6000
-      - idNodo: "milano-edge-02"
-        indirizzoIP: "192.168.252.52"
-        userName: "isaia"
-        password: "root"
-        capacita: "MEDIUM"
-        chiavePrivata: "MC4CAQAwBQYDK2VwBCIEIDK425yPPtvEbZB2ZED5wp2YLn32qmS5Ip5aQzuODfyj"
-        funzioni:
-          - nome: "shasum"
-            immagine: "ghcr.io/openfaas/shasum:latest"
-            execTimeout: 4
-            maxInflight: 400
-            timeoutMs: 6000
-          - nome: "figlet"
-            immagine: "ghcr.io/openfaas/figlet:latest"
+        capacity: "MEDIUM"
+        balancingStrategy: "staticstrategy"
+        privateKey: "MC4CAQAwBQYDK2VwBCIEIODgFN+A8KkNvY8ozKDMXdQV2fehNH43Ba+MYpOzihsJ"
+        functions:
+          - name: "shasum"
+            image: "ghcr.io/openfaas/shasum:latest"
             execTimeout: 4
             maxInflight: 400
             timeoutMs: 6000
 
-      - idNodo: "milano-edge-03"
-        indirizzoIP: "192.168.252.53"
-        userName: "isaia"
+      - nodeID: "milano-edge-02"
+        ipAddress: "192.168.252.58"
+        username: "isaia"
         password: "root"
-        capacita: "MEDIUM"
-        chiavePrivata: "MC4CAQAwBQYDK2VwBCIEIH2bNnEMT85rlwCD5bHGqjYbaOW8xOrbVfi8MGsEWjDG"
-        funzioni:
-          - nome: "figlet"
-            immagine: "ghcr.io/openfaas/figlet:latest"
+        capacity: "MEDIUM"
+        balancingStrategy: "staticstrategy"
+        privateKey: "MC4CAQAwBQYDK2VwBCIEIDK425yPPtvEbZB2ZED5wp2YLn32qmS5Ip5aQzuODfyj"
+        functions:
+          - name: "shasum"
+            image: "ghcr.io/openfaas/shasum:latest"
             execTimeout: 4
             maxInflight: 400
             timeoutMs: 6000
-  # 2. TOPOLOGIA (Corrected indentation and structure)
-  topologia:
+          - name: "figlet"
+            image: "ghcr.io/openfaas/figlet:latest"
+            execTimeout: 4
+            maxInflight: 400
+            timeoutMs: 6000
+
+      - nodeID: "milano-edge-03"
+        ipAddress: "192.168.252.59"
+        username: "isaia"
+        password: "root"
+        capacity: "MEDIUM"
+        balancingStrategy: "staticstrategy"
+        privateKey: "MC4CAQAwBQYDK2VwBCIEIH2bNnEMT85rlwCD5bHGqjYbaOW8xOrbVfi8MGsEWjDG"
+        functions:
+          - name: "figlet"
+            image: "ghcr.io/openfaas/figlet:latest"
+            execTimeout: 4
+            maxInflight: 400
+            timeoutMs: 6000
+
+  # 2. NETWORK TOPOLOGY
+  topology:
     links:
-      - nodoA: "milano-edge-01"
-        nodoB: "torino-edge-02"
-        latenzaMs: 54
-      - nodoA: "milano-edge-01"
-        nodoB: "torino-edge-03"
-        latenzaMs: 21
+      - nodeA: "milano-edge-01"
+        nodeB: "torino-edge-02"
+        latencyMs: 54
+      - nodeA: "milano-edge-01"
+        nodeB: "torino-edge-03"
+        latencyMs: 21
 
+  # 3. CLEANUP FLAG
   isCleanupRequested: false

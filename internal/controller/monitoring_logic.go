@@ -79,7 +79,7 @@ func (r *EsperimentoReconciler) checkMonitoringStack(ctx context.Context) (bool,
 
 	promReady := false
 	grafanaReady := false
-	minioReady := false // AGGIUNTO: Check per MinIO
+	minioReady := false
 
 	for _, pod := range podList.Items {
 		isReady := false
@@ -127,14 +127,14 @@ func (r *EsperimentoReconciler) reconcilePrometheusTargets(ctx context.Context, 
 
 	var targets []PrometheusTarget
 
-	// Cicliamo sui nodi definiti nell'oggetto Esperimento
-	for _, nodo := range exp.Spec.Federazione.Nodi {
+	// Cicliamo sui nodi definiti nell' Esperimento
+	for _, nodo := range exp.Spec.Federation.Nodes {
 		target := PrometheusTarget{
-			Targets: []string{nodo.IndirizzoIP + ":30909"}, // Usa l'IP della CRD e la porta di dFaaS
+			Targets: []string{nodo.IpAddress + ":30909"}, // Usa l'IP della CRD e la porta di dFaaS
 			Labels: map[string]string{
 				"esperimento": exp.Name,
-				"nodo_id":     nodo.IDNodo,
-				"tipo_nodo":   string(nodo.Capacita),
+				"nodo_id":     nodo.NodeID,
+				"tipo_nodo":   string(nodo.Capacity),
 			},
 		}
 		targets = append(targets, target)

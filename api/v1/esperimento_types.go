@@ -31,27 +31,33 @@ const (
 	CapacityHigh   NodeCapacity = "HIGH"
 )
 
+type BalancingStrategy string
+
+const (
+	staticStrategy     BalancingStrategy = "staticstrategy"
+	nodeMarginStrategy BalancingStrategy = "nodemarginstrategy"
+	recalcStrategy     BalancingStrategy = "recalcstrategy"
+	Alllocalstrstegy   BalancingStrategy = "alllocalstrategy"
+	RLAgentStrategy    BalancingStrategy = "rlagentstrategy"
+)
+
 // --- SOTTO-STRUTTURE (SPEC) ---
 
-type Federazione struct {
-	// Strategia di load balancing (es: "ROUND_ROBIN")
-	// +kubebuilder:validation:Required
-	Strategia string `json:"strategia"`
+type Federation struct {
 
 	// Lista dei nodi della federazione per questo specifico esperimento
 	// +kubebuilder:validation:MinItems=1
-	Nodi []Nodo `json:"nodi"`
+	Nodes []Node `json:"nodes"`
 }
 
-type FunzioneConfig struct {
+type Function struct {
 	// Nome della funzione (es: "figlet")
 	// +kubebuilder:validation:Required
-	Nome string `json:"nome"`
+	Name string `json:"name"`
 
 	// Immagine completa (es: "functions/figlet:latest")
-	// Necessaria per evitare errore 400 su OpenFaaS CE
 	// +kubebuilder:validation:Required
-	Immagine string `json:"immagine"`
+	Image string `json:"image"`
 
 	// Tempo massimo di esecuzione (corrisponde a exec_timeout)
 	// +kubebuilder:default=5
@@ -68,77 +74,76 @@ type FunzioneConfig struct {
 
 // --- MODIFICA STRUTTURA NODO ---
 
-type Nodo struct {
-	IDNodo        string       `json:"idNodo"`
-	IndirizzoIP   string       `json:"indirizzoIP"`
-	UserName      string       `json:"userName"`
-	Password      string       `json:"password"`
-	Capacita      NodeCapacity `json:"capacita"`
-	ChiavePrivata string       `json:"chiavePrivata"`
+type Node struct {
+	NodeID            string       `json:"nodeID"`
+	IpAddress         string       `json:"ipAddress"`
+	Username          string       `json:"username"`
+	Password          string       `json:"password"`
+	Capacity          NodeCapacity `json:"capacity"`
+	BalancingStrategy string       `json:"balancingStrategy"`
+	PrivateKey        string       `json:"privateKey"`
 
 	// Lista di configurazioni per le funzioni da deployare su questo nodo
 	// +optional
-	Funzioni []FunzioneConfig `json:"funzioni,omitempty"`
+	Functions []Function `json:"functions,omitempty"`
 }
 
-type Topologia struct {
+type Topology struct {
 	// Definizione dei link di rete tra i nodi dell'esperimento
 	Links []Link `json:"links"`
 }
 
 type Link struct {
-	NodoA     string `json:"nodoA"`
-	NodoB     string `json:"nodoB"`
-	LatenzaMs int    `json:"latenzaMs"`
+	NodeA     string `json:"nodeA"`
+	NodeB     string `json:"nodeB"`
+	LatencyMs int    `json:"latencyMs"`
 }
 
 // --- CORE DELLA CRD ---
 
-// EsperimentoSpec definisce i parametri di configurazione del SINGOLO esperimento
-type EsperimentoSpec struct {
-
-	// Configurazione della federazione dedicata
+type ExperimentSpec struct {
+	// Configuration of the dedicated federation
 	// +kubebuilder:validation:Required
-	Federazione Federazione `json:"federazione"`
+	Federation Federation `json:"federation"`
 
-	// Flag per richiedere la pulizia delle risorse a fine test
+	// Flag to request resource cleanup after the test
 	// +kubebuilder:default=false
 	IsCleanupRequested bool `json:"isCleanupRequested"`
 
-	// Topologia di rete dell'esperimento
+	// Network topology of the experiment
 	// +kubebuilder:validation:Required
-	Topologia Topologia `json:"topologia"`
+	Topology Topology `json:"topology"`
 }
 
 // EsperimentoStatus definisce lo stato osservato dell'istanza (gestito dal Controller)
-type EsperimentoStatus struct {
-	// Conditions rappresenta l'osservazione dello stato attuale dell'esperimento
+type ExperimentStatus struct {
+	// Conditions represents the observations of the experiment's current state
 	// +patchStrategy=merge
 	// +patchMergeKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 
-	// Stato attuale dell'esecuzione
+	// Current execution phase
 	// +kubebuilder:default=IDLE
 	// +optional
-	Fase FaseEsperimento `json:"fase,omitempty"`
+	Phase FaseEsperimento `json:"phase,omitempty"`
 
-	// Messaggio di dettaglio (es. motivo di un FAILED)
+	// Detailed message (e.g., reason for a FAILED state)
 	// +optional
 	Message string `json:"message,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.fase"
+// +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 
 // Esperimento è lo schema per la risorsa singola
 type Esperimento struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   EsperimentoSpec   `json:"spec,omitempty"`
-	Status EsperimentoStatus `json:"status,omitempty"`
+	Spec   ExperimentSpec   `json:"spec,omitempty"`
+	Status ExperimentStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true

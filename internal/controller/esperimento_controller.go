@@ -68,7 +68,7 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if exp.Status.Fase == "" {
+	if exp.Status.Phase == "" {
 		log.Info("Inizio Reconcile")
 	}
 
@@ -83,7 +83,7 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 	}
 
 	// 2. State Machine
-	switch exp.Status.Fase {
+	switch exp.Status.Phase {
 
 	case "":
 		log.Info("Inizio handleInitialState")
@@ -124,7 +124,7 @@ func (r *EsperimentoReconciler) updateStatus(ctx context.Context,
 	}
 
 	// 2. Aggiorniamo la fase sulla versione appena scaricata
-	latestExp.Status.Fase = dfaasv1.FaseEsperimento(fase)
+	latestExp.Status.Phase = dfaasv1.FaseEsperimento(fase)
 
 	if err := r.Status().Update(ctx, latestExp); err != nil {
 		return ctrl.Result{}, err
