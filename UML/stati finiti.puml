@@ -3,75 +3,85 @@ skinparam backgroundColor #FFFFFF
 skinparam state {
   BackgroundColor #E1F5FE
   BorderColor #01579B
+  BackgroundColor<<External>> #FFF9C4
+  BorderColor<<External>> #FBC02D
   BackgroundColor<<Error>> #FFCCCC
   BorderColor<<Error>> #FF0000
 }
 
-title Architettura Logica delle Fasi dell'Esperimento
+title Architettura Logica delle Fasi dell'Esperimento (v2)
 
-[*] --> IDLE 
+[*] --> INITIAL_STATE
 
-state IDLE{
-  IDLE : Attesa creazione Esperimento (Attesa CDR)
+state INITIAL_STATE {
+  INITIAL_STATE : Inizio Esperimento
+  INITIAL_STATE : Lettura specifica CDR (n. nodi, caratteristiche...)
 }
 
-state PROVISIONING_INFRA {
-  CostruzioneFederazione : Costruisco DFaaS Desiderato
-  CostruzioneFederazione --> VerificaProvisioning : OK
-  VerificaProvisioning : Verifico che tutto sia pronto
+state INFRASTRUCTURE_PROVISIONING {
+  INFRASTRUCTURE_PROVISIONING : Creazione macchine virtuali
+}
+
+state INSTALLING_DFAAS {
+  INSTALLING_DFAAS : Installazione dFaaS Agent, OpenFaaS e HAProxy...
+  INSTALLING_DFAAS : Configurazione rete P2P
 }
 
 state PROVISIONING_MONITORING {
-  ProvisioningPrometheus : Provisioning Prometheus
-  ProvisioningPrometheus --> VerificaProvisioningMonitoring : OK
-  ProvisioningGrafana : Provisioning Grafana
-  ProvisioningGrafana --> VerificaProvisioningMonitoring : OK
-  VerificaProvisioningMonitoring : Verifico che Prometheus e Grafana siano pronti
-  
+  PROVISIONING_MONITORING : Installazione stack monitoring(Prometheus, Grafana e MinIO)
 }
 
-state READY {
-  PrepMonitoraggio : Aggiorno configurazione Prometheus
-  PrepMonitoraggio : su Prometheus (JSON Injection)
-  PrepMonitoraggio --> PrepCarico : OK
-  PrepCarico : Generazione Script k6 
-  PrepCarico : e lancio del Job
+state READY <<External>> {
+  READY : Sistema configurato e pronto
+  READY : Configurazione script k6
 }
 
-state RUNNING {
-  MonitoraggioJobK6 : Verifica completamento 
-  MonitoraggioJobK6 : o fallimento del Job
-  LiveObservability : Apertura Dashboard Grafana 
+note right of READY
+  **INTERVENTO ESTERNO RICHIESTO**
+  Il controller rimane in attesa di un input
+  dal frontend o di un cambio stato manuale.
+end note
+
+state RUNNING <<External>> {
+  RUNNING : Esecuzione Job k6
+  RUNNING : Monitoraggio metriche real-time
 }
 
 state COOLDOWN {
-  BufferSync : Attesa sincronizzazione 
-  BufferSync : buffer Prometheus (Dati k6)
-  BufferSync --> Estrazioni : OK
-  Estrazioni : Estrazione dati da Prometheus to CSV e salvati in MinIO
+  COOLDOWN : Sincronizzazione dati Prometheus
+  COOLDOWN : Estrazione risultati in CSV verso MinIO
+}
+
+state CLEANUP {
+  CLEANUP : Rimozione VMs
 }
 
 state COMPLETED {
-  CLEANUP : Pulizia risorse (se richiesto dall'utente)
+  COMPLETED : Esperimento Terminato correttamente
 }
 
-' Transizioni di alto livello
-IDLE --> Validazione_file : Esperimento Creato
-Validazione_file -->  PROVISIONING_INFRA: File Validato
-PROVISIONING_INFRA --> PROVISIONING_MONITORING : Infra Pronta
-PROVISIONING_MONITORING --> READY : Piattaforma monitoring Pronta
-READY --> RUNNING : Carico Pronto
-RUNNING --> COOLDOWN : Fine Test
-COOLDOWN --> COMPLETED : Dati Pronti
+' Transizioni basate sullo Switch Case del Controller
+INITIAL_STATE --> INFRASTRUCTURE_PROVISIONING : [case ""]
+INFRASTRUCTURE_PROVISIONING --> INSTALLING_DFAAS : [case "INFRASTRUCTURE_PROVISIONING"]
+INSTALLING_DFAAS --> PROVISIONING_MONITORING : [case "INSTALLING_DFAAS"]
+PROVISIONING_MONITORING --> READY : [case "PROVISIONING_MONITORING"]
 
-' Gestione Errore
-PROVISIONING_INFRA --> FAILED : Timeout/Errore
-PROVISIONING_MONITORING --> FAILED : Timeout/Errore
-READY --> FAILED : Errore Config
-RUNNING --> FAILED : Crash k6
+' Transizioni gestite esternamente (Frontend)
+READY --> RUNNING : Input Esterno (Frontend)
+RUNNING --> COOLDOWN : Fine Test / Input Esterno
 
+' Ripresa flusso automatico per chiusura
+COOLDOWN --> CLEANUP : [case "COOLDOWN"]
+CLEANUP --> COMPLETED : [case "CLEANUP"]
+COMPLETED --> [*] : [case "COMPLETED"]
+
+' Gestione Errori
 state FAILED <<Error>> {
-  FAILED : Snapshot dell'errore
+  FAILED : Snapshot log e stato errore
 }
+
+INFRASTRUCTURE_PROVISIONING --> FAILED : Errore SSH/K3s
+INSTALLING_DFAAS --> FAILED : Errore Helm/P2P
+PROVISIONING_MONITORING --> FAILED : Errore DNS/Svc
 
 @enduml

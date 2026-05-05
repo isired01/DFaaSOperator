@@ -52,6 +52,11 @@ func (r *EsperimentoReconciler) handleDeletion(ctx context.Context,
 
 func (r *EsperimentoReconciler) reconcileInfra(ctx context.Context,
 	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
+	return r.updateStatus(ctx, exp, "INSTALLING_DFAAS")
+}
+
+func (r *EsperimentoReconciler) reconcileDFAAS(ctx context.Context,
+	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
 
 	log := log.FromContext(ctx)
 
@@ -143,7 +148,6 @@ func (r *EsperimentoReconciler) reconcileCooldown(ctx context.Context, exp *dfaa
 	log := log.FromContext(ctx)
 
 	//TO DO: riprestinare coolDown reale magari manco la facciamo qua
-
 	// 3. Se sono passati i 30 secondi, cambiamo fase
 	log.Info("✅ Cooldown di 30s terminato. Passo a EXPORT_METRICHE.")
 	return r.updateStatus(ctx, exp, "EXPORT_METRICHE")

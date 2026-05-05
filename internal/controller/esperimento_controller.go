@@ -92,6 +92,10 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 	case "PROVISIONING_INFRA":
 		log.Info("Inizio PROVISIONING_INFRA")
 		return r.reconcileInfra(ctx, &exp)
+	
+	case "INSTALLING_DFAAS":
+		log.Info("Inizio INSTALLING_DFAAS")
+		return r.reconcileDFAAS(ctx, &exp)
 
 	case "PROVISIONING_MONITORING":
 		log.Info("Inizio PROVISIONING_MONITORING")
