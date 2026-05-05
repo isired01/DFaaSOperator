@@ -176,13 +176,13 @@ const AnsiblePlaybookYaml = `---
       when: 
         - node_specific_functions is defined
         - item != ""
-        - item not in (node_specific_functions | map(attribute='nome') | list)
+        - item not in (node_specific_functions | map(attribute='name') | list)
 
     - name: "Deploy functions from CRD"
       ansible.builtin.shell: |
         /usr/local/bin/faas-cli deploy \
-          --image={{ item.immagine }} \
-          --name={{ item.nome }} \
+          --image={{ item.image }} \
+          --name={{ item.name }} \
           --gateway={{ openfaas_url }} \
           --env exec_timeout={{ item.execTimeout }}s \
           --env max_inflight={{ item.maxInflight }} \

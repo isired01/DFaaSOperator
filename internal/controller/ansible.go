@@ -54,7 +54,7 @@ func (r *EsperimentoReconciler) createAnsibleJob(ctx context.Context, exp *dfaas
 
 			NodesFunctionsJson, _ := json.Marshal(Nodes.Functions)
 
-			line := fmt.Sprintf("%s ansible_user=%s ansible_password=%s Nodes_specific_functions='%s' node_priv_key='%s' dfaas_agent_id='%s' is_bootstrap=%t bootstrap_address='%s' balancing_strategy='%s'\n",
+			line := fmt.Sprintf("%s ansible_user=%s ansible_password=%s node_specific_functions='%s' node_priv_key='%s' dfaas_agent_id='%s' is_bootstrap=%t bootstrap_address='%s' balancing_strategy='%s'\n",
 				Nodes.IpAddress,
 				Nodes.Username,
 				Nodes.Password,
