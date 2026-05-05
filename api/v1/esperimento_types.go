@@ -10,19 +10,6 @@ import (
 
 // --- ENUMS ---
 
-type FaseEsperimento string
-
-const (
-	FaseIdle      FaseEsperimento = "IDLE"
-	FaseProvision FaseEsperimento = "PROVISIONING"
-	FaseReady     FaseEsperimento = "READY"
-	FaseRunning   FaseEsperimento = "RUNNING"
-	FaseCooldown  FaseEsperimento = "COOLDOWN"
-	FaseCompleted FaseEsperimento = "COMPLETED"
-	FaseFailed    FaseEsperimento = "FAILED"
-	FaseCleanup   FaseEsperimento = "CLEANUP"
-)
-
 type NodeCapacity string
 
 const (
@@ -126,7 +113,7 @@ type ExperimentStatus struct {
 	// Current execution phase
 	// +kubebuilder:default=IDLE
 	// +optional
-	Phase FaseEsperimento `json:"phase,omitempty"`
+	Phase string `json:"phase,omitempty"`
 
 	// Detailed message (e.g., reason for a FAILED state)
 	// +optional

@@ -89,10 +89,10 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 		log.Info("Inizio handleInitialState")
 		return r.handleInitialState(ctx, &exp)
 
-	case "PROVISIONING_INFRA":
-		log.Info("Inizio PROVISIONING_INFRA")
+	case "INFRASTRUCTURE_PROVISIONING":
+		log.Info("Inizio INFRASTRUCTURE_PROVISIONING")
 		return r.reconcileInfra(ctx, &exp)
-	
+
 	case "INSTALLING_DFAAS":
 		log.Info("Inizio INSTALLING_DFAAS")
 		return r.reconcileDFAAS(ctx, &exp)
@@ -128,7 +128,7 @@ func (r *EsperimentoReconciler) updateStatus(ctx context.Context,
 	}
 
 	// 2. Aggiorniamo la fase sulla versione appena scaricata
-	latestExp.Status.Phase = dfaasv1.FaseEsperimento(fase)
+	latestExp.Status.Phase = fase
 
 	if err := r.Status().Update(ctx, latestExp); err != nil {
 		return ctrl.Result{}, err
@@ -144,7 +144,7 @@ func (r *EsperimentoReconciler) handleInitialState(ctx context.Context,
 	log.Info("Controllo che non vi siano VM vecchie passo alla fase di PROVISIONING")
 	//se ci sono robe da pulire va i cleanUP e chiamo il metodo per pulire
 	//Controllo che posso offrire quello che mi è stato richiesto
-	return r.updateStatus(ctx, exp, "PROVISIONING_INFRA")
+	return r.updateStatus(ctx, exp, "INFRASTRUCTURE_PROVISIONING")
 }
 
 // SetupWithManager sets up the controller with the Manager.
