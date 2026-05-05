@@ -29,18 +29,6 @@ func (r *EsperimentoReconciler) handleDeletion(ctx context.Context,
 		// 1. Pulizia Prometheus
 		r.cleanupPrometheusTargets(ctx, exp)
 
-		// 2. CANCELLAZIONE ESPLICITA DEL JOB
-		// Questo risolve l'errore "already exists" se riapplichi velocemente
-		job := &batchv1.Job{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      exp.Name + "-k6-job",
-				Namespace: exp.Namespace,
-			},
-		}
-		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
-			log.Info("Job k6 non trovato o già cancellato")
-		}
-
 		// 3. Rimuoviamo il finalizer
 		controllerutil.RemoveFinalizer(exp, esperimentoFinalizer)
 		if err := r.Update(ctx, exp); err != nil {
@@ -108,7 +96,7 @@ func (r *EsperimentoReconciler) reconcileDFAAS(ctx context.Context,
 	}
 
 	if job.Status.Failed > 0 {
-		log.Info("❌ Ansible ha fallito! Controlla i log del Job per dettagli.(kubectl logs -f -l job-name=" + exp.Name + "-infra-job)")
+		log.Info("❌ Ansible has failed! Check Logs.(kubectl logs -f -l job-name=" + exp.Name + "-infra-job)")
 		r.setCondition(ctx, exp, "InfrastructureReady", metav1.ConditionFalse,
 			"ProvisioningFailed", "Il Job Ansible è fallito, controlla i log")
 
