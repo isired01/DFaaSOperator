@@ -19,11 +19,16 @@ package controller
 import (
 	"context"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	dfaasv1 "dfaas-operator/api/v1"
 )
@@ -46,6 +51,9 @@ type PrometheusTarget struct {
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=pods,verbs=get;list;watch
+
+//+kubebuilder:rbac:groups=k6.io,resources=testruns,verbs=get;list;watch
+//+kubebuilder:rbac:groups=k6.io,resources=testruns/status,verbs=get
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -101,6 +109,14 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 		log.Info("Inizio PROVISIONING_MONITORING")
 		return r.reconcileMonitoring(ctx, &exp)
 
+	case "READY":
+		log.Info("Esperimento READY — in attesa di un TestRun k6...")
+		return r.reconcileReady(ctx, &exp)
+
+	case "RUNNING":
+		log.Info("Test k6 in esecuzione — monitoraggio TestRun...")
+		return r.reconcileRunning(ctx, &exp)
+
 	case "COOLDOWN":
 		log.Info("Inizio COOLDOWN")
 		return r.reconcileCooldown(ctx, &exp)
@@ -147,9 +163,44 @@ func (r *EsperimentoReconciler) handleInitialState(ctx context.Context,
 	return r.updateStatus(ctx, exp, "INFRASTRUCTURE_PROVISIONING")
 }
 
+// TestRun GVR per il dynamic client
+var testRunGVR = schema.GroupVersionResource{
+	Group:    "k6.io",
+	Version:  "v1alpha1",
+	Resource: "testruns",
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *EsperimentoReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Creiamo un oggetto unstructured "template" per il watch sui TestRun k6
+	testRunObj := &unstructured.Unstructured{}
+	testRunObj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "k6.io",
+		Version: "v1alpha1",
+		Kind:    "TestRun",
+	})
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&dfaasv1.Esperimento{}).
+		Watches(
+			testRunObj,
+			handler.EnqueueRequestsFromMapFunc(
+				func(ctx context.Context, obj client.Object) []reconcile.Request {
+					// Recupera la label che collega il TestRun all'Esperimento
+					lbls := obj.GetLabels()
+					expName, ok := lbls["dfaas.io/experiment-name"]
+					if !ok || expName == "" {
+						return nil
+					}
+
+					return []reconcile.Request{{
+						NamespacedName: types.NamespacedName{
+							Name:      expName,
+							Namespace: obj.GetNamespace(),
+						},
+					}}
+				},
+			),
+		).
 		Complete(r)
 }

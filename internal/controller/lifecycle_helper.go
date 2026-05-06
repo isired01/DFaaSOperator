@@ -9,6 +9,8 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -130,6 +132,131 @@ func (r *EsperimentoReconciler) reconcileMonitoring(ctx context.Context,
 		"PodsRunning", "Monitoraggio UP")
 	// Transizione della FASE
 	return r.updateStatus(ctx, exp, "READY")
+}
+
+// reconcileReady gestisce la fase READY: cerca un TestRun k6 collegato e, se il test
+// è in esecuzione (stage=started), transiziona l'esperimento a RUNNING.
+func (r *EsperimentoReconciler) reconcileReady(ctx context.Context,
+	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	// Cerca TestRun con la label dfaas.io/experiment-name=<exp.Name>
+	testRun, found, err := r.findTestRunForExperiment(ctx, exp)
+	if err != nil {
+		log.Error(err, "Errore nella ricerca del TestRun")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	if !found {
+		// Nessun TestRun trovato: il test non è stato ancora lanciato dalla UI.
+		// Resta in READY e riprova tra 5 secondi.
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Leggi il campo status.stage dal TestRun
+	stage := getStageFromTestRun(testRun)
+	log.Info("TestRun trovato", "name", testRun.GetName(), "stage", stage)
+
+	switch stage {
+	case "started":
+		// Il test è in esecuzione → passiamo a RUNNING
+		log.Info("🏃 TestRun in esecuzione! Transizione a RUNNING.")
+		r.setCondition(ctx, exp, "K6TestRunning", metav1.ConditionTrue,
+			"TestStarted", "Il TestRun k6 è in esecuzione")
+		return r.updateStatus(ctx, exp, "RUNNING")
+
+	case "error":
+		// Il test è fallito
+		log.Info("❌ TestRun fallito! Transizione a FAILED.")
+		r.setCondition(ctx, exp, "K6TestRunning", metav1.ConditionFalse,
+			"TestFailed", "Il TestRun k6 ha riscontrato un errore")
+		return r.updateStatus(ctx, exp, "FAILED")
+
+	default:
+		// Il TestRun esiste ma non è ancora in stage "started"
+		// (potrebbe essere in initialization, initialized, created...)
+		log.Info("⏳ TestRun in preparazione...", "stage", stage)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+}
+
+// reconcileRunning gestisce la fase RUNNING: monitora il TestRun k6 e, quando
+// il test termina (stage=finished/stopped), transiziona l'esperimento a COOLDOWN.
+func (r *EsperimentoReconciler) reconcileRunning(ctx context.Context,
+	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	testRun, found, err := r.findTestRunForExperiment(ctx, exp)
+	if err != nil {
+		log.Error(err, "Errore nella ricerca del TestRun")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	if !found {
+		// Il TestRun è scomparso inaspettatamente → FAILED
+		log.Info("⚠️ TestRun non trovato durante RUNNING. Transizione a FAILED.")
+		r.setCondition(ctx, exp, "K6TestRunning", metav1.ConditionFalse,
+			"TestRunDisappeared", "Il TestRun k6 è stato eliminato inaspettatamente")
+		return r.updateStatus(ctx, exp, "FAILED")
+	}
+
+	stage := getStageFromTestRun(testRun)
+	log.Info("Monitoraggio TestRun", "name", testRun.GetName(), "stage", stage)
+
+	switch stage {
+	case "finished", "stopped":
+		// Il test è terminato → passiamo a COOLDOWN
+		log.Info("✅ TestRun terminato! Transizione a COOLDOWN.")
+		r.setCondition(ctx, exp, "K6TestRunning", metav1.ConditionFalse,
+			"TestFinished", "Il TestRun k6 è terminato con successo")
+		return r.updateStatus(ctx, exp, "COOLDOWN")
+
+	case "error":
+		log.Info("❌ TestRun fallito durante l'esecuzione! Transizione a FAILED.")
+		r.setCondition(ctx, exp, "K6TestRunning", metav1.ConditionFalse,
+			"TestFailed", "Il TestRun k6 ha riscontrato un errore durante l'esecuzione")
+		return r.updateStatus(ctx, exp, "FAILED")
+
+	default:
+		// Il test sta ancora girando (started, created, etc.)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+}
+
+// findTestRunForExperiment cerca un TestRun k6 nel namespace dell'esperimento
+// che abbia la label dfaas.io/experiment-name corrispondente.
+func (r *EsperimentoReconciler) findTestRunForExperiment(ctx context.Context,
+	exp *dfaasv1.Esperimento) (*unstructured.Unstructured, bool, error) {
+
+	testRunList := &unstructured.UnstructuredList{}
+	testRunList.SetGroupVersionKind(testRunGVR.GroupVersion().WithKind("TestRunList"))
+
+	selector, _ := labels.Parse("dfaas.io/experiment-name=" + exp.Name)
+	opts := &client.ListOptions{
+		LabelSelector: selector,
+		Namespace:     exp.Namespace,
+	}
+
+	if err := r.List(ctx, testRunList, opts); err != nil {
+		return nil, false, err
+	}
+
+	if len(testRunList.Items) == 0 {
+		return nil, false, nil
+	}
+
+	// Prendi il più recente (ultimo nella lista, che è il più recente per creazione)
+	latest := &testRunList.Items[len(testRunList.Items)-1]
+	return latest, true, nil
+}
+
+// getStageFromTestRun estrae il campo status.stage da un TestRun unstructured.
+func getStageFromTestRun(tr *unstructured.Unstructured) string {
+	stage, found, err := unstructured.NestedString(tr.Object, "status", "stage")
+	if err != nil || !found {
+		return ""
+	}
+	return stage
 }
 
 func (r *EsperimentoReconciler) reconcileCooldown(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
