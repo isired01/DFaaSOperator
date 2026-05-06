@@ -114,16 +114,24 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 		return r.reconcileReady(ctx, &exp)
 
 	case "RUNNING":
-		log.Info("Test k6 in esecuzione — monitoraggio TestRun...")
+		log.Info("Test k6 in esecuzione")
 		return r.reconcileRunning(ctx, &exp)
 
 	case "COOLDOWN":
 		log.Info("Inizio COOLDOWN")
 		return r.reconcileCooldown(ctx, &exp)
 
+	case "EXPORT_METRICHE":
+		log.Info("Inizio EXPORT_METRICHE")
+		return r.reconcileExportMetriche(ctx, &exp)
+
 	case "CLEANUP":
 		log.Info("Inizio CLEANUP")
 		return r.reconcileCleanup(ctx, &exp)
+
+	case "FAILED":
+		log.Info("Esperimento Fallito")
+		return ctrl.Result{}, nil
 
 	case "COMPLETED":
 		log.Info("Esperimento Completo")

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -207,7 +208,7 @@ func (r *EsperimentoReconciler) reconcileRunning(ctx context.Context,
 	case "finished", "stopped":
 		// Il test è terminato → passiamo a COOLDOWN
 		log.Info("✅ TestRun terminato! Transizione a COOLDOWN.")
-		r.setCondition(ctx, exp, "K6TestRunning", metav1.ConditionFalse,
+		r.setCondition(ctx, exp, "K6TestRunning", metav1.ConditionTrue,
 			"TestFinished", "Il TestRun k6 è terminato con successo")
 		return r.updateStatus(ctx, exp, "COOLDOWN")
 
@@ -266,6 +267,96 @@ func (r *EsperimentoReconciler) reconcileCooldown(ctx context.Context, exp *dfaa
 	// 3. Se sono passati i 30 secondi, cambiamo fase
 	log.Info("✅ Cooldown di 30s terminato. Passo a EXPORT_METRICHE.")
 	return r.updateStatus(ctx, exp, "EXPORT_METRICHE")
+}
+
+func (r *EsperimentoReconciler) reconcileExportMetriche(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	// 1. Controlliamo se il Job esiste già
+	var job batchv1.Job
+	jobKey := client.ObjectKey{Name: exp.Name + "-exporter-job", Namespace: exp.Namespace}
+	err := r.Get(ctx, jobKey, &job)
+
+	if apierrors.IsNotFound(err) {
+		log.Info("🚀 Creazione Job Exporter Metriche...")
+
+		// Recuperiamo eventuali tempi dal K6 TestRun se possibile,
+		// per ora usiamo il tempo di creazione dell'esperimento e il momento attuale
+		startTime := exp.CreationTimestamp.Time.UTC().Format(time.RFC3339)
+		endTime := time.Now().UTC().Format(time.RFC3339)
+
+		// Metriche di default
+		queries := "node_cpu_seconds_total|node_memory_MemTotal_bytes"
+
+		// Proviamo a leggere le metriche personalizzate dal TestRun K6 (tramite annotation)
+		testRun, found, _ := r.findTestRunForExperiment(ctx, exp)
+		if found {
+			annots := testRun.GetAnnotations()
+			if val, ok := annots["dfaas.io/metrics-queries"]; ok && val != "" {
+				queries = val
+			}
+		}
+
+		newJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      exp.Name + "-exporter-job",
+				Namespace: exp.Namespace,
+			},
+			Spec: batchv1.JobSpec{
+				BackoffLimit: int32Ptr(2),
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name:  "exporter",
+								Image: "ghcr.io/isired01/dfaas-exporter:latest",
+								Env: []corev1.EnvVar{
+									{Name: "PROM_URL", Value: "http://prometheus-operated.monitoring.svc.cluster.local:9090"},
+									{Name: "QUERIES", Value: queries},
+									{Name: "START_TIME", Value: startTime},
+									{Name: "END_TIME", Value: endTime},
+									{Name: "STEP", Value: "10s"},
+									{Name: "EXP_NAME", Value: exp.Name},
+									{Name: "MINIO_ENDPOINT", Value: "minio-service.monitoring.svc.cluster.local:9000"},
+									{Name: "MINIO_ACCESS_KEY", Value: "minioadmin"}, // Idealmente da Secret
+									{Name: "MINIO_SECRET_KEY", Value: "minioadmin"}, // Idealmente da Secret
+								},
+							},
+						},
+						RestartPolicy: corev1.RestartPolicyOnFailure,
+					},
+				},
+			},
+		}
+
+		_ = ctrl.SetControllerReference(exp, newJob, r.Scheme)
+
+		if err := r.Create(ctx, newJob); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	} else if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 2. Controllo stato Job
+	if job.Status.Succeeded > 0 {
+		log.Info("✅ Export Metriche completato con successo!")
+		if exp.Spec.IsCleanupRequested {
+			return r.updateStatus(ctx, exp, "CLEANUP")
+		}
+		return r.updateStatus(ctx, exp, "COMPLETED")
+	}
+
+	if job.Status.Failed > 0 {
+		log.Info("❌ Export Metriche fallito!")
+		return r.updateStatus(ctx, exp, "FAILED")
+	}
+
+	// 3. Job ancora in corso
+	log.Info("⏳ Exporter in esecuzione...")
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
 func (r *EsperimentoReconciler) reconcileCleanup(ctx context.Context,
