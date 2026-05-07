@@ -40,3 +40,17 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - k6.io
+  resources:
+  - testruns
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - k6.io
+  resources:
+  - testruns/status
+  verbs:
+  - get

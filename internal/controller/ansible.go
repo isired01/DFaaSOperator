@@ -34,6 +34,10 @@ func (r *EsperimentoReconciler) createAnsibleJob(ctx context.Context, exp *dfaas
 		return nil, nil, fmt.Errorf("failed to ensure ansible config map: %w", err)
 	}
 
+	if len(exp.Spec.Federation.Nodes) == 0 {
+		return nil, nil, fmt.Errorf("no nodes specified in federation")
+	}
+
 	firstPeerID, _ := calcolaPeerID(exp.Spec.Federation.Nodes[0].PrivateKey)
 
 	var inventory string
