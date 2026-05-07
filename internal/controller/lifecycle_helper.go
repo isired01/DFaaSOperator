@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 
 	"time"
 
@@ -131,6 +132,8 @@ func (r *EsperimentoReconciler) reconcileMonitoring(ctx context.Context,
 	// Se è pronto:
 	r.setCondition(ctx, exp, "MonitoringReady", metav1.ConditionTrue,
 		"PodsRunning", "Monitoraggio UP")
+
+	r.reconcilePrometheusTargets(ctx, exp)
 	// Transizione della FASE
 	return r.updateStatus(ctx, exp, "READY")
 }
@@ -176,7 +179,7 @@ func (r *EsperimentoReconciler) reconcileReady(ctx context.Context,
 	default:
 		// Il TestRun esiste ma non è ancora in stage "started"
 		// (potrebbe essere in initialization, initialized, created...)
-		log.Info("⏳ TestRun in preparazione...", "stage", stage)
+		log.Info("⏳ TestRun in attesa di una configurazione...", "stage", stage)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 }
@@ -260,11 +263,45 @@ func getStageFromTestRun(tr *unstructured.Unstructured) string {
 	return stage
 }
 
+// getK6PodTerminationTime cerca i pod associati al TestRun e restituisce l'orario di terminazione.
+func (r *EsperimentoReconciler) getK6PodTerminationTime(ctx context.Context, namespace, testRunName string) (time.Time, bool) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(namespace)); err == nil {
+		for _, pod := range podList.Items {
+			// K6-operator crea pod "initializer" e "starter" che terminano subito.
+			// Vogliamo prendere l'orario di un pod "runner" vero e proprio.
+			if strings.HasPrefix(pod.Name, testRunName) &&
+				!strings.Contains(pod.Name, "-initializer-") &&
+				!strings.Contains(pod.Name, "-starter-") {
+				
+				for _, cs := range pod.Status.ContainerStatuses {
+					if cs.State.Terminated != nil {
+						return cs.State.Terminated.FinishedAt.Time, true
+					}
+				}
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
 func (r *EsperimentoReconciler) reconcileCooldown(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
-	//TO DO: riprestinare coolDown reale magari manco la facciamo qua
-	// 3. Se sono passati i 30 secondi, cambiamo fase
+	testRun, found, _ := r.findTestRunForExperiment(ctx, exp)
+	termTime := time.Now()
+	if found {
+		if t, ok := r.getK6PodTerminationTime(ctx, exp.Namespace, testRun.GetName()); ok {
+			termTime = t
+		}
+	}
+
+	// Controlla se sono passati almeno 30 secondi
+	if time.Since(termTime) < 30*time.Second {
+		log.Info("⏳ Cooldown in corso, attesa di 30 secondi dalla fine del test K6...")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
 	log.Info("✅ Cooldown di 30s terminato. Passo a EXPORT_METRICHE.")
 	return r.updateStatus(ctx, exp, "EXPORT_METRICHE")
 }
@@ -280,16 +317,24 @@ func (r *EsperimentoReconciler) reconcileExportMetriche(ctx context.Context, exp
 	if apierrors.IsNotFound(err) {
 		log.Info("🚀 Creazione Job Exporter Metriche...")
 
-		// Recuperiamo eventuali tempi dal K6 TestRun se possibile,
-		// per ora usiamo il tempo di creazione dell'esperimento e il momento attuale
-		startTime := exp.CreationTimestamp.Time.UTC().Format(time.RFC3339)
-		endTime := time.Now().UTC().Format(time.RFC3339)
+		// Recuperiamo il tempo di terminazione del pod K6
+		termTime := time.Now()
+		testRun, found, _ := r.findTestRunForExperiment(ctx, exp)
+		if found {
+			if t, ok := r.getK6PodTerminationTime(ctx, exp.Namespace, testRun.GetName()); ok {
+				termTime = t
+			}
+		}
+
+		// startTime = k6 pod terminato - 1 minuto
+		startTime := termTime.Add(-1 * time.Minute).UTC().Format(time.RFC3339)
+		// endTime = adesso - 30 secondi
+		endTime := time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339)
 
 		// Metriche di default
 		queries := "node_cpu_seconds_total|node_memory_MemTotal_bytes"
 
-		// Proviamo a leggere le metriche personalizzate dal TestRun K6 (tramite annotation)
-		testRun, found, _ := r.findTestRunForExperiment(ctx, exp)
+		// Proviamo a leggere le metriche personalizzate dal TestRun K6
 		if found {
 			annots := testRun.GetAnnotations()
 			if val, ok := annots["dfaas.io/metrics-queries"]; ok && val != "" {
@@ -311,15 +356,15 @@ func (r *EsperimentoReconciler) reconcileExportMetriche(ctx context.Context, exp
 								Name:  "exporter",
 								Image: "ghcr.io/isired01/dfaas-exporter:latest",
 								Env: []corev1.EnvVar{
-									{Name: "PROM_URL", Value: "http://prometheus-operated.monitoring.svc.cluster.local:9090"},
+									{Name: "PROM_URL", Value: "http://prometheus-service.monitoring.svc.cluster.local:9090"},
 									{Name: "QUERIES", Value: queries},
 									{Name: "START_TIME", Value: startTime},
 									{Name: "END_TIME", Value: endTime},
-									{Name: "STEP", Value: "10s"},
+									{Name: "STEP", Value: "5s"},
 									{Name: "EXP_NAME", Value: exp.Name},
 									{Name: "MINIO_ENDPOINT", Value: "minio-service.monitoring.svc.cluster.local:9000"},
-									{Name: "MINIO_ACCESS_KEY", Value: "minioadmin"}, // Idealmente da Secret
-									{Name: "MINIO_SECRET_KEY", Value: "minioadmin"}, // Idealmente da Secret
+									{Name: "MINIO_ACCESS_KEY", Value: "admin"},       // Idealmente da Secret
+									{Name: "MINIO_SECRET_KEY", Value: "password123"}, // Idealmente da Secret
 								},
 							},
 						},
