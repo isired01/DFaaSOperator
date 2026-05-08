@@ -1,114 +1,98 @@
-# dfaas-operator
-// TODO(user): Add simple overview of use/purpose
+# dFaaS Experiment Controller
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+Benvenuto nel repository del **dFaaS Experiment Controller**, il cuore orchestrativo del sistema **dFaaS** (distributed Function-as-a-Service). Questo progetto implementa un operatore Kubernetes  per la gestione automatizzata del ciclo di vita di esperimenti FaaS in ambienti Edge/Cloud federati.
 
-## Getting Started
+## 🚀 Panoramica del Progetto
 
-### Prerequisites
-- go version v1.21.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+Il sistema è progettato per semplificare la ricerca e il testing di architetture dFaaS, permettendo di passare dalla definizione astratta di una federazione all'esecuzione di test di carico e raccolta metriche in pochi click.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+### Componenti Principali
+*   **dFaaS Operator (Core)**: Un operatore Kubernetes sviluppato in Go che gestisce la Custom Resource `Esperimento`. Coordina il provisioning, l'installazione, l'esecuzione dei test e la pulizia finale.
+*   **Data Exporter**: Un componente specializzato che estrae metriche granulari da Prometheus alla fine di ogni esperimento e le archivia in formato CSV su **MinIO**.
+*   **Ansible**: Utilizzato dall'operatore per configurare dinamicamente le VM esterne e i nodi della federazione.
 
-```sh
-make docker-build docker-push IMG=<some-registry>/dfaas-operator:tag
-```
+*   **dFaaS UI & API Gateway**: Un'interfaccia web moderna (**React + Vite**) e un gateway (**Go + Gin**) che permettono di monitorare e comandare il cluster in tempo reale senza interagire direttamente con i manifest YAML.
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+---
 
-**Install the CRDs into the cluster:**
+## 🏗️ Architettura e Stato dell'Esperimento
 
-```sh
+L'operatore implementa un'automa a stati finiti (FSM) per garantire determinismo e resilienza durante l'esecuzione:
+
+| Fase | Descrizione |
+| :--- | :--- |
+| `INFRASTRUCTURE_PROVISIONING` | Provisioning delle VM tramite Ansible. |
+| `INSTALLING_DFAAS` | Installazione degli agent dFaaS e configurazione del routing. |
+| `PROVISIONING_MONITORING` | Deployment dello stack di monitoraggio (Prometheus/Grafana/MinIO). |
+| `READY` | Sistema pronto, in attesa del comando di avvio test dalla UI. |
+| `RUNNING` | Esecuzione del test di carico tramite **k6-operator**. |
+| `COOLDOWN` | Periodo di stabilizzazione post-test (30s) per catturare metriche residue. |
+| `EXPORT_METRICHE` | Estrazione dati da Prometheus e upload su Object Storage (MinIO). |
+| `CLEANUP` | Rimozione automatica delle risorse temporanee se richiesto. |
+| `COMPLETED` | Esperimento terminato con successo. |
+
+---
+
+## 🛠️ Requisiti di Sistema
+
+*   **Kubernetes Cluster**: v1.25+
+*   **k6-operator**: Installato nel cluster per gestire i test di carico.
+*   **Go**: v1.22+ (per sviluppo)
+*   **Docker**: Per il build delle immagini.
+
+---
+
+## 🏁 Getting Started
+
+### 1. Installazione dell'Operatore
+Per compilare e installare l'operatore nel cluster corrente:
+
+```bash
+# Genera i manifesti delle CRD
+make manifests
+
+# Installa le CRD nel cluster
 make install
+
+# deply locale
+make run
+
+# Build e push dell'immagine (sostituisci la tua registry)
+make docker-build docker-push IMG=ghcr.io/tuo-user/dfaas-operator:latest
+
+# Deploy del controller
+make deploy IMG=ghcr.io/tuo-user/dfaas-operator:latest
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+### 2. Accesso alla UI
+La UI si trova a [qui](https://github.com/isired01/DFaaS_UI). Per avviarla localmente in modalità sviluppo:
 
-```sh
-make deploy IMG=<some-registry>/dfaas-operator:tag
+```bash
+# Avvio del Backend (API Gateway)
+cd UI
+go run ./cmd/server/main.go
+
+# Avvio del Frontend
+cd UI/ui
+npm install
+npm run dev
 ```
+La dashboard sarà accessibile su `http://localhost:5173`.
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+---
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+## 📊 Monitoraggio ed Export
+L'intero sistema è strumentato per Prometheus. Alla fine dell'esperimento, l'operatore lancia automaticamente un `DataExporter` che:
+1.  Recupera le query PromQL specificate nell'UI.
+2.  Genera un file CSV con timestamp e `nodo_id`.
+3.  Carica il report nel bucket `dfaas-results` su MinIO.
 
-```sh
-kubectl apply -k config/samples/
-```
+---
 
->**NOTE**: Ensure that the samples has default values to test it out.
+## 🤝 Contribuire
+Il progetto è parte di un lavoro di tesi focalizzato sulla federazione Edge/Cloud. Feedback e pull request sono benvenuti!
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+---
 
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following are the steps to build the installer and distribute this project to users.
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/dfaas-operator:tag
-```
-
-NOTE: The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without
-its dependencies.
-
-2. Using the installer
-
-Users can just run kubectl apply -f <URL for YAML BUNDLE> to install the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/dfaas-operator/<tag or branch>/dist/install.yaml
-```
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+> [!IMPORTANT]
+> Assicurati che i nodi target siano raggiungibili via SSH e che le chiavi siano correttamente configurate nelle Secret di Kubernetes.
