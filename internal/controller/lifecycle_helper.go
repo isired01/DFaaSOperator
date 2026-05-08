@@ -273,7 +273,7 @@ func (r *EsperimentoReconciler) getK6PodTerminationTime(ctx context.Context, nam
 			if strings.HasPrefix(pod.Name, testRunName) &&
 				!strings.Contains(pod.Name, "-initializer-") &&
 				!strings.Contains(pod.Name, "-starter-") {
-				
+
 				for _, cs := range pod.Status.ContainerStatuses {
 					if cs.State.Terminated != nil {
 						return cs.State.Terminated.FinishedAt.Time, true
