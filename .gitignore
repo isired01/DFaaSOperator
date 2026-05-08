@@ -51,3 +51,11 @@ testbin/
 # --- Log e temporanei ---
 *.log
 /dist/
+
+# --- Junk & Secrets ---
+id_rsa
+id_rsa.pub
+*.pem
+*.key
+primoEsperimento.yaml
+.DS_Store
