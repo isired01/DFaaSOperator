@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -141,23 +142,24 @@ func (r *EsperimentoReconciler) Reconcile(ctx context.Context,
 	return ctrl.Result{}, nil
 }
 
-// Funzione per aggiornare la fase dell'esperimento
+// Funzione per aggiornare la fase dell'esperimento.
+// Usa retry.RetryOnConflict per assorbire la cache-lag dell'informer:
+// dopo un Status().Update precedente l'informer può ancora servire una RV
+// stale → il primo tentativo riceve 409 e il backoff esponenziale ritenta.
 func (r *EsperimentoReconciler) updateStatus(ctx context.Context,
 	exp *dfaasv1.Esperimento, fase string) (ctrl.Result, error) {
-	// 1. Rileggiamo l'oggetto fresco dal cluster per evitare conflitti di versione
 
-	latestExp := &dfaasv1.Esperimento{}
-	if err := r.Get(ctx, client.ObjectKeyFromObject(exp), latestExp); err != nil {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &dfaasv1.Esperimento{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(exp), latest); err != nil {
+			return err
+		}
+		latest.Status.Phase = fase
+		return r.Status().Update(ctx, latest)
+	})
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-
-	// 2. Aggiorniamo la fase sulla versione appena scaricata
-	latestExp.Status.Phase = fase
-
-	if err := r.Status().Update(ctx, latestExp); err != nil {
-		return ctrl.Result{}, err
-	}
-
 	return ctrl.Result{Requeue: true}, nil
 }
 

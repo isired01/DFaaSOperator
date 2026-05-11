@@ -2,25 +2,20 @@ package controller
 
 import (
 	"context"
-	"strings"
-
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
-
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
-
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"dfaas-operator/internal/controller/ansible"
 )
 
 func (r *EsperimentoReconciler) handleDeletion(ctx context.Context,
@@ -61,20 +56,21 @@ func (r *EsperimentoReconciler) reconcileDFAAS(ctx context.Context,
 	if apierrors.IsNotFound(err) {
 		log.Info("🚀 Fase 1: Creazione Job Ansible per Provisioning...")
 
-		if err := r.ensureAnsibleConfigMap(ctx, exp); err != nil {
+		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
+		if err := am.EnsureConfigMap(ctx, exp); err != nil {
 			return ctrl.Result{}, err
 		}
 
 		// Creazione Job e Secret
-		newJob, secret, err := r.createAnsibleJob(ctx, exp)
+		newJob, secret, err := am.CreateJob(ctx, exp)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 
-		if err := r.Create(ctx, secret); err != nil {
+		if err := r.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{}, err
 		}
-		if err := r.Create(ctx, newJob); err != nil {
+		if err := r.Create(ctx, newJob); err != nil && !apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{}, err
 		}
 
@@ -227,64 +223,6 @@ func (r *EsperimentoReconciler) reconcileRunning(ctx context.Context,
 	}
 }
 
-// findTestRunForExperiment cerca un TestRun k6 nel namespace dell'esperimento
-// che abbia la label dfaas.io/experiment-name corrispondente.
-func (r *EsperimentoReconciler) findTestRunForExperiment(ctx context.Context,
-	exp *dfaasv1.Esperimento) (*unstructured.Unstructured, bool, error) {
-
-	testRunList := &unstructured.UnstructuredList{}
-	testRunList.SetGroupVersionKind(testRunGVR.GroupVersion().WithKind("TestRunList"))
-
-	selector, _ := labels.Parse("dfaas.io/experiment-name=" + exp.Name)
-	opts := &client.ListOptions{
-		LabelSelector: selector,
-		Namespace:     exp.Namespace,
-	}
-
-	if err := r.List(ctx, testRunList, opts); err != nil {
-		return nil, false, err
-	}
-
-	if len(testRunList.Items) == 0 {
-		return nil, false, nil
-	}
-
-	// Prendi il più recente (ultimo nella lista, che è il più recente per creazione)
-	latest := &testRunList.Items[len(testRunList.Items)-1]
-	return latest, true, nil
-}
-
-// getStageFromTestRun estrae il campo status.stage da un TestRun unstructured.
-func getStageFromTestRun(tr *unstructured.Unstructured) string {
-	stage, found, err := unstructured.NestedString(tr.Object, "status", "stage")
-	if err != nil || !found {
-		return ""
-	}
-	return stage
-}
-
-// getK6PodTerminationTime cerca i pod associati al TestRun e restituisce l'orario di terminazione.
-func (r *EsperimentoReconciler) getK6PodTerminationTime(ctx context.Context, namespace, testRunName string) (time.Time, bool) {
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(namespace)); err == nil {
-		for _, pod := range podList.Items {
-			// K6-operator crea pod "initializer" e "starter" che terminano subito.
-			// Vogliamo prendere l'orario di un pod "runner" vero e proprio.
-			if strings.HasPrefix(pod.Name, testRunName) &&
-				!strings.Contains(pod.Name, "-initializer-") &&
-				!strings.Contains(pod.Name, "-starter-") {
-
-				for _, cs := range pod.Status.ContainerStatuses {
-					if cs.State.Terminated != nil {
-						return cs.State.Terminated.FinishedAt.Time, true
-					}
-				}
-			}
-		}
-	}
-	return time.Time{}, false
-}
-
 func (r *EsperimentoReconciler) reconcileCooldown(ctx context.Context, exp *dfaasv1.Esperimento) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
@@ -317,66 +255,21 @@ func (r *EsperimentoReconciler) reconcileExportMetriche(ctx context.Context, exp
 	if apierrors.IsNotFound(err) {
 		log.Info("🚀 Creazione Job Exporter Metriche...")
 
-		// Recuperiamo il tempo di terminazione del pod K6
+		// termTime + queries determinazione dal TestRun (con default).
 		termTime := time.Now()
-		testRun, found, _ := r.findTestRunForExperiment(ctx, exp)
-		if found {
+		queries := "node_cpu_seconds_total|node_memory_MemTotal_bytes"
+
+		if testRun, found, _ := r.findTestRunForExperiment(ctx, exp); found {
 			if t, ok := r.getK6PodTerminationTime(ctx, exp.Namespace, testRun.GetName()); ok {
 				termTime = t
 			}
-		}
-
-		// startTime = k6 pod terminato - 1 minuto
-		startTime := termTime.Add(-1 * time.Minute).UTC().Format(time.RFC3339)
-		// endTime = adesso - 30 secondi
-		endTime := time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339)
-
-		// Metriche di default
-		queries := "node_cpu_seconds_total|node_memory_MemTotal_bytes"
-
-		// Proviamo a leggere le metriche personalizzate dal TestRun K6
-		if found {
-			annots := testRun.GetAnnotations()
-			if val, ok := annots["dfaas.io/metrics-queries"]; ok && val != "" {
+			if val, ok := testRun.GetAnnotations()["dfaas.io/metrics-queries"]; ok && val != "" {
 				queries = val
 			}
 		}
 
-		newJob := &batchv1.Job{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      exp.Name + "-exporter-job",
-				Namespace: exp.Namespace,
-			},
-			Spec: batchv1.JobSpec{
-				BackoffLimit: int32Ptr(2),
-				Template: corev1.PodTemplateSpec{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name:  "exporter",
-								Image: "ghcr.io/isired01/dfaas-exporter:latest",
-								Env: []corev1.EnvVar{
-									{Name: "PROM_URL", Value: "http://prometheus-service.monitoring.svc.cluster.local:9090"},
-									{Name: "QUERIES", Value: queries},
-									{Name: "START_TIME", Value: startTime},
-									{Name: "END_TIME", Value: endTime},
-									{Name: "STEP", Value: "5s"},
-									{Name: "EXP_NAME", Value: exp.Name},
-									{Name: "MINIO_ENDPOINT", Value: "minio-service.monitoring.svc.cluster.local:9000"},
-									{Name: "MINIO_ACCESS_KEY", Value: "admin"},       // Idealmente da Secret
-									{Name: "MINIO_SECRET_KEY", Value: "password123"}, // Idealmente da Secret
-								},
-							},
-						},
-						RestartPolicy: corev1.RestartPolicyOnFailure,
-					},
-				},
-			},
-		}
-
-		_ = ctrl.SetControllerReference(exp, newJob, r.Scheme)
-
-		if err := r.Create(ctx, newJob); err != nil {
+		newJob := r.createExporterJob(exp, queries, termTime)
+		if err := r.Create(ctx, newJob); err != nil && !apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{}, err
 		}
 
@@ -430,15 +323,25 @@ func (r *EsperimentoReconciler) reconcileCleanup(ctx context.Context,
 	return r.updateStatus(ctx, exp, "COMPLETED")
 }
 
+// setCondition rifetcha l'oggetto dentro un retry loop e applica la condition
+// sul latest, così il bump di ResourceVersion fatto da un eventuale
+// Status().Update precedente non causa un 409 Conflict.
 func (r *EsperimentoReconciler) setCondition(ctx context.Context,
 	exp *dfaasv1.Esperimento, condType string, status metav1.ConditionStatus,
 	reason, message string) error {
-	meta.SetStatusCondition(&exp.Status.Conditions, metav1.Condition{
-		Type:               condType,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		LastTransitionTime: metav1.Now(),
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &dfaasv1.Esperimento{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(exp), latest); err != nil {
+			return err
+		}
+		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+			Type:               condType,
+			Status:             status,
+			Reason:             reason,
+			Message:            message,
+			LastTransitionTime: metav1.Now(),
+		})
+		return r.Status().Update(ctx, latest)
 	})
-	return r.Status().Update(ctx, exp)
 }

@@ -1,4 +1,4 @@
-@startuml
+@startuml STATI
 skinparam backgroundColor #FFFFFF
 skinparam state {
   BackgroundColor #E1F5FE

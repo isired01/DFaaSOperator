@@ -1,7 +1,6 @@
 @startuml
 title CDR per dFaaSOperator -- Class Diagram
 
-' Stili
 skinparam class {
     BackgroundColor<<CRD>> #E1F5FE
     BorderColor #01579B
@@ -12,7 +11,7 @@ skinparam enum {
 }
 
 ' Classi Principali (Kubernetes Style)
-class Esperimento <<CRD>> {
+class "Esperimento <<CRD>>" as Esperimento {
     + metav1.ObjectMeta metadata
     + ExperimentSpec spec
     + ExperimentStatus status

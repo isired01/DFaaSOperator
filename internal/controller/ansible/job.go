@@ -1,36 +1,28 @@
-package controller
+package ansible
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	dfaasv1 "dfaas-operator/api/v1"
-
-	"github.com/libp2p/go-libp2p-core/crypto"
-	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-func (r *EsperimentoReconciler) createAnsibleJob(ctx context.Context, exp *dfaasv1.Esperimento) (*batchv1.Job, *corev1.Secret, error) {
+// CreateJob costruisce il Job Ansible per il provisioning dei nodi della
+// federazione e il Secret con l'inventory generato dalla Federation.
+func (m *Manager) CreateJob(ctx context.Context, exp *dfaasv1.Esperimento) (*batchv1.Job, *corev1.Secret, error) {
 
 	// 1. Assicuriamoci che le ConfigMap dei values esistano PRIMA di definire il Job
-	if err := r.ensureHelmValuesConfig(ctx, exp); err != nil {
+	if err := m.EnsureHelmValues(ctx, exp); err != nil {
 		return nil, nil, fmt.Errorf("failed to ensure helm values config: %w", err)
 	}
 
-	err := r.ensureAnsibleConfigMap(ctx, exp)
-	if err != nil {
+	if err := m.EnsureConfigMap(ctx, exp); err != nil {
 		return nil, nil, fmt.Errorf("failed to ensure ansible config map: %w", err)
 	}
 
@@ -138,103 +130,8 @@ func (r *EsperimentoReconciler) createAnsibleJob(ctx context.Context, exp *dfaas
 		},
 	}
 
-	_ = ctrl.SetControllerReference(exp, secret, r.Scheme)
-	_ = ctrl.SetControllerReference(exp, job, r.Scheme)
+	_ = ctrl.SetControllerReference(exp, secret, m.Scheme)
+	_ = ctrl.SetControllerReference(exp, job, m.Scheme)
 
 	return job, secret, nil
-}
-
-func (r *EsperimentoReconciler) ensureAnsibleConfigMap(ctx context.Context, exp *dfaasv1.Esperimento) error {
-	cmName := "ansible-playbooks-" + exp.Name
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cmName,
-			Namespace: exp.Namespace,
-		},
-		Data: map[string]string{
-			"setup-Nodes.yml": AnsiblePlaybookYaml,
-		},
-	}
-
-	if err := ctrl.SetControllerReference(exp, cm, r.Scheme); err != nil {
-		return err
-	}
-
-	found := &corev1.ConfigMap{}
-	err := r.Get(ctx, types.NamespacedName{Name: cmName, Namespace: exp.Namespace}, found)
-	if err != nil && apierrors.IsNotFound(err) {
-		return r.Create(ctx, cm)
-	} else if err == nil {
-		found.Data = cm.Data
-		return r.Update(ctx, found)
-	}
-	return err
-}
-
-func (r *EsperimentoReconciler) ensureHelmValuesConfig(ctx context.Context, exp *dfaasv1.Esperimento) error {
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "helm-values-config-" + exp.Name,
-			Namespace: exp.Namespace,
-		},
-		Data: map[string]string{
-			"haproxy.yaml":    HaproxyValues,
-			"openfaas.yaml":   OpenfaasValues,
-			"prometheus.yaml": PrometheusValues,
-		},
-	}
-
-	if err := ctrl.SetControllerReference(exp, cm, r.Scheme); err != nil {
-		return err
-	}
-
-	found := &corev1.ConfigMap{}
-	err := r.Get(ctx, types.NamespacedName{Name: cm.Name, Namespace: exp.Namespace}, found)
-	if err != nil && apierrors.IsNotFound(err) {
-		return r.Create(ctx, cm)
-	} else if err == nil {
-		found.Data = cm.Data
-		return r.Update(ctx, found)
-	}
-	return err
-}
-
-func calcolaPeerID(privKeyBase64 string) (string, error) {
-	// 1. Decodifica la stringa Base64
-	derBytes, err := base64.StdEncoding.DecodeString(privKeyBase64)
-	if err != nil {
-		return "", fmt.Errorf("errore decodifica base64: %v", err)
-	}
-
-	// 2. Parsing della chiave PKCS#8 (formato standard per le chiavi private Ed25519)
-	rawKey, err := x509.ParsePKCS8PrivateKey(derBytes)
-	if err != nil {
-		return "", fmt.Errorf("errore parsing PKCS8: %v", err)
-	}
-
-	// 3. Cast alla chiave Ed25519 standard di Go
-	edPriv, ok := rawKey.(ed25519.PrivateKey)
-	if !ok {
-		return "", fmt.Errorf("la chiave non è di tipo Ed25519")
-	}
-
-	// 4. Conversione nel formato crypto.PrivKey richiesto da libp2p
-	// Libp2p vuole i byte della chiave privata seguiti da quelli della pubblica (64 byte totali)
-	priv, err := crypto.UnmarshalEd25519PrivateKey(edPriv)
-	if err != nil {
-		return "", fmt.Errorf("errore unmarshal per libp2p: %v", err)
-	}
-
-	// 5. Generazione del PeerID
-	id, err := peer.IDFromPrivateKey(priv)
-	if err != nil {
-		return "", fmt.Errorf("errore generazione PeerID: %v", err)
-	}
-
-	return id.String(), nil
-}
-
-// Funzione di utilità per creare un puntatore a int32
-func int32Ptr(i int32) *int32 {
-	return &i
 }
