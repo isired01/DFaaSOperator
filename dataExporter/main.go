@@ -4,32 +4,32 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/prometheus/client_golang/api"
-	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
-	"github.com/prometheus/common/model"
 	"log"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/prometheus/client_golang/api"
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/common/model"
+	"golang.org/x/oauth2/google"
+	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/option"
 )
 
 func main() {
-	// 1. Recupero parametri dalle Env Var (Configurate dall'Operatore)
+	// 1. Recupero parametri dalle Env Var (configurate dall'Operator)
 	promURL := os.Getenv("PROM_URL")
 	queries := strings.Split(os.Getenv("QUERIES"), "|")
 	startStr := os.Getenv("START_TIME")
 	endStr := os.Getenv("END_TIME")
 	stepStr := os.Getenv("STEP")
-
 	expName := os.Getenv("EXP_NAME")
 
-	// Credenziali MinIO (Assicurati che l'operatore le passi correttamente)
-	minioEndpoint := os.Getenv("MINIO_ENDPOINT") // Es: minio-service.monitoring:9000
-	minioAccessKey := os.Getenv("MINIO_ACCESS_KEY")
-	minioSecretKey := os.Getenv("MINIO_SECRET_KEY")
-	bucketName := "dfaas-results"
+	// Destinazione opzionale Google Drive (set dall'Operator se
+	// exp.Spec.GoogleDrive è valorizzato sulla CR). Se vuote: fallback stdout.
+	gdriveFolderID := os.Getenv("GDRIVE_FOLDER_ID")
+	gdriveCredPath := os.Getenv("GDRIVE_CREDENTIALS_PATH")
 
 	// 2. Parsing dei tempi e dello step
 	start, _ := time.Parse(time.RFC3339, startStr)
@@ -53,7 +53,7 @@ func main() {
 	}
 
 	writer := csv.NewWriter(file)
-	writer.Write([]string{"Timestamp", "ID_Nodo", "Query", "Valore", "Labels"})
+	_ = writer.Write([]string{"Timestamp", "ID_Nodo", "Query", "Valore", "Labels"})
 
 	// 5. Estrazione Dati da Prometheus
 	ctx := context.Background()
@@ -80,7 +80,7 @@ func main() {
 			allLabels := series.Metric.String()
 
 			for _, pair := range series.Values {
-				writer.Write([]string{
+				_ = writer.Write([]string{
 					pair.Timestamp.Time().Format(time.RFC3339),
 					nodeID,
 					q,
@@ -91,43 +91,70 @@ func main() {
 		}
 	}
 
-	// Fondamentale: chiudiamo il writer e il file prima di caricarlo su MinIO
+	// Fondamentale: chiudiamo il writer e il file prima di leggerlo / caricarlo.
 	writer.Flush()
-	file.Close()
+	if err := file.Close(); err != nil {
+		log.Fatalf("Errore chiusura file CSV: %v", err)
+	}
 	fmt.Printf("✅ Export locale completato: %s\n", fileName)
 
-	// 6. Upload su MinIO (Object Storage)
-	// -----------------------------------------------------------------
+	// 6. Destinazione: Google Drive se configurato, altrimenti stdout.
+	if gdriveFolderID == "" || gdriveCredPath == "" {
+		fmt.Println("📋 Google Drive non configurato. Dump CSV su stdout:")
+		dumpToStdout(fileName)
+		return
+	}
 
-	// Inizializzazione Client MinIO
-	minioClient, err := minio.New(minioEndpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(minioAccessKey, minioSecretKey, ""),
-		Secure: false, // Usiamo HTTP interno al cluster
-	})
+	if err := uploadToGoogleDrive(ctx, fileName, expName, gdriveFolderID, gdriveCredPath); err != nil {
+		log.Fatalf("❌ Upload Google Drive: %v", err)
+	}
+}
+
+// dumpToStdout legge il CSV e lo stampa su stdout, racchiuso tra marker per
+// facilitare il recovery via `kubectl logs job/<exp>-exporter-job`.
+func dumpToStdout(fileName string) {
+	data, err := os.ReadFile(fileName)
 	if err != nil {
-		log.Fatalf("❌ Errore setup client MinIO: %v", err)
+		log.Fatalf("read csv: %v", err)
 	}
+	fmt.Println("----- BEGIN CSV -----")
+	fmt.Print(string(data))
+	fmt.Println("----- END CSV -----")
+}
 
-	// Creazione bucket se non esiste (lo facciamo qui così non devi farlo a mano)
-	exists, err := minioClient.BucketExists(ctx, bucketName)
-	if err == nil && !exists {
-		err = minioClient.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{})
-		fmt.Printf("📦 Bucket '%s' creato con successo\n", bucketName)
-	}
-	if err != nil && !exists {
-		log.Fatalf("❌ Errore verifica/creazione bucket MinIO: %v", err)
-	}
-
-	// Carichiamo il file in una "cartella" virtuale col nome dell'esperimento
-	objectName := fmt.Sprintf("%s/%s_report.csv", expName, expName)
-
-	fmt.Printf("📤 Caricamento in corso su MinIO (%s)... ", objectName)
-	info, err := minioClient.FPutObject(ctx, bucketName, objectName, fileName, minio.PutObjectOptions{
-		ContentType: "text/csv",
-	})
+// uploadToGoogleDrive carica il CSV nella cartella Drive identificata da
+// folderID, autenticandosi con un service-account JSON letto da credPath.
+func uploadToGoogleDrive(ctx context.Context, fileName, expName, folderID, credPath string) error {
+	credJSON, err := os.ReadFile(credPath)
 	if err != nil {
-		log.Fatalf("❌ Errore upload: %v", err)
+		return fmt.Errorf("read credentials: %w", err)
 	}
 
-	fmt.Printf("🚀 Completato! (%d byte salvati)\n", info.Size)
+	cfg, err := google.JWTConfigFromJSON(credJSON, drive.DriveFileScope)
+	if err != nil {
+		return fmt.Errorf("parse credentials: %w", err)
+	}
+
+	driveSvc, err := drive.NewService(ctx, option.WithHTTPClient(cfg.Client(ctx)))
+	if err != nil {
+		return fmt.Errorf("init drive service: %w", err)
+	}
+
+	f, err := os.Open(fileName)
+	if err != nil {
+		return fmt.Errorf("open csv: %w", err)
+	}
+	defer f.Close()
+
+	meta := &drive.File{
+		Name:    fmt.Sprintf("%s_report.csv", expName),
+		Parents: []string{folderID},
+	}
+	fmt.Printf("📤 Upload Google Drive (folder=%s)...\n", folderID)
+	res, err := driveSvc.Files.Create(meta).Media(f).Do()
+	if err != nil {
+		return fmt.Errorf("upload: %w", err)
+	}
+	fmt.Printf("🚀 Caricato su Drive (id=%s, size=%d)\n", res.Id, res.Size)
+	return nil
 }

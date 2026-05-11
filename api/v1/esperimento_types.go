@@ -86,6 +86,20 @@ type Link struct {
 	LatencyMs int    `json:"latencyMs"`
 }
 
+// GoogleDriveConfig descrive la destinazione opzionale Google Drive per il
+// CSV esportato dal dataExporter. Se il campo googleDrive su ExperimentSpec
+// è nullo, l'exporter stampa il CSV su stdout (recuperabile via kubectl logs).
+type GoogleDriveConfig struct {
+	// FolderID della cartella di destinazione su Google Drive.
+	// +kubebuilder:validation:Required
+	FolderID string `json:"folderId"`
+
+	// CredentialsSecretRef riferisce un Secret nel namespace dell'esperimento
+	// contenente la chiave "credentials.json" con il service account JSON.
+	// +kubebuilder:validation:Required
+	CredentialsSecretRef string `json:"credentialsSecretRef"`
+}
+
 // --- CORE DELLA CRD ---
 
 type ExperimentSpec struct {
@@ -100,6 +114,11 @@ type ExperimentSpec struct {
 	// Network topology of the experiment
 	// +kubebuilder:validation:Required
 	Topology Topology `json:"topology"`
+
+	// Destinazione Google Drive opzionale per il CSV dell'exporter.
+	// Se nullo, l'exporter stampa il CSV su stdout.
+	// +optional
+	GoogleDrive *GoogleDriveConfig `json:"googleDrive,omitempty"`
 }
 
 // EsperimentoStatus definisce lo stato osservato dell'istanza (gestito dal Controller)

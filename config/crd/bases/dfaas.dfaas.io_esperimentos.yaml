@@ -112,6 +112,24 @@ spec:
                 required:
                 - nodes
                 type: object
+              googleDrive:
+                description: |-
+                  Destinazione Google Drive opzionale per il CSV dell'exporter.
+                  Se nullo, l'exporter stampa il CSV su stdout.
+                properties:
+                  credentialsSecretRef:
+                    description: |-
+                      CredentialsSecretRef riferisce un Secret nel namespace dell'esperimento
+                      contenente la chiave "credentials.json" con il service account JSON.
+                    type: string
+                  folderId:
+                    description: FolderID della cartella di destinazione su Google
+                      Drive.
+                    type: string
+                required:
+                - credentialsSecretRef
+                - folderId
+                type: object
               isCleanupRequested:
                 default: false
                 description: Flag to request resource cleanup after the test

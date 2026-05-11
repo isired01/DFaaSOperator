@@ -16,6 +16,7 @@ import (
 
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/controller/ansible"
+	"dfaas-operator/internal/controller/monitoring"
 )
 
 func (r *EsperimentoReconciler) handleDeletion(ctx context.Context,
@@ -26,7 +27,8 @@ func (r *EsperimentoReconciler) handleDeletion(ctx context.Context,
 		log.Info("🗑️ Finalizer rilevato, avvio procedure di pulizia...")
 
 		// 1. Pulizia Prometheus
-		r.cleanupPrometheusTargets(ctx, exp)
+		mm := &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
+		_ = mm.CleanupTargets(ctx, exp)
 
 		// 3. Rimuoviamo il finalizer
 		controllerutil.RemoveFinalizer(exp, esperimentoFinalizer)
@@ -112,10 +114,11 @@ func (r *EsperimentoReconciler) reconcileDFAAS(ctx context.Context,
 
 func (r *EsperimentoReconciler) reconcileMonitoring(ctx context.Context,
 	exp *dfaasv1.Esperimento) (ctrl.Result, error) {
-	if err := r.deployMonitoringStack(ctx); err != nil {
+	mm := &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
+	if err := mm.Deploy(ctx); err != nil {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
-	ready, _ := r.checkMonitoringStack(ctx)
+	ready, _ := mm.Check(ctx)
 
 	if !ready {
 		// 2. Aggiorna la CONDITION
@@ -129,7 +132,7 @@ func (r *EsperimentoReconciler) reconcileMonitoring(ctx context.Context,
 	r.setCondition(ctx, exp, "MonitoringReady", metav1.ConditionTrue,
 		"PodsRunning", "Monitoraggio UP")
 
-	r.reconcilePrometheusTargets(ctx, exp)
+	_ = mm.ReconcileTargets(ctx, exp)
 	// Transizione della FASE
 	return r.updateStatus(ctx, exp, "READY")
 }
@@ -307,7 +310,8 @@ func (r *EsperimentoReconciler) reconcileCleanup(ctx context.Context,
 		"CleanupStarted", "Rimozione target Prometheus e deallocazione risorse...")
 
 	// 2. Esecuzione pulizia Prometheus
-	if err := r.cleanupPrometheusTargets(ctx, exp); err != nil {
+	mm := &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
+	if err := mm.CleanupTargets(ctx, exp); err != nil {
 		log.Error(err, "⚠️ Errore durante il cleanup dei target")
 		r.setCondition(ctx, exp, "MonitoringCleanUP", metav1.ConditionFalse,
 			"CleanupFailed", err.Error())

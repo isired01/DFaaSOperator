@@ -40,18 +40,14 @@ type EsperimentoReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-type PrometheusTarget struct {
-	Targets []string          `json:"targets"`
-	Labels  map[string]string `json:"labels"`
-}
-
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=esperimentos,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=esperimentos/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=esperimentos/finalizers,verbs=update
 
-//+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=pods,verbs=get;list;watch
+//+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=configmaps;services;secrets;serviceaccounts;persistentvolumeclaims;namespaces,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+//+kubebuilder:rbac:groups=apps,resources=deployments;statefulsets;daemonsets;replicasets,verbs=get;list;watch;create;update;patch;delete
 
 //+kubebuilder:rbac:groups=k6.io,resources=testruns,verbs=get;list;watch
 //+kubebuilder:rbac:groups=k6.io,resources=testruns/status,verbs=get

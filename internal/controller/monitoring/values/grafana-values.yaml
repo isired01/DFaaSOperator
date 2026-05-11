@@ -1,0 +1,23 @@
+# Override values per il chart grafana/grafana.
+# PoC: niente PVC, credenziali admin/admin, datasource Prometheus
+# pre-configurato puntando alla release "prometheus" nel namespace monitoring.
+
+persistence:
+  enabled: false
+
+adminUser: admin
+adminPassword: admin
+
+service:
+  type: NodePort
+  nodePort: 30300
+
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        url: http://prometheus-server.monitoring.svc.cluster.local
+        access: proxy
+        isDefault: true
