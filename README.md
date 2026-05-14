@@ -1,98 +1,138 @@
 # dFaaS Experiment Controller
 
-Benvenuto nel repository del **dFaaS Experiment Controller**, il cuore orchestrativo del sistema **dFaaS** (distributed Function-as-a-Service). Questo progetto implementa un operatore Kubernetes  per la gestione automatizzata del ciclo di vita di esperimenti FaaS in ambienti Edge/Cloud federati.
+Kubebuilder-scaffolded Kubernetes operator (Go 1.25, controller-runtime v0.17.3) that orchestrates **dFaaS** (distributed FaaS) experiments end-to-end: from federation provisioning to k6 load tests and metrics export.
 
-## 🚀 Panoramica del Progetto
+The operator ships as a single Deployment that runs **two controllers** against two CRDs in `dfaas.dfaas.io/v1`:
 
-Il sistema è progettato per semplificare la ricerca e il testing di architetture dFaaS, permettendo di passare dalla definizione astratta di una federazione all'esecuzione di test di carico e raccolta metriche in pochi click.
+- **`Environment`** — federation infrastructure. Provisions VMs (dfaas-worker nodes + k6-load-generator nodes) and the operator-cluster monitoring stack. Long-lived: once `Ready`, it stays idle until the spec changes.
+- **`LoadTest`** — one k6 load test against an `Environment`. Looks up its `targetEnvironment`, waits until it is `Ready`, dispatches one remote k6 `TestRun` per k6-load-generator node, then runs a metrics exporter Job.
 
-### Componenti Principali
-*   **dFaaS Operator (Core)**: Un operatore Kubernetes sviluppato in Go che gestisce la Custom Resource `Esperimento`. Coordina il provisioning, l'installazione, l'esecuzione dei test e la pulizia finale.
-*   **Data Exporter**: Un componente specializzato che estrae metriche granulari da Prometheus alla fine di ogni esperimento e le archivia in formato CSV su **MinIO**.
-*   **Ansible**: Utilizzato dall'operatore per configurare dinamicamente le VM esterne e i nodi della federazione.
+For a detailed architectural deep-dive (FSM transitions, file map, conventions, gotchas) see [.claude/CLAUDE.md](.claude/CLAUDE.md).
 
-*   **dFaaS UI & API Gateway**: Un'interfaccia web moderna (**React + Vite**) e un gateway (**Go + Gin**) che permettono di monitorare e comandare il cluster in tempo reale senza interagire direttamente con i manifest YAML.
+## 🚀 What it does
 
----
+```text
++---------------------------+        +-----------------------------+
+|       Environment CR      |        |         LoadTest CR         |
+|---------------------------|        |-----------------------------|
+| nodes: dfaas-worker, k6   |        | targetEnvironment: env-xyz  |
+| topology (latency links)  |        | perNodeLoad[]               |
+| openfaas functions        |        | metricsExport.queries (PromQL)|
++-------------+-------------+        +--------------+--------------+
+              | reconcile                            | reconcile
+              v                                      v
+   +----------+----------+               +-----------+------------+
+   |  Ansible Jobs (VMs) | ----------->  | Remote k6 TestRun via  |
+   |  Helm (Prometheus,  |               | per-node k3s + k6-op   |
+   |  Grafana on mgmt)   |               +-----------+------------+
+   +----------+----------+                           |
+              |                                      v
+              v                              +-------+--------+
+       Environment.Ready                     | Exporter Job   |
+                                             | Prometheus →   |
+                                             | CSV (stdout/   |
+                                             |  Google Drive) |
+                                             +----------------+
+```
 
-## 🏗️ Architettura e Stato dell'Esperimento
+## 🏗️ State machines
 
-L'operatore implementa un'automa a stati finiti (FSM) per garantire determinismo e resilienza durante l'esecuzione:
+### `Environment`
+```
+"" / Idle / Failed → ProvisioningVMs → ProvisioningK6 → ProvisioningMonitoring → Ready
+```
+Re-provisioning only runs when `spec.generation` changes. A finalizer (`dfaas.dfaas.io/environment-finalizer`) cleans per-environment Prometheus scrape-target entries on delete.
 
-| Fase | Descrizione |
-| :--- | :--- |
-| `INFRASTRUCTURE_PROVISIONING` | Provisioning delle VM tramite Ansible. |
-| `INSTALLING_DFAAS` | Installazione degli agent dFaaS e configurazione del routing. |
-| `PROVISIONING_MONITORING` | Deployment dello stack di monitoraggio (Prometheus/Grafana/MinIO). |
-| `READY` | Sistema pronto, in attesa del comando di avvio test dalla UI. |
-| `RUNNING` | Esecuzione del test di carico tramite **k6-operator**. |
-| `COOLDOWN` | Periodo di stabilizzazione post-test (30s) per catturare metriche residue. |
-| `EXPORT_METRICHE` | Estrazione dati da Prometheus e upload su Object Storage (MinIO). |
-| `CLEANUP` | Rimozione automatica delle risorse temporanee se richiesto. |
-| `COMPLETED` | Esperimento terminato con successo. |
+### `LoadTest`
+```
+Pending → Running → Exporting → Completed
+                              ↘ Failed
+```
+The reconciler watches the target `Environment`: a Pending LoadTest auto-resumes when the env reaches `Ready`.
 
----
+## 🧩 Components
 
-## 🛠️ Requisiti di Sistema
+| Component | Path | Image |
+|---|---|---|
+| Operator (`Environment` + `LoadTest` controllers) | `cmd/` + `internal/controller/` | built from repo root `Dockerfile` |
+| Data exporter (Prometheus → CSV + optional Drive upload) | `dataExporter/` | `ghcr.io/isired01/dfaas-exporter:latest` (multi-arch, separate `Dockerfile`) |
+| Ansible playbooks (worker + k6 provisioning) | `internal/controller/ansible/templates/` | `alpine/ansible:2.18.6` (see note below) |
+| Monitoring stack (Prometheus + Grafana, Helm-managed) | `internal/controller/monitoring/charts/` | vendored `.tgz` chart bundles |
+| Front-end + API gateway (separate repo) | `https://github.com/isired01/DFaaS_UI` | — |
 
-*   **Kubernetes Cluster**: v1.25+
-*   **k6-operator**: Installato nel cluster per gestire i test di carico.
-*   **Go**: v1.22+ (per sviluppo)
-*   **Docker**: Per il build delle immagini.
+## 🛠️ Requirements
 
----
+- Kubernetes cluster ≥ v1.25 (tested on k3s + standard kubeadm)
+- Go ≥ 1.25 for local development
+- Docker + buildx (multi-arch exporter image)
+- A Helm-compatible cluster (no extra installation needed — the operator drives Helm via the embedded SDK)
+- Optional, for Drive export: a Google Cloud project with the Drive API enabled, a service account, and a **Google Workspace Shared Drive** (My Drive doesn't work — service accounts have no personal quota)
 
 ## 🏁 Getting Started
 
-### 1. Installazione dell'Operatore
-Per compilare e installare l'operatore nel cluster corrente:
-
 ```bash
-# Genera i manifesti delle CRD
-make manifests
+# Generate CRDs + RBAC from kubebuilder markers
+make manifests generate
 
-# Installa le CRD nel cluster
+# Install the CRDs into the current cluster
 make install
 
-# deply locale
+# Run the controller locally against your current kubecontext
 make run
 
-# Build e push dell'immagine (sostituisci la tua registry)
-make docker-build docker-push IMG=ghcr.io/tuo-user/dfaas-operator:latest
-
-# Deploy del controller
-make deploy IMG=ghcr.io/tuo-user/dfaas-operator:latest
+# Apply samples
+kubectl apply -f config/samples/dfaas_v1_environment.yaml
+# Wait until env-sample reaches `Ready`, then:
+kubectl apply -f config/samples/dfaas_v1_loadtest.yaml
 ```
 
-### 2. Accesso alla UI
-La UI si trova a [qui](https://github.com/isired01/DFaaS_UI). Per avviarla localmente in modalità sviluppo:
+To deploy the operator inside the cluster instead:
 
 ```bash
-# Avvio del Backend (API Gateway)
-cd UI
-go run ./cmd/server/main.go
-
-# Avvio del Frontend
-cd UI/ui
-npm install
-npm run dev
+make docker-buildx IMG=ghcr.io/<you>/dfaas-operator:latest   # multi-arch build + push
+make deploy        IMG=ghcr.io/<you>/dfaas-operator:latest
 ```
-La dashboard sarà accessibile su `http://localhost:5173`.
 
----
+To rebuild the exporter image (separate from the operator):
 
-## 📊 Monitoraggio ed Export
-L'intero sistema è strumentato per Prometheus. Alla fine dell'esperimento, l'operatore lancia automaticamente un `DataExporter` che:
-1.  Recupera le query PromQL specificate nell'UI.
-2.  Genera un file CSV con timestamp e `nodo_id`.
-3.  Carica il report nel bucket `dfaas-results` su MinIO.
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/<you>/dfaas-exporter:latest \
+  -f dataExporter/Dockerfile dataExporter --push
+```
 
----
+## 📊 Metrics export
 
-## 🤝 Contribuire
-Il progetto è parte di un lavoro di tesi focalizzato sulla federazione Edge/Cloud. Feedback e pull request sono benvenuti!
+During the `Exporting` phase, the LoadTestReconciler creates `<loadtest>-exporter-job` running the `dfaas-exporter` image. It pulls metrics from the management-cluster Prometheus over `[startTime, endTime]` (queries come from `spec.metricsExport.queries`) and writes them to a CSV.
 
----
+The destination depends on `spec.metricsExport.googleDrive`:
+
+| Configuration | Behaviour |
+|---|---|
+| `googleDrive` **unset** | CSV dumped to stdout between `----- BEGIN CSV -----` / `----- END CSV -----` markers. Retrievable with `kubectl logs job/<loadtest>-exporter-job`. |
+| `googleDrive` **set** | Service-account JSON is read from a Secret you provisioned manually (key `credentials.json`), the file is uploaded into the configured Drive folder via `drive.Files.Create(...).SupportsAllDrives(true)`. |
+
+Provision the credentials Secret out-of-band — the operator does **not** create it:
+
+```bash
+kubectl create secret generic <credentialsSecretRef> -n <namespace> \
+  --from-file=credentials.json=/path/to/service-account.json
+```
+
+The Drive folder **must live inside a Workspace Shared Drive** with the service account added as Content manager, otherwise upload fails with `storageQuotaExceeded` (service accounts have no personal storage quota).
+
+The management-cluster Prometheus federates worker metrics via `/federate?match[]={job!=""}`, so PromQL like `rate(node_cpu_seconds_total[1m])` and `container_memory_working_set_bytes` resolve against each worker's local Prometheus. UIs are exposed as NodePort: Prometheus on `http://<management-node-ip>:30090`, Grafana on `:30300`.
+
+## ⚠️ Known limitations / pins
+
+- **`alpine/ansible:2.18.6`** is pinned ([`internal/controller/ansible/job.go`](internal/controller/ansible/job.go)) instead of `latest` / `2.20.0` because of an upstream bug in the `mschuchard.general` collection (`No module named 'mschuchard'` — broken absolute imports inside `plugins/module_utils/*.py` that escape the `ansible_collections.*` namespace at remote-execution time). Bug reproduces identically on ansible-core 2.18.6 and 2.20.0, so the operator side-steps the collection entirely and shells out to `faas-cli` for OpenFaaS function deployment. The pin makes the failure trivially reproducible if you want to verify against upstream; bump it back once the collection is patched.
+- **Worker VMs must have correct clocks** (NTP enabled) — `apt update` rejects Release files dated in the future, which blocks the dfaas-worker provisioning job.
+- **k6-operator's `kube-rbac-proxy` sidecar** can stay in `ImagePullBackOff` on isolated networks; the manager container itself works fine (1/2 Ready) and TestRuns dispatch normally.
+- **Google Drive export requires a Shared Drive.** Personal `@gmail.com` accounts and Workspace tiers that disable Shared Drives cannot use this path; fall back to stdout dump (`googleDrive` unset) or wire an alternative storage (MinIO/S3) if persistence beyond Pod GC is required.
+
+## 🤝 Contributing
+
+This repo is part of a thesis project on Edge/Cloud federation. Feedback and PRs welcome.
 
 > [!IMPORTANT]
-> Assicurati che i nodi target siano raggiungibili via SSH e che le chiavi siano correttamente configurate nelle Secret di Kubernetes.
+> Target VMs must be reachable via SSH from the cluster network and the credentials in `Environment.spec.nodes[].password` / `privateKey` must be valid before applying the manifest. The operator does **not** distribute SSH keys.
