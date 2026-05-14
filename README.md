@@ -7,8 +7,6 @@ The operator ships as a single Deployment that runs **two controllers** against 
 - **`Environment`** — federation infrastructure. Provisions VMs (dfaas-worker nodes + k6-load-generator nodes) and the operator-cluster monitoring stack. Long-lived: once `Ready`, it stays idle until the spec changes.
 - **`LoadTest`** — one k6 load test against an `Environment`. Looks up its `targetEnvironment`, waits until it is `Ready`, dispatches one remote k6 `TestRun` per k6-load-generator node, then runs a metrics exporter Job.
 
-For a detailed architectural deep-dive (FSM transitions, file map, conventions, gotchas) see [.claude/CLAUDE.md](.claude/CLAUDE.md).
-
 ## 🚀 What it does
 
 ```text
