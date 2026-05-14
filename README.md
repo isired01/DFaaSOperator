@@ -13,8 +13,8 @@ For a detailed architectural deep-dive (FSM transitions, file map, conventions, 
 
 ```text
 +---------------------------+        +-----------------------------+
-|       Environment CR      |        |         LoadTest CR         |
-|---------------------------|        |-----------------------------|
+| Environment CR |  | LoadTest CR |
+| -------------- ||-----------------------------|
 | nodes: dfaas-worker, k6   |        | targetEnvironment: env-xyz  |
 | topology (latency links)  |        | perNodeLoad[]               |
 | openfaas functions        |        | metricsExport.queries (PromQL)|
@@ -52,13 +52,13 @@ The reconciler watches the target `Environment`: a Pending LoadTest auto-resumes
 
 ## 🧩 Components
 
-| Component | Path | Image |
-|---|---|---|
-| Operator (`Environment` + `LoadTest` controllers) | `cmd/` + `internal/controller/` | built from repo root `Dockerfile` |
-| Data exporter (Prometheus → CSV + optional Drive upload) | `dataExporter/` | `ghcr.io/isired01/dfaas-exporter:latest` (multi-arch, separate `Dockerfile`) |
-| Ansible playbooks (worker + k6 provisioning) | `internal/controller/ansible/templates/` | `alpine/ansible:2.18.6` (see note below) |
-| Monitoring stack (Prometheus + Grafana, Helm-managed) | `internal/controller/monitoring/charts/` | vendored `.tgz` chart bundles |
-| Front-end + API gateway (separate repo) | `https://github.com/isired01/DFaaS_UI` | — |
+| Component                                                | Path                                     | Image                                                                        |
+| -------------------------------------------------------- | ---------------------------------------- | ---------------------------------------------------------------------------- |
+| Operator (`Environment` + `LoadTest` controllers)        | `cmd/` + `internal/controller/`          | built from repo root `Dockerfile`                                            |
+| Data exporter (Prometheus → CSV + optional Drive upload) | `dataExporter/`                          | `ghcr.io/isired01/dfaas-exporter:latest` (multi-arch, separate `Dockerfile`) |
+| Ansible playbooks (worker + k6 provisioning)             | `internal/controller/ansible/templates/` | `alpine/ansible:2.18.6` (see note below)                                     |
+| Monitoring stack (Prometheus + Grafana, Helm-managed)    | `internal/controller/monitoring/charts/` | vendored `.tgz` chart bundles                                                |
+| Front-end + API gateway (separate repo)                  | `https://github.com/isired01/DFaaS_UI`   | —                                                                            |
 
 ## 🛠️ Requirements
 
@@ -107,10 +107,10 @@ During the `Exporting` phase, the LoadTestReconciler creates `<loadtest>-exporte
 
 The destination depends on `spec.metricsExport.googleDrive`:
 
-| Configuration | Behaviour |
-|---|---|
-| `googleDrive` **unset** | CSV dumped to stdout between `----- BEGIN CSV -----` / `----- END CSV -----` markers. Retrievable with `kubectl logs job/<loadtest>-exporter-job`. |
-| `googleDrive` **set** | Service-account JSON is read from a Secret you provisioned manually (key `credentials.json`), the file is uploaded into the configured Drive folder via `drive.Files.Create(...).SupportsAllDrives(true)`. |
+| Configuration           | Behaviour                                                                                                                                                                                                  |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `googleDrive` **unset** | CSV dumped to stdout between `----- BEGIN CSV -----` / `----- END CSV -----` markers. Retrievable with `kubectl logs job/<loadtest>-exporter-job`.                                                         |
+| `googleDrive` **set**   | Service-account JSON is read from a Secret you provisioned manually (key `credentials.json`), the file is uploaded into the configured Drive folder via `drive.Files.Create(...).SupportsAllDrives(true)`. |
 
 Provision the credentials Secret out-of-band — the operator does **not** create it:
 
@@ -129,10 +129,6 @@ The management-cluster Prometheus federates worker metrics via `/federate?match[
 - **Worker VMs must have correct clocks** (NTP enabled) — `apt update` rejects Release files dated in the future, which blocks the dfaas-worker provisioning job.
 - **k6-operator's `kube-rbac-proxy` sidecar** can stay in `ImagePullBackOff` on isolated networks; the manager container itself works fine (1/2 Ready) and TestRuns dispatch normally.
 - **Google Drive export requires a Shared Drive.** Personal `@gmail.com` accounts and Workspace tiers that disable Shared Drives cannot use this path; fall back to stdout dump (`googleDrive` unset) or wire an alternative storage (MinIO/S3) if persistence beyond Pod GC is required.
-
-## 🤝 Contributing
-
-This repo is part of a thesis project on Edge/Cloud federation. Feedback and PRs welcome.
 
 > [!IMPORTANT]
 > Target VMs must be reachable via SSH from the cluster network and the credentials in `Environment.spec.nodes[].password` / `privateKey` must be valid before applying the manifest. The operator does **not** distribute SSH keys.
