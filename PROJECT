@@ -15,7 +15,16 @@ resources:
   controller: true
   domain: dfaas.io
   group: dfaas
-  kind: Esperimento
+  kind: Environment
+  path: dfaas-operator/api/v1
+  version: v1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: dfaas.io
+  group: dfaas
+  kind: LoadTest
   path: dfaas-operator/api/v1
   version: v1
 version: "3"

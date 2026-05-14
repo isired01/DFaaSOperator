@@ -1,6 +1,17 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+*/
+
 package controller
 
 import (
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -11,17 +22,51 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 )
 
-// createExporterJob costruisce il Job che lancia il container dfaas-exporter
-// per estrarre le metriche da Prometheus e caricarle su MinIO.
-// startTime = termTime - 1min, endTime = adesso - 30s.
-func (r *EsperimentoReconciler) createExporterJob(exp *dfaasv1.Esperimento, queries string, termTime time.Time) *batchv1.Job {
-	startTime := termTime.Add(-1 * time.Minute).UTC().Format(time.RFC3339)
-	endTime := time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339)
+// createExporterJob builds the in-cluster Job that runs the dfaas-exporter
+// image to pull metrics from Prometheus over [startTime, endTime] and either
+// upload a CSV to Google Drive or print it to stdout.
+func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, endTime time.Time) *batchv1.Job {
+	queries := strings.Join(lt.Spec.MetricsExport.Queries, "|")
+	step := lt.Spec.MetricsExport.Step
+	if step == "" {
+		step = "15s"
+	}
+
+	env := []corev1.EnvVar{
+		{Name: "PROM_URL", Value: "http://prometheus-server.monitoring.svc.cluster.local:9090"},
+		{Name: "QUERIES", Value: queries},
+		{Name: "START_TIME", Value: startTime.UTC().Format(time.RFC3339)},
+		{Name: "END_TIME", Value: endTime.UTC().Format(time.RFC3339)},
+		{Name: "STEP", Value: step},
+		{Name: "EXP_NAME", Value: lt.Name},
+	}
+
+	var volumes []corev1.Volume
+	var volumeMounts []corev1.VolumeMount
+
+	if lt.Spec.MetricsExport.GoogleDrive != nil {
+		gd := lt.Spec.MetricsExport.GoogleDrive
+		env = append(env,
+			corev1.EnvVar{Name: "GDRIVE_FOLDER_ID", Value: gd.FolderID},
+			corev1.EnvVar{Name: "GDRIVE_CREDENTIALS_PATH", Value: "/var/run/gdrive/credentials.json"},
+		)
+		volumes = append(volumes, corev1.Volume{
+			Name: "gdrive-creds",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: gd.CredentialsSecretRef},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "gdrive-creds",
+			MountPath: "/var/run/gdrive",
+			ReadOnly:  true,
+		})
+	}
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      exp.Name + "-exporter-job",
-			Namespace: exp.Namespace,
+			Name:      lt.Name + "-exporter-job",
+			Namespace: lt.Namespace,
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit: int32Ptr(2),
@@ -29,28 +74,19 @@ func (r *EsperimentoReconciler) createExporterJob(exp *dfaasv1.Esperimento, quer
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "exporter",
-							Image: "ghcr.io/isired01/dfaas-exporter:latest",
-							Env: []corev1.EnvVar{
-								{Name: "PROM_URL", Value: "http://prometheus-service.monitoring.svc.cluster.local:9090"},
-								{Name: "QUERIES", Value: queries},
-								{Name: "START_TIME", Value: startTime},
-								{Name: "END_TIME", Value: endTime},
-								{Name: "STEP", Value: "5s"},
-								{Name: "EXP_NAME", Value: exp.Name},
-								{Name: "MINIO_ENDPOINT", Value: "minio-service.monitoring.svc.cluster.local:9000"},
-								{Name: "MINIO_ACCESS_KEY", Value: "admin"},       // Idealmente da Secret
-								{Name: "MINIO_SECRET_KEY", Value: "password123"}, // Idealmente da Secret
-							},
+							Name:         "exporter",
+							Image:        "ghcr.io/isired01/dfaas-exporter:latest",
+							Env:          env,
+							VolumeMounts: volumeMounts,
 						},
 					},
+					Volumes:       volumes,
 					RestartPolicy: corev1.RestartPolicyOnFailure,
 				},
 			},
 		},
 	}
-
-	_ = ctrl.SetControllerReference(exp, job, r.Scheme)
+	_ = ctrl.SetControllerReference(lt, job, r.Scheme)
 	return job
 }
 

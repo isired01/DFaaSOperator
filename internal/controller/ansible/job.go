@@ -1,3 +1,13 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+*/
+
 package ansible
 
 import (
@@ -13,93 +23,74 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 )
 
-// CreateJob costruisce il Job Ansible per il provisioning dei nodi della
-// federazione e il Secret con l'inventory generato dalla Federation.
-func (m *Manager) CreateJob(ctx context.Context, exp *dfaasv1.Esperimento) (*batchv1.Job, *corev1.Secret, error) {
+// CreateJobForRole builds an Ansible Job + inventory Secret for the subset of
+// nodes in env that match role. jobSuffix becomes part of the Job/Secret/
+// playbook-ConfigMap name so VM and K6 phases run independent Jobs against
+// distinct node sets. The playbook chosen depends on the role:
+//
+//   - dfaas-worker        → setup-nodes.yml (base OS + dFaaS install)
+//   - k6-load-generator   → setup-k6-nodes.yml (k3s + k6-operator)
+func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment,
+	role dfaasv1.NodeRole, jobSuffix string) (*batchv1.Job, *corev1.Secret, error) {
 
-	// 1. Assicuriamoci che le ConfigMap dei values esistano PRIMA di definire il Job
-	if err := m.EnsureHelmValues(ctx, exp); err != nil {
-		return nil, nil, fmt.Errorf("failed to ensure helm values config: %w", err)
+	nodes := env.NodesWithRole(role)
+	if len(nodes) == 0 {
+		return nil, nil, fmt.Errorf("no nodes with role %q in environment %q", role, env.Name)
 	}
 
-	if err := m.EnsureConfigMap(ctx, exp); err != nil {
-		return nil, nil, fmt.Errorf("failed to ensure ansible config map: %w", err)
+	if err := m.EnsureHelmValues(ctx, env); err != nil {
+		return nil, nil, fmt.Errorf("ensure helm values: %w", err)
+	}
+	if err := m.EnsurePlaybookConfigMap(ctx, env, role); err != nil {
+		return nil, nil, fmt.Errorf("ensure playbook configmap: %w", err)
+	}
+	saName, err := m.EnsureRBAC(ctx, env)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ensure RBAC: %w", err)
 	}
 
-	if len(exp.Spec.Federation.Nodes) == 0 {
-		return nil, nil, fmt.Errorf("no nodes specified in federation")
-	}
+	playbookFile := playbookFileForRole(role)
+	playbookCMName := playbookConfigMapName(env, role)
 
-	firstPeerID, _ := calcolaPeerID(exp.Spec.Federation.Nodes[0].PrivateKey)
-
-	var inventory string
-	inventory += "[target_Nodess]\n"
-
-	for i, Nodes := range exp.Spec.Federation.Nodes {
-		if Nodes.IpAddress != "" {
-			peerID, err := calcolaPeerID(Nodes.PrivateKey)
-			if err != nil {
-				peerID = "error-key"
-			}
-
-			isBootstrap := (i != 0)
-			bootstrapAddr := fmt.Sprintf("/ip4/%s/tcp/31600/p2p/%s", exp.Spec.Federation.Nodes[0].IpAddress, firstPeerID)
-			if !isBootstrap {
-				bootstrapAddr = ""
-			}
-
-			NodesFunctionsJson, _ := json.Marshal(Nodes.Functions)
-
-			line := fmt.Sprintf("%s ansible_user=%s ansible_password=%s node_specific_functions='%s' node_priv_key='%s' dfaas_agent_id='%s' is_bootstrap=%t bootstrap_address='%s' balancing_strategy='%s'\n",
-				Nodes.IpAddress,
-				Nodes.Username,
-				Nodes.Password,
-				string(NodesFunctionsJson),
-				Nodes.PrivateKey,
-				peerID,
-				isBootstrap,
-				bootstrapAddr,
-				Nodes.BalancingStrategy,
-			)
-			inventory += line
-		}
-	}
-
+	inventory := buildInventory(env, role, nodes)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      exp.Name + "-ansible-inventory",
-			Namespace: exp.Namespace,
+			Name:      fmt.Sprintf("%s-ansible-%s-inventory", env.Name, jobSuffix),
+			Namespace: env.Namespace,
 		},
-		StringData: map[string]string{
-			"hosts": inventory,
-		},
+		StringData: map[string]string{"hosts": inventory},
 	}
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      exp.Name + "-infra-job",
-			Namespace: exp.Namespace,
+			Name:      fmt.Sprintf("%s-infra-%s-job", env.Name, jobSuffix),
+			Namespace: env.Namespace,
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit: int32Ptr(3), //default se non specificato è 6
+			BackoffLimit: int32Ptr(3),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:    "ansible-worker",
-							Image:   "alpine/ansible:2.20.0",
-							Command: []string{"sh", "-c"},
-							Args: []string{
-								"ansible-playbook -i /etc/ansible/hosts /ansible/playbooks/setup-Nodes.yml " +
+					ServiceAccountName: saName,
+					Containers: []corev1.Container{{
+						Name:    "ansible-worker",
+						Image:   "alpine/ansible:2.18.6",
+						Command: []string{"sh", "-c"},
+						Args: []string{
+							fmt.Sprintf(
+								"set -e; "+
+									"apk add --no-cache py3-pip && "+
+									"pip3 install --break-system-packages --quiet kubernetes && "+
+									"ansible-galaxy collection install -r /ansible/playbooks/requirements.yml && "+
+									"ansible-playbook -i /etc/ansible/hosts /ansible/playbooks/%s "+
 									"--extra-vars \"ansible_ssh_common_args='-o StrictHostKeyChecking=no'\"",
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{Name: "inventory-volume", MountPath: "/etc/ansible"},
-								{Name: "playbook-volume", MountPath: "/ansible/playbooks"},
-								{Name: "helm-values-volume", MountPath: "/opt/helm-values"},
-							},
+								playbookFile),
 						},
-					},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "inventory-volume", MountPath: "/etc/ansible"},
+							{Name: "playbook-volume", MountPath: "/ansible/playbooks"},
+							{Name: "helm-values-volume", MountPath: "/opt/helm-values"},
+						},
+					}},
 					Volumes: []corev1.Volume{
 						{
 							Name: "inventory-volume",
@@ -111,7 +102,7 @@ func (m *Manager) CreateJob(ctx context.Context, exp *dfaasv1.Esperimento) (*bat
 							Name: "playbook-volume",
 							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{Name: "ansible-playbooks-" + exp.Name},
+									LocalObjectReference: corev1.LocalObjectReference{Name: playbookCMName},
 								},
 							},
 						},
@@ -119,7 +110,7 @@ func (m *Manager) CreateJob(ctx context.Context, exp *dfaasv1.Esperimento) (*bat
 							Name: "helm-values-volume",
 							VolumeSource: corev1.VolumeSource{
 								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{Name: "helm-values-config-" + exp.Name},
+									LocalObjectReference: corev1.LocalObjectReference{Name: "helm-values-config-" + env.Name},
 								},
 							},
 						},
@@ -130,8 +121,63 @@ func (m *Manager) CreateJob(ctx context.Context, exp *dfaasv1.Esperimento) (*bat
 		},
 	}
 
-	_ = ctrl.SetControllerReference(exp, secret, m.Scheme)
-	_ = ctrl.SetControllerReference(exp, job, m.Scheme)
-
+	_ = ctrl.SetControllerReference(env, secret, m.Scheme)
+	_ = ctrl.SetControllerReference(env, job, m.Scheme)
 	return job, secret, nil
+}
+
+// buildInventory builds the Ansible inventory text for the given role + node
+// subset. Only dfaas-worker nodes get bootstrap-peer + balancing-strategy
+// vars; k6 nodes get a minimal inventory.
+func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole, nodes []dfaasv1.EnvironmentNode) string {
+	var inv string
+	switch role {
+	case dfaasv1.RoleDfaasWorker:
+		inv = "[target_Nodess]\n"
+
+		firstPeerID, _ := calcolaPeerID(nodes[0].PrivateKey)
+		for i, n := range nodes {
+			peerID, err := calcolaPeerID(n.PrivateKey)
+			if err != nil {
+				peerID = "error-key"
+			}
+			isBootstrap := i != 0
+			bootstrap := ""
+			if isBootstrap {
+				bootstrap = fmt.Sprintf("/ip4/%s/tcp/31600/p2p/%s", nodes[0].IPAddress, firstPeerID)
+			}
+			fnJSON, _ := json.Marshal(n.Functions)
+			inv += fmt.Sprintf(
+				"%s ansible_user=%s ansible_password=%s node_specific_functions='%s' "+
+					"node_priv_key='%s' dfaas_agent_id='%s' is_bootstrap=%t bootstrap_address='%s' "+
+					"balancing_strategy='%s'\n",
+				n.IPAddress, n.Username, n.Password, string(fnJSON),
+				n.PrivateKey, peerID, isBootstrap, bootstrap, n.BalancingStrategy,
+			)
+		}
+	case dfaasv1.RoleK6LoadGenerator:
+		inv = "[k6_nodes]\n"
+		for _, n := range nodes {
+			inv += fmt.Sprintf(
+				"%s ansible_user=%s ansible_password=%s node_id='%s' env_name='%s' env_namespace='%s'\n",
+				n.IPAddress, n.Username, n.Password, n.NodeID, env.Name, env.Namespace,
+			)
+		}
+	}
+	return inv
+}
+
+func playbookFileForRole(role dfaasv1.NodeRole) string {
+	if role == dfaasv1.RoleK6LoadGenerator {
+		return "setup-k6-nodes.yml"
+	}
+	return "setup-nodes.yml"
+}
+
+func playbookConfigMapName(env *dfaasv1.Environment, role dfaasv1.NodeRole) string {
+	suffix := "dfaas"
+	if role == dfaasv1.RoleK6LoadGenerator {
+		suffix = "k6"
+	}
+	return fmt.Sprintf("ansible-playbooks-%s-%s", suffix, env.Name)
 }

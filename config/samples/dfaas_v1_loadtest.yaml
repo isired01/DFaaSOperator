@@ -1,0 +1,47 @@
+apiVersion: dfaas.dfaas.io/v1
+kind: LoadTest
+metadata:
+  name: loadtest-sample
+  namespace: default
+spec:
+  targetEnvironment: env-sample
+  perNodeLoad:
+    - nodeID: k6-gen-1
+      vus: 50
+      duration: 30s
+      scriptConfigMap:
+        name: loadtest-sample-script
+  metricsExport:
+    step: 15s
+    queries:
+      - rate(node_cpu_seconds_total[1m])
+      - node_memory_MemAvailable_bytes
+    # googleDrive is optional. When unset, the exporter dumps the CSV to
+    # stdout between markers "----- BEGIN CSV -----" / "----- END CSV -----"
+    # (retrievable via `kubectl logs job/<loadtest>-exporter-job`).
+    # To enable Drive upload, set folderId + credentialsSecretRef and create
+    # the Secret out-of-band (see CLAUDE.md "Google Drive export — Secret
+    # provisioning"). Requires a Shared Drive (Workspace).
+    # googleDrive:
+    #   folderId: <shared-drive-folder-id>
+    #   credentialsSecretRef: google-credentials-secret
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loadtest-sample-script
+  namespace: default
+data:
+  script.js: |
+    import http from 'k6/http';
+    import { sleep } from 'k6';
+
+    export const options = {
+      vus: 50,
+      duration: '30s',
+    };
+
+    export default function () {
+      http.get('http://192.168.252.60:31112/function/figlet');
+      sleep(1);
+    }

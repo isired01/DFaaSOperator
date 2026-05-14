@@ -4,24 +4,27 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.20.1
-  name: esperimentos.dfaas.dfaas.io
+  name: environments.dfaas.dfaas.io
 spec:
   group: dfaas.dfaas.io
   names:
-    kind: Esperimento
-    listKind: EsperimentoList
-    plural: esperimentos
-    singular: esperimento
+    kind: Environment
+    listKind: EnvironmentList
+    plural: environments
+    singular: environment
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
     name: v1
     schema:
       openAPIV3Schema:
-        description: Esperimento è lo schema per la risorsa singola
+        description: Environment is the schema for the federation infrastructure resource.
         properties:
           apiVersion:
             description: |-
@@ -41,87 +44,92 @@ spec:
           metadata:
             type: object
           spec:
+            description: EnvironmentSpec is the desired federation infrastructure.
             properties:
-              federation:
-                description: Configuration of the dedicated federation
-                properties:
-                  nodes:
-                    description: Lista dei nodi della federazione per questo specifico
-                      esperimento
-                    items:
-                      properties:
-                        balancingStrategy:
-                          type: string
-                        capacity:
-                          type: string
-                        functions:
-                          description: Lista di configurazioni per le funzioni da
-                            deployare su questo nodo
-                          items:
-                            properties:
-                              execTimeout:
-                                default: 5
-                                description: Tempo massimo di esecuzione (corrisponde
-                                  a exec_timeout)
-                                type: integer
-                              image:
-                                description: 'Immagine completa (es: "functions/figlet:latest")'
-                                type: string
-                              maxInflight:
-                                default: 400
-                                description: Massimo numero di richieste parallele
-                                  (corrisponde a max_inflight)
-                                type: integer
-                              name:
-                                description: 'Nome della funzione (es: "figlet")'
-                                type: string
-                              timeoutMs:
-                                default: 6000
-                                description: Timeout logico per l'operatore dFaaS
-                                  in millisecondi
-                                type: integer
-                            required:
-                            - execTimeout
-                            - image
-                            - maxInflight
-                            - name
-                            - timeoutMs
-                            type: object
-                          type: array
-                        ipAddress:
-                          type: string
-                        nodeID:
-                          type: string
-                        password:
-                          type: string
-                        privateKey:
-                          type: string
-                        username:
-                          type: string
-                      required:
-                      - balancingStrategy
-                      - capacity
-                      - ipAddress
-                      - nodeID
-                      - password
-                      - privateKey
-                      - username
-                      type: object
-                    minItems: 1
-                    type: array
-                required:
-                - nodes
-                type: object
-              isCleanupRequested:
+              cleanupOnDelete:
                 default: false
-                description: Flag to request resource cleanup after the test
+                description: CleanupOnDelete drives the finalizer's behavior.
                 type: boolean
+              nodes:
+                items:
+                  description: EnvironmentNode declares one machine in the federation.
+                  properties:
+                    balancingStrategy:
+                      description: BalancingStrategy is meaningful only for dfaas-worker
+                        nodes.
+                      type: string
+                    capacity:
+                      description: NodeCapacity expresses the relative CPU/RAM budget
+                        of a node.
+                      enum:
+                      - LOW
+                      - MEDIUM
+                      - HIGH
+                      type: string
+                    functions:
+                      description: Functions to deploy on a dfaas-worker node.
+                      items:
+                        description: Function describes one OpenFaaS function deployed
+                          on a dfaas-worker node.
+                        properties:
+                          execTimeout:
+                            default: 5
+                            type: integer
+                          image:
+                            type: string
+                          maxInflight:
+                            default: 400
+                            type: integer
+                          name:
+                            type: string
+                          timeoutMs:
+                            default: 6000
+                            type: integer
+                        required:
+                        - execTimeout
+                        - image
+                        - maxInflight
+                        - name
+                        - timeoutMs
+                        type: object
+                      type: array
+                    ipAddress:
+                      type: string
+                    nodeID:
+                      type: string
+                    password:
+                      type: string
+                    privateKey:
+                      type: string
+                    role:
+                      description: |-
+                        NodeRole tags a node either as a dFaaS worker or as a k6 load generator
+                        running its own k3s + k6-operator.
+                      enum:
+                      - dfaas-worker
+                      - k6-load-generator
+                      type: string
+                    username:
+                      description: SSH credentials (inline, matches the FE-produced
+                        manifests).
+                      type: string
+                  required:
+                  - capacity
+                  - ipAddress
+                  - nodeID
+                  - password
+                  - role
+                  - username
+                  type: object
+                minItems: 1
+                type: array
               topology:
-                description: Network topology of the experiment
+                description: Topology declares inter-node network shaping (latency
+                  injection).
                 properties:
                   links:
-                    description: Definizione dei link di rete tra i nodi dell'esperimento
                     items:
+                      description: Link is one symmetric latency link in the topology.
                       properties:
                         latencyMs:
                           type: integer
@@ -135,21 +143,15 @@ spec:
                       - nodeB
                       type: object
                     type: array
-                required:
-                - links
                 type: object
             required:
-            - federation
-            - isCleanupRequested
-            - topology
+            - nodes
             type: object
           status:
-            description: EsperimentoStatus definisce lo stato osservato dell'istanza
-              (gestito dal Controller)
+            description: EnvironmentStatus tracks the infrastructure phase observed
+              by the controller.
             properties:
               conditions:
-                description: Conditions represents the observations of the experiment's
-                  current state
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -205,12 +207,46 @@ spec:
                   - type
                   type: object
                 type: array
+              dfaasNodes:
+                items:
+                  type: string
+                type: array
+              k6Nodes:
+                items:
+                  description: |-
+                    K6NodeStatus mirrors per-k6-machine connectivity info so the LoadTest
+                    reconciler can resolve remote clusters without re-walking the spec.
+                  properties:
+                    ipAddress:
+                      type: string
+                    kubeconfigSecret:
+                      type: string
+                    nodeID:
+                      type: string
+                  required:
+                  - ipAddress
+                  - kubeconfigSecret
+                  - nodeID
+                  type: object
+                type: array
               message:
-                description: Detailed message (e.g., reason for a FAILED state)
                 type: string
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the spec.generation observed at the last
+                  successful provisioning run. The reconciler skips re-provisioning when
+                  metadata.generation == status.observedGeneration and phase == Ready.
+                format: int64
+                type: integer
               phase:
-                default: IDLE
-                description: Current execution phase
+                description: EnvironmentPhase tracks the infrastructure lifecycle.
+                enum:
+                - Idle
+                - ProvisioningVMs
+                - ProvisioningK6
+                - ProvisioningMonitoring
+                - Ready
+                - Failed
                 type: string
             type: object
         type: object

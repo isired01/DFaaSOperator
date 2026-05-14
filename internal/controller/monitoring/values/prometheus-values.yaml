@@ -1,0 +1,63 @@
+# Override values per il chart prometheus-community/prometheus.
+# Minimizza l'install: Prometheus server con sidecar configmap-reload, niente
+# node-exporter, alertmanager, kube-state-metrics, pushgateway.
+
+alertmanager:
+  enabled: false
+prometheus-node-exporter:
+  enabled: false
+kube-state-metrics:
+  enabled: false
+prometheus-pushgateway:
+  enabled: false
+
+# Sidecar configmap-reload (incluso nel chart). Osserva mount delle ConfigMap
+# e chiama POST http://localhost:9090/-/reload quando il filesystem cambia
+# → hot-reload senza restart del pod.
+configmapReload:
+  prometheus:
+    enabled: true
+    # Estende il watch alla dir di service-discovery file-based:
+    # quando l'operator aggiorna la ConfigMap prometheus-targets, il file
+    # JSON montato cambia e il reloader notifica Prometheus.
+    extraVolumeMounts:
+      - name: dfaas-targets
+        mountPath: /etc/prometheus/file_sd
+
+server:
+  fullnameOverride: "prometheus-server"
+  persistentVolume:
+    enabled: false
+  retention: "1d"
+  service:
+    type: NodePort
+    servicePort: 9090
+    nodePort: 30090
+  # Monta la ConfigMap prometheus-targets gestita dall'operator
+  # (reconcilePrometheusTargets). `optional: true` evita errori se la
+  # ConfigMap non esiste al primo deploy.
+  extraVolumes:
+    - name: dfaas-targets
+      configMap:
+        name: prometheus-targets
+        optional: true
+  extraVolumeMounts:
+    - name: dfaas-targets
+      mountPath: /etc/prometheus/file_sd
+
+# Append al scrape_configs di base: job dfaas-nodes federa tutte le metriche
+# dal Prometheus locale del worker (cAdvisor, node-exporter, openfaas, …).
+# File-based SD: i target sono in /etc/prometheus/file_sd/*.json (vedi
+# monitoring/targets.go).
+# Chart 29.x reads this key at top level (not under server.).
+extraScrapeConfigs: |
+  - job_name: 'dfaas-nodes'
+    honor_labels: true
+    metrics_path: /federate
+    params:
+      'match[]':
+        - '{job!=""}'
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/file_sd/*.json
+        refresh_interval: 30s

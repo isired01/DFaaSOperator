@@ -1,0 +1,9 @@
+---
+# Ansible Galaxy collections required by the playbooks under this directory.
+# Installed at Job startup via:
+#   ansible-galaxy collection install -r /ansible/playbooks/requirements.yml
+collections:
+  - name: kubernetes.core
+    version: ">=3.0.0"
+  - name: community.general
+    version: ">=8.0.0"

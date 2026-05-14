@@ -5,10 +5,48 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - dfaas.dfaas.io
+  - ""
   resources:
   - configmaps
-  - esperimentos
+  - namespaces
+  - persistentvolumeclaims
+  - secrets
+  - serviceaccounts
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - daemonsets
+  - deployments
+  - replicasets
+  - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - batch
+  resources:
   - jobs
   verbs:
   - create
@@ -21,36 +59,42 @@ rules:
 - apiGroups:
   - dfaas.dfaas.io
   resources:
-  - esperimentos/finalizers
+  - environments
+  - loadtests
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - dfaas.dfaas.io
+  resources:
+  - environments/finalizers
+  - loadtests/finalizers
   verbs:
   - update
 - apiGroups:
   - dfaas.dfaas.io
   resources:
-  - esperimentos/status
+  - environments/status
+  - loadtests/status
   verbs:
   - get
   - patch
   - update
 - apiGroups:
-  - dfaas.dfaas.io
+  - rbac.authorization.k8s.io
   resources:
-  - pods
+  - rolebindings
+  - roles
   verbs:
+  - create
+  - delete
   - get
   - list
+  - patch
+  - update
   - watch
-- apiGroups:
-  - k6.io
-  resources:
-  - testruns
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - k6.io
-  resources:
-  - testruns/status
-  verbs:
-  - get
