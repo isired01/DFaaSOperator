@@ -36,6 +36,7 @@ import (
 
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/controller"
+	"dfaas-operator/internal/k6dispatch"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -122,11 +123,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.EsperimentoReconciler{
+	if err = (&controller.EnvironmentReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Esperimento")
+		setupLog.Error(err, "unable to create controller", "controller", "Environment")
+		os.Exit(1)
+	}
+	if err = (&controller.LoadTestReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		Dispatcher: &k6dispatch.Dispatcher{Local: mgr.GetClient()},
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "LoadTest")
 		os.Exit(1)
 	}
 	//+kubebuilder:scaffold:builder

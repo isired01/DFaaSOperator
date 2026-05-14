@@ -1,0 +1,141 @@
+---
+- name: "Provision k6 load-generator (k3s + k6-operator) and push kubeconfig"
+  hosts: k6_nodes
+  become: true
+  gather_facts: true
+  collections:
+    - kubernetes.core
+    - community.general
+  vars:
+    k3s_config_remote: /etc/rancher/k3s/k3s.yaml
+    k6_namespace: k6-operator-system
+    k6_chart_version: "3.7.0"
+    mgmt_secret_name: "{{ node_id }}-kubeconfig"
+
+  tasks:
+    - name: Disable APT automatic upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99-disable-auto-upgrades
+        content: |
+          APT::Periodic::Enable "0";
+          APT::Periodic::Update-Package-Lists "0";
+          APT::Periodic::Unattended-Upgrade "0";
+
+    - name: Install prerequisite packages
+      ansible.builtin.apt:
+        name: [curl, python3-pip, python3-kubernetes, ca-certificates]
+        state: present
+        update_cache: true
+
+    - name: Disable UFW firewall
+      community.general.ufw:
+        state: disabled
+
+    - name: Ensure netfilter modules are loaded
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop: [br_netfilter, nf_conntrack]
+
+    - name: Check if k3s binary is present
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: k3s_bin
+
+    - name: Install k3s (single-node, no Traefik, no ServiceLB)
+      ansible.builtin.shell:
+        cmd: |
+          curl -sfL https://get.k3s.io | \
+            INSTALL_K3S_EXEC="--disable traefik --disable servicelb --write-kubeconfig-mode=644" sh -
+      when: not k3s_bin.stat.exists
+
+    - name: Ensure k3s service is started + enabled
+      ansible.builtin.systemd:
+        name: k3s
+        state: started
+        enabled: true
+
+    - name: Wait for k3s Node to be Ready
+      kubernetes.core.k8s_info:
+        kind: Node
+        kubeconfig: "{{ k3s_config_remote }}"
+      register: k3s_nodes
+      until: k3s_nodes.resources | length > 0
+      retries: 30
+      delay: 5
+
+    - name: Check if Helm is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/helm
+      register: helm_bin
+
+    - name: Install Helm
+      ansible.builtin.shell:
+        cmd: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      when: not helm_bin.stat.exists
+
+    - name: Add grafana Helm repo
+      kubernetes.core.helm_repository:
+        name: grafana
+        repo_url: https://grafana.github.io/helm-charts
+
+    - name: Ensure k6-operator namespace adopted by Helm
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ k3s_config_remote }}"
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ k6_namespace }}"
+            labels:
+              app.kubernetes.io/managed-by: Helm
+            annotations:
+              meta.helm.sh/release-name: k6-operator
+              meta.helm.sh/release-namespace: "{{ k6_namespace }}"
+
+    - name: Install k6-operator chart
+      kubernetes.core.helm:
+        name: k6-operator
+        chart_ref: grafana/k6-operator
+        chart_version: "{{ k6_chart_version }}"
+        release_namespace: "{{ k6_namespace }}"
+        wait: true
+        kubeconfig: "{{ k3s_config_remote }}"
+
+    - name: Read the k3s kubeconfig
+      ansible.builtin.slurp:
+        src: "{{ k3s_config_remote }}"
+      register: kubeconfig_b64
+
+    - name: Rewrite server URL to public IP
+      ansible.builtin.set_fact:
+        kubeconfig_rendered: >-
+          {{
+            (kubeconfig_b64.content | b64decode)
+            | replace('https://127.0.0.1:6443', 'https://' + ansible_host + ':6443')
+          }}
+
+    # Push the kubeconfig back to the management cluster as a Secret named
+    # exactly Environment.spec.nodes[i].k6KubeconfigSecret (set by the FE).
+    # delegate_to: localhost runs this on the Ansible Job pod, which has an
+    # in-cluster ServiceAccount with Secrets-create RBAC in env.Namespace
+    # granted by ansible.Manager.EnsureRBAC at Job creation time.
+    - name: "Push kubeconfig Secret to management cluster"
+      delegate_to: localhost
+      become: false
+      kubernetes.core.k8s:
+        state: present
+        apply: true
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: Opaque
+          metadata:
+            name: "{{ mgmt_secret_name }}"
+            namespace: "{{ env_namespace }}"
+            labels:
+              dfaas.io/env: "{{ env_name }}"
+              dfaas.io/node-id: "{{ node_id }}"
+          stringData:
+            kubeconfig: "{{ kubeconfig_rendered }}"

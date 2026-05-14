@@ -1,6 +1,17 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+*/
+
 package controller
 
 import (
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -11,43 +22,38 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 )
 
-// createExporterJob costruisce il Job che lancia il container dfaas-exporter
-// per estrarre le metriche da Prometheus.
-// startTime = termTime - 1min, endTime = adesso - 30s.
-//
-// Destinazione CSV:
-//   - se exp.Spec.GoogleDrive != nil: monta il Secret indicato in
-//     CredentialsSecretRef su /var/run/gdrive e passa GDRIVE_FOLDER_ID +
-//     GDRIVE_CREDENTIALS_PATH al binario, che caricherà il CSV su Drive.
-//   - se nil: il binario stamperà il CSV su stdout (recuperabile via
-//     `kubectl logs job/<exp>-exporter-job`).
-func (r *EsperimentoReconciler) createExporterJob(exp *dfaasv1.Esperimento, queries string, termTime time.Time) *batchv1.Job {
-	startTime := termTime.Add(-1 * time.Minute).UTC().Format(time.RFC3339)
-	endTime := time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339)
+// createExporterJob builds the in-cluster Job that runs the dfaas-exporter
+// image to pull metrics from Prometheus over [startTime, endTime] and either
+// upload a CSV to Google Drive or print it to stdout.
+func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, endTime time.Time) *batchv1.Job {
+	queries := strings.Join(lt.Spec.MetricsExport.Queries, "|")
+	step := lt.Spec.MetricsExport.Step
+	if step == "" {
+		step = "15s"
+	}
 
 	env := []corev1.EnvVar{
 		{Name: "PROM_URL", Value: "http://prometheus-server.monitoring.svc.cluster.local:9090"},
 		{Name: "QUERIES", Value: queries},
-		{Name: "START_TIME", Value: startTime},
-		{Name: "END_TIME", Value: endTime},
-		{Name: "STEP", Value: "5s"},
-		{Name: "EXP_NAME", Value: exp.Name},
+		{Name: "START_TIME", Value: startTime.UTC().Format(time.RFC3339)},
+		{Name: "END_TIME", Value: endTime.UTC().Format(time.RFC3339)},
+		{Name: "STEP", Value: step},
+		{Name: "EXP_NAME", Value: lt.Name},
 	}
 
 	var volumes []corev1.Volume
 	var volumeMounts []corev1.VolumeMount
 
-	if exp.Spec.GoogleDrive != nil {
+	if lt.Spec.MetricsExport.GoogleDrive != nil {
+		gd := lt.Spec.MetricsExport.GoogleDrive
 		env = append(env,
-			corev1.EnvVar{Name: "GDRIVE_FOLDER_ID", Value: exp.Spec.GoogleDrive.FolderID},
+			corev1.EnvVar{Name: "GDRIVE_FOLDER_ID", Value: gd.FolderID},
 			corev1.EnvVar{Name: "GDRIVE_CREDENTIALS_PATH", Value: "/var/run/gdrive/credentials.json"},
 		)
 		volumes = append(volumes, corev1.Volume{
 			Name: "gdrive-creds",
 			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: exp.Spec.GoogleDrive.CredentialsSecretRef,
-				},
+				Secret: &corev1.SecretVolumeSource{SecretName: gd.CredentialsSecretRef},
 			},
 		})
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
@@ -59,8 +65,8 @@ func (r *EsperimentoReconciler) createExporterJob(exp *dfaasv1.Esperimento, quer
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      exp.Name + "-exporter-job",
-			Namespace: exp.Namespace,
+			Name:      lt.Name + "-exporter-job",
+			Namespace: lt.Namespace,
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit: int32Ptr(2),
@@ -80,8 +86,7 @@ func (r *EsperimentoReconciler) createExporterJob(exp *dfaasv1.Esperimento, quer
 			},
 		},
 	}
-
-	_ = ctrl.SetControllerReference(exp, job, r.Scheme)
+	_ = ctrl.SetControllerReference(lt, job, r.Scheme)
 	return job
 }
 

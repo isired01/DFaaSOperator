@@ -1,0 +1,33 @@
+apiVersion: dfaas.dfaas.io/v1
+kind: Environment
+metadata:
+  name: env-sample
+  namespace: default
+spec:
+  cleanupOnDelete: false
+  nodes:
+    - nodeID: dfaas-worker-1
+      ipAddress: 192.168.252.60
+      role: dfaas-worker
+      capacity: MEDIUM
+      username: isaia
+      password: root
+      privateKey: MC4CAQAwBQYDK2VwBCIEIODgFN+A8KkNvY8ozKDMXdQV2fehNH43Ba+MYpOzihsJ
+      balancingStrategy: alllocal
+      functions:
+        - name: figlet
+          image: ghcr.io/openfaas/figlet:latest
+          execTimeout: 5
+          maxInflight: 400
+          timeoutMs: 6000
+    - nodeID: k6-gen-1
+      ipAddress: 192.168.252.61
+      role: k6-load-generator
+      capacity: HIGH
+      username: isaia
+      password: root
+  topology:
+    links:
+      - nodeA: dfaas-worker-1
+        nodeB: k6-gen-1
+        latencyMs: 20

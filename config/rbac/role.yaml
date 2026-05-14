@@ -59,7 +59,8 @@ rules:
 - apiGroups:
   - dfaas.dfaas.io
   resources:
-  - esperimentos
+  - environments
+  - loadtests
   verbs:
   - create
   - delete
@@ -71,28 +72,29 @@ rules:
 - apiGroups:
   - dfaas.dfaas.io
   resources:
-  - esperimentos/finalizers
+  - environments/finalizers
+  - loadtests/finalizers
   verbs:
   - update
 - apiGroups:
   - dfaas.dfaas.io
   resources:
-  - esperimentos/status
+  - environments/status
+  - loadtests/status
   verbs:
   - get
   - patch
   - update
 - apiGroups:
-  - k6.io
+  - rbac.authorization.k8s.io
   resources:
-  - testruns
+  - rolebindings
+  - roles
   verbs:
+  - create
+  - delete
   - get
   - list
+  - patch
+  - update
   - watch
-- apiGroups:
-  - k6.io
-  resources:
-  - testruns/status
-  verbs:
-  - get

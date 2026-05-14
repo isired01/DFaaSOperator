@@ -29,6 +29,10 @@ server:
   persistentVolume:
     enabled: false
   retention: "1d"
+  service:
+    type: NodePort
+    servicePort: 9090
+    nodePort: 30090
   # Monta la ConfigMap prometheus-targets gestita dall'operator
   # (reconcilePrometheusTargets). `optional: true` evita errori se la
   # ConfigMap non esiste al primo deploy.
@@ -40,16 +44,20 @@ server:
   extraVolumeMounts:
     - name: dfaas-targets
       mountPath: /etc/prometheus/file_sd
-  # Append al scrape_configs di base: job dfaas-nodes legge i target
-  # dai file JSON in /etc/prometheus/file_sd/*.json (file-based SD).
-  extraScrapeConfigs: |
-    - job_name: 'dfaas-nodes'
-      file_sd_configs:
-        - files:
-            - /etc/prometheus/file_sd/*.json
-          refresh_interval: 30s
 
-service:
-  type: NodePort
-  servicePort: 9090
-  nodePort: 30909
+# Append al scrape_configs di base: job dfaas-nodes federa tutte le metriche
+# dal Prometheus locale del worker (cAdvisor, node-exporter, openfaas, …).
+# File-based SD: i target sono in /etc/prometheus/file_sd/*.json (vedi
+# monitoring/targets.go).
+# Chart 29.x reads this key at top level (not under server.).
+extraScrapeConfigs: |
+  - job_name: 'dfaas-nodes'
+    honor_labels: true
+    metrics_path: /federate
+    params:
+      'match[]':
+        - '{job!=""}'
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/file_sd/*.json
+        refresh_interval: 30s

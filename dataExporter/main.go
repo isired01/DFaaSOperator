@@ -151,7 +151,10 @@ func uploadToGoogleDrive(ctx context.Context, fileName, expName, folderID, credP
 		Parents: []string{folderID},
 	}
 	fmt.Printf("📤 Upload Google Drive (folder=%s)...\n", folderID)
-	res, err := driveSvc.Files.Create(meta).Media(f).Do()
+	res, err := driveSvc.Files.Create(meta).
+		SupportsAllDrives(true).
+		Media(f).
+		Do()
 	if err != nil {
 		return fmt.Errorf("upload: %w", err)
 	}
