@@ -31,7 +31,8 @@ import (
 //   - dfaas-worker        → setup-nodes.yml (base OS + dFaaS install)
 //   - k6-load-generator   → setup-k6-nodes.yml (k3s + k6-operator)
 func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment,
-	role dfaasv1.NodeRole, jobSuffix string) (*batchv1.Job, *corev1.Secret, error) {
+	role dfaasv1.NodeRole, jobSuffix string,
+	libp2pKeys map[string]string) (*batchv1.Job, *corev1.Secret, error) {
 
 	nodes := env.NodesWithRole(role)
 	if len(nodes) == 0 {
@@ -52,7 +53,7 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 	playbookFile := playbookFileForRole(role)
 	playbookCMName := playbookConfigMapName(env, role)
 
-	inventory := buildInventory(env, role, nodes)
+	inventory := buildInventory(env, role, nodes, libp2pKeys)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-ansible-%s-inventory", env.Name, jobSuffix),
@@ -129,15 +130,28 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 // buildInventory builds the Ansible inventory text for the given role + node
 // subset. Only dfaas-worker nodes get bootstrap-peer + balancing-strategy
 // vars; k6 nodes get a minimal inventory.
-func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole, nodes []dfaasv1.EnvironmentNode) string {
+//
+// libp2pKeys maps nodeID → base64 PKCS#8 ed25519 key, populated by
+// EnsureLibp2pKeys for dfaas-worker nodes. Precedence: spec.PrivateKey wins
+// when non-empty; otherwise the operator-managed key from libp2pKeys is used.
+func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole,
+	nodes []dfaasv1.EnvironmentNode, libp2pKeys map[string]string) string {
 	var inv string
 	switch role {
 	case dfaasv1.RoleDfaasWorker:
 		inv = "[target_Nodess]\n"
 
-		firstPeerID, _ := calcolaPeerID(nodes[0].PrivateKey)
+		keyForNode := func(n dfaasv1.EnvironmentNode) string {
+			if n.PrivateKey != "" {
+				return n.PrivateKey
+			}
+			return libp2pKeys[n.NodeID]
+		}
+
+		firstPeerID, _ := calcolaPeerID(keyForNode(nodes[0]))
 		for i, n := range nodes {
-			peerID, err := calcolaPeerID(n.PrivateKey)
+			privKey := keyForNode(n)
+			peerID, err := calcolaPeerID(privKey)
 			if err != nil {
 				peerID = "error-key"
 			}
@@ -152,7 +166,7 @@ func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole, nodes []dfa
 					"node_priv_key='%s' dfaas_agent_id='%s' is_bootstrap=%t bootstrap_address='%s' "+
 					"balancing_strategy='%s'\n",
 				n.IPAddress, n.Username, n.Password, string(fnJSON),
-				n.PrivateKey, peerID, isBootstrap, bootstrap, n.BalancingStrategy,
+				privKey, peerID, isBootstrap, bootstrap, string(n.BalancingStrategy),
 			)
 		}
 	case dfaasv1.RoleK6LoadGenerator:

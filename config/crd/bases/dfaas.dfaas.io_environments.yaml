@@ -55,8 +55,18 @@ spec:
                   description: EnvironmentNode declares one machine in the federation.
                   properties:
                     balancingStrategy:
-                      description: BalancingStrategy is meaningful only for dfaas-worker
-                        nodes.
+                      description: |-
+                        BalancingStrategy is meaningful only for dfaas-worker nodes.
+                        Accepted values are the canonical strategy names recognised by
+                        dfaas-agent (AGENT_STRATEGY env var). Typos that look like
+                        "alllocal" silently fall back to recalcstrategy and crash on
+                        missing dfaas.maxrate, so the enum guard is the safety net.
+                      enum:
+                      - staticstrategy
+                      - nodemarginstrategy
+                      - recalcstrategy
+                      - alllocalstrategy
+                      - rlagentstrategy
                       type: string
                     capacity:
                       description: NodeCapacity expresses the relative CPU/RAM budget
@@ -80,6 +90,16 @@ spec:
                           maxInflight:
                             default: 400
                             type: integer
+                          maxRate:
+                            default: 100
+                            description: |-
+                              MaxRate is the per-function request rate cap (req/s) consumed by
+                              recalcstrategy. Emitted as OpenFaaS label `dfaas.maxrate` at deploy.
+                              Required for recalcstrategy; ignored by staticstrategy and
+                              alllocalstrategy.
+                            format: int32
+                            minimum: 1
+                            type: integer
                           name:
                             type: string
                           timeoutMs:
@@ -89,6 +109,7 @@ spec:
                         - execTimeout
                         - image
                         - maxInflight
+                        - maxRate
                         - name
                         - timeoutMs
                         type: object

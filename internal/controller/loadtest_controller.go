@@ -22,6 +22,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -74,7 +75,37 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	// Block until Environment is Ready.
+	// Strict create-time gate: a LoadTest may only enter the FSM if its
+	// Environment is already Ready. Submitting a LoadTest against a
+	// Pending / Provisioning / Failed Environment fails fast with an
+	// explanatory message — no quiet Pending limbo waiting on infra that
+	// may never come up. Only runs on the very first reconcile
+	// (`phase == ""`); once the LoadTest has moved past it, Environment
+	// drift out of Ready does NOT retroactively cancel the run.
+	if lt.Status.Phase == "" && env.Status.Phase != dfaasv1.EnvReady {
+		return r.failLoadTest(ctx, &lt,
+			fmt.Sprintf("environment %q is %q; it must be Ready before creating a LoadTest",
+				env.Name, env.Status.Phase))
+	}
+
+	// Stamp an OwnerReference Environment → LoadTest on first encounter so
+	// `kubectl delete environment` cascades into the dependent LoadTests via
+	// Kubernetes garbage collection. SetOwnerReference (not Controller) is
+	// the correct choice: a LoadTest is owned-by an Environment for GC
+	// purposes but is NOT controlled-by it (LoadTestReconciler is the
+	// controller). Idempotent: skip the Update when the ref is already there.
+	if !hasOwnerRef(&lt, &env) {
+		if err := controllerutil.SetOwnerReference(&env, &lt, r.Scheme); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.Update(ctx, &lt); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Block while Environment is mid-flight (only reachable post-first-reconcile
+	// when the Environment drifts out of Ready, e.g. spec edited).
 	if env.Status.Phase != dfaasv1.EnvReady {
 		logger.Info("waiting for environment", "env", env.Name, "phase", env.Status.Phase)
 		return r.setLoadTestPhase(ctx, &lt, dfaasv1.LoadTestPending)
@@ -137,6 +168,19 @@ func (r *LoadTestReconciler) setLoadTestCondition(ctx context.Context,
 		})
 		return r.Status().Update(ctx, latest)
 	})
+}
+
+// hasOwnerRef reports whether lt already lists env among its OwnerReferences.
+// Match is by UID (controllerutil.SetOwnerReference also matches by UID, so
+// this gate avoids needless Updates on every reconcile once the ref is in
+// place).
+func hasOwnerRef(lt *dfaasv1.LoadTest, env *dfaasv1.Environment) bool {
+	for _, o := range lt.OwnerReferences {
+		if o.UID == env.UID {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *LoadTestReconciler) SetupWithManager(mgr ctrl.Manager) error {

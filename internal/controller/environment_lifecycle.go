@@ -51,14 +51,22 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 }
 
 // reconcileProvisioningVMs creates an Ansible Job that runs the base-OS +
-// dFaaS playbook against the dfaas-worker nodes.
+// dFaaS playbook against the dfaas-worker nodes. Before the Job is created,
+// it materializes operator-managed libp2p keys for any dfaas-worker node that
+// did not ship a `privateKey` in spec.
 func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
+	am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
+	keys, err := am.EnsureLibp2pKeys(ctx, env)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	return r.runAnsiblePhase(ctx, env,
 		dfaasv1.RoleDfaasWorker,
 		"vms",
 		dfaasv1.EnvProvisioningK6,
 		"VMsProvisioned",
+		keys,
 	)
 }
 
@@ -71,17 +79,20 @@ func (r *EnvironmentReconciler) reconcileProvisioningK6(ctx context.Context,
 		"k6",
 		dfaasv1.EnvProvisioningMonitoring,
 		"K6Provisioned",
+		nil,
 	)
 }
 
 // runAnsiblePhase is the shared "ensure Ansible Job, wait, advance phase"
 // loop used by both VM and K6 provisioning. jobSuffix becomes part of the Job
 // name; nextPhase is the phase to advance to on success; reason is the
-// condition reason stamped on completion.
+// condition reason stamped on completion. libp2pKeys is the operator-managed
+// libp2p key map (dfaas-worker role only; nil for k6).
 func (r *EnvironmentReconciler) runAnsiblePhase(ctx context.Context,
 	env *dfaasv1.Environment,
 	role dfaasv1.NodeRole, jobSuffix string,
 	nextPhase dfaasv1.EnvironmentPhase, reason string,
+	libp2pKeys map[string]string,
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -100,7 +111,7 @@ func (r *EnvironmentReconciler) runAnsiblePhase(ctx context.Context,
 		logger.Info("creating Ansible Job for phase", "role", role, "job", jobName)
 
 		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
-		newJob, secret, err := am.CreateJobForRole(ctx, env, role, jobSuffix)
+		newJob, secret, err := am.CreateJobForRole(ctx, env, role, jobSuffix, libp2pKeys)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -120,6 +131,18 @@ func (r *EnvironmentReconciler) runAnsiblePhase(ctx context.Context,
 
 	if job.Status.Succeeded > 0 {
 		logger.Info("Ansible Job succeeded", "job", jobName)
+		// Set TTLSecondsAfterFinished only on success so the Job-controller
+		// garbage-collects the pod chain ~10 min after Complete. On Failed we
+		// intentionally leave TTL unset → pods stick around for forensics
+		// until the Environment CR is deleted (cascade via OwnerRef).
+		if job.Spec.TTLSecondsAfterFinished == nil {
+			patched := job.DeepCopy()
+			ttl := int32(600)
+			patched.Spec.TTLSecondsAfterFinished = &ttl
+			if err := r.Patch(ctx, patched, client.MergeFrom(&job)); err != nil {
+				logger.Error(err, "patch TTL on successful Ansible Job", "job", jobName)
+			}
+		}
 		_ = r.setEnvCondition(ctx, env, "InfrastructureReady", metav1.ConditionTrue,
 			reason, "Ansible Job "+jobName+" completed")
 		return r.setEnvPhase(ctx, env, nextPhase)
@@ -179,7 +202,7 @@ func (r *EnvironmentReconciler) syncNodeStatus(ctx context.Context, env *dfaasv1
 				k6 = append(k6, dfaasv1.K6NodeStatus{
 					NodeID:           n.NodeID,
 					IPAddress:        n.IPAddress,
-					KubeconfigSecret: n.NodeID + "-kubeconfig",
+					KubeconfigSecret: latest.Name + "-" + n.NodeID + "-kubeconfig",
 				})
 			case dfaasv1.RoleDfaasWorker:
 				dfaas = append(dfaas, n.NodeID)

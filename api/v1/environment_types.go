@@ -48,8 +48,13 @@ type EnvironmentNode struct {
 	PrivateKey string `json:"privateKey,omitempty"`
 
 	// BalancingStrategy is meaningful only for dfaas-worker nodes.
+	// Accepted values are the canonical strategy names recognised by
+	// dfaas-agent (AGENT_STRATEGY env var). Typos that look like
+	// "alllocal" silently fall back to recalcstrategy and crash on
+	// missing dfaas.maxrate, so the enum guard is the safety net.
+	// +kubebuilder:validation:Enum=staticstrategy;nodemarginstrategy;recalcstrategy;alllocalstrategy;rlagentstrategy
 	// +optional
-	BalancingStrategy string `json:"balancingStrategy,omitempty"`
+	BalancingStrategy BalancingStrategy `json:"balancingStrategy,omitempty"`
 
 	// Functions to deploy on a dfaas-worker node.
 	// +optional

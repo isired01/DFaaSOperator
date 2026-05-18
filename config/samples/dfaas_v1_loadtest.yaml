@@ -20,8 +20,7 @@ spec:
     # stdout between markers "----- BEGIN CSV -----" / "----- END CSV -----"
     # (retrievable via `kubectl logs job/<loadtest>-exporter-job`).
     # To enable Drive upload, set folderId + credentialsSecretRef and create
-    # the Secret out-of-band (see CLAUDE.md "Google Drive export — Secret
-    # provisioning"). Requires a Shared Drive (Workspace).
+    # the Secret out-of-band. Requires a Shared Drive (Workspace).
     # googleDrive:
     #   folderId: <shared-drive-folder-id>
     #   credentialsSecretRef: google-credentials-secret

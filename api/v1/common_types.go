@@ -57,6 +57,14 @@ type Function struct {
 
 	// +kubebuilder:default=6000
 	TimeoutMs int `json:"timeoutMs"`
+
+	// MaxRate is the per-function request rate cap (req/s) consumed by
+	// recalcstrategy. Emitted as OpenFaaS label `dfaas.maxrate` at deploy.
+	// Required for recalcstrategy; ignored by staticstrategy and
+	// alllocalstrategy.
+	// +kubebuilder:default=100
+	// +kubebuilder:validation:Minimum=1
+	MaxRate int32 `json:"maxRate"`
 }
 
 // Topology declares inter-node network shaping (latency injection).

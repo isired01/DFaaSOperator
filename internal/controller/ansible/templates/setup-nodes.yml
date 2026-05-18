@@ -195,6 +195,7 @@
           --env=exec_timeout={{ item.execTimeout }}s
           --env=max_inflight={{ item.maxInflight }}
           --label=dfaas.timeout_ms={{ item.timeoutMs }}
+          --label=dfaas.maxrate={{ item.maxRate | default(100) }}
       loop: "{{ node_specific_functions | default([]) }}"
       when: node_specific_functions is defined and (node_specific_functions | length) > 0
 
