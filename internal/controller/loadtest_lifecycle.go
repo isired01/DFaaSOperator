@@ -194,7 +194,7 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 	lt *dfaasv1.LoadTest, _ *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	jobName := lt.Name + "-exporter-job"
+	jobName := ExporterJobName(lt)
 	var job batchv1.Job
 	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: lt.Namespace}, &job)
 

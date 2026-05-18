@@ -53,7 +53,8 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 // reconcileProvisioningVMs creates an Ansible Job that runs the base-OS +
 // dFaaS playbook against the dfaas-worker nodes. Before the Job is created,
 // it materializes operator-managed libp2p keys for any dfaas-worker node that
-// did not ship a `privateKey` in spec.
+// did not ship a `privateKey` in spec. Phase advances to ProvisioningInfra
+// (parallel K6 + Monitoring) once the Job succeeds.
 func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
 	am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
@@ -64,30 +65,134 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 	return r.runAnsiblePhase(ctx, env,
 		dfaasv1.RoleDfaasWorker,
 		"vms",
-		dfaasv1.EnvProvisioningK6,
+		dfaasv1.EnvProvisioningInfra,
 		"VMsProvisioned",
 		keys,
 	)
 }
 
-// reconcileProvisioningK6 creates an Ansible Job that runs the k3s + k6
-// playbook against the k6-load-generator nodes.
-func (r *EnvironmentReconciler) reconcileProvisioningK6(ctx context.Context,
+// reconcileProvisioningInfra runs the K6 Ansible Job and the monitoring stack
+// install concurrently (side-by-side resources, not goroutines). Fan-in:
+// advances to Ready only when BOTH have reached a terminal state and both
+// succeeded; transitions to Failed only after BOTH have settled, so the
+// Conditions reflect a coherent picture (e.g. "K6 failed, Monitoring OK")
+// rather than aborting one mid-flight.
+func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
-	return r.runAnsiblePhase(ctx, env,
-		dfaasv1.RoleK6LoadGenerator,
-		"k6",
-		dfaasv1.EnvProvisioningMonitoring,
-		"K6Provisioned",
-		nil,
-	)
+
+	k6Done, k6Failed, err := r.ensureK6Job(ctx, env)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	monDone, monFailed, err := r.ensureMonitoring(ctx, env)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	k6Terminal := k6Done || k6Failed
+	monTerminal := monDone || monFailed
+	if !(k6Terminal && monTerminal) {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	if k6Failed || monFailed {
+		_ = r.setEnvCondition(ctx, env, "InfrastructureReady", metav1.ConditionFalse,
+			"InfraFailed", "K6 or Monitoring provisioning failed; inspect K6Ready and MonitoringReady conditions")
+		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
+	}
+	_ = r.setEnvCondition(ctx, env, "InfrastructureReady", metav1.ConditionTrue,
+		"InfraReady", "K6 and Monitoring provisioning completed")
+	if err := r.syncNodeStatus(ctx, env); err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.setEnvPhase(ctx, env, dfaasv1.EnvReady)
+}
+
+// ensureK6Job is the non-advancing variant of runAnsiblePhase used by the
+// parallel ProvisioningInfra fan-in. Returns done/failed flags and stamps the
+// K6Ready Condition; never calls setEnvPhase.
+func (r *EnvironmentReconciler) ensureK6Job(ctx context.Context,
+	env *dfaasv1.Environment) (done bool, failed bool, err error) {
+	logger := log.FromContext(ctx)
+
+	if !env.HasNodeWithRole(dfaasv1.RoleK6LoadGenerator) {
+		logger.Info("no k6-load-generator nodes, skipping K6 phase")
+		_ = r.setEnvCondition(ctx, env, "K6Ready", metav1.ConditionTrue,
+			"NoK6Nodes", "no k6-load-generator nodes in spec — phase skipped")
+		return true, false, nil
+	}
+
+	jobName := ansible.JobNameForRole(env, "k6")
+	var job batchv1.Job
+	getErr := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: env.Namespace}, &job)
+
+	if apierrors.IsNotFound(getErr) {
+		logger.Info("creating Ansible Job for K6", "job", jobName)
+		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
+		newJob, secret, err := am.CreateJobForRole(ctx, env, dfaasv1.RoleK6LoadGenerator, "k6", nil)
+		if err != nil {
+			return false, false, err
+		}
+		if err := r.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
+			return false, false, err
+		}
+		if err := r.Create(ctx, newJob); err != nil && !apierrors.IsAlreadyExists(err) {
+			return false, false, err
+		}
+		_ = r.setEnvCondition(ctx, env, "K6Ready", metav1.ConditionFalse,
+			"AnsibleRunning", "K6 Ansible Job started")
+		return false, false, nil
+	}
+	if getErr != nil {
+		return false, false, getErr
+	}
+
+	if job.Status.Succeeded > 0 {
+		patchJobTTL(ctx, r.Client, &job, 600)
+		_ = r.setEnvCondition(ctx, env, "K6Ready", metav1.ConditionTrue,
+			"K6Provisioned", "K6 Ansible Job "+jobName+" completed")
+		return true, false, nil
+	}
+	if job.Status.Failed > 0 {
+		patchJobTTL(ctx, r.Client, &job, 86400)
+		_ = r.setEnvCondition(ctx, env, "K6Ready", metav1.ConditionFalse,
+			"AnsibleFailed", "K6 Ansible Job "+jobName+" failed; check logs")
+		return false, true, nil
+	}
+	_ = r.setEnvCondition(ctx, env, "K6Ready", metav1.ConditionFalse,
+		"AnsibleRunning", "K6 Ansible Job "+jobName+" in progress")
+	return false, false, nil
+}
+
+// ensureMonitoring is the non-advancing variant of the monitoring-stack
+// provisioning step. Returns done/failed and stamps MonitoringReady.
+// Currently the monitoring stack can only be "not ready" or "ready" — there
+// is no explicit failure path from Helm + check, so `failed` stays false and
+// the operator simply requeues forever. Plumbed for future hardening.
+func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
+	env *dfaasv1.Environment) (done bool, failed bool, err error) {
+
+	mm := &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
+	if err := mm.Deploy(ctx); err != nil {
+		_ = r.setEnvCondition(ctx, env, "MonitoringReady", metav1.ConditionFalse,
+			"HelmInstalling", "monitoring Helm install in progress / retrying: "+err.Error())
+		return false, false, nil
+	}
+	ready, _ := mm.Check(ctx)
+	if !ready {
+		_ = r.setEnvCondition(ctx, env, "MonitoringReady", metav1.ConditionFalse,
+			"WaitingPods", "monitoring pods not Ready yet")
+		return false, false, nil
+	}
+
+	_ = r.setEnvCondition(ctx, env, "MonitoringReady", metav1.ConditionTrue,
+		"PodsRunning", "monitoring stack up")
+	_ = mm.ReconcileTargets(ctx, env)
+	return true, false, nil
 }
 
 // runAnsiblePhase is the shared "ensure Ansible Job, wait, advance phase"
-// loop used by both VM and K6 provisioning. jobSuffix becomes part of the Job
-// name; nextPhase is the phase to advance to on success; reason is the
-// condition reason stamped on completion. libp2pKeys is the operator-managed
-// libp2p key map (dfaas-worker role only; nil for k6).
+// loop used by VM provisioning (the only remaining sequential phase). For
+// the parallel K6 + Monitoring phase use the non-advancing helpers above.
 func (r *EnvironmentReconciler) runAnsiblePhase(ctx context.Context,
 	env *dfaasv1.Environment,
 	role dfaasv1.NodeRole, jobSuffix string,
@@ -96,7 +201,7 @@ func (r *EnvironmentReconciler) runAnsiblePhase(ctx context.Context,
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	jobName := env.Name + "-infra-" + jobSuffix + "-job"
+	jobName := ansible.JobNameForRole(env, jobSuffix)
 	var job batchv1.Job
 	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: env.Namespace}, &job)
 
@@ -131,24 +236,14 @@ func (r *EnvironmentReconciler) runAnsiblePhase(ctx context.Context,
 
 	if job.Status.Succeeded > 0 {
 		logger.Info("Ansible Job succeeded", "job", jobName)
-		// Set TTLSecondsAfterFinished only on success so the Job-controller
-		// garbage-collects the pod chain ~10 min after Complete. On Failed we
-		// intentionally leave TTL unset → pods stick around for forensics
-		// until the Environment CR is deleted (cascade via OwnerRef).
-		if job.Spec.TTLSecondsAfterFinished == nil {
-			patched := job.DeepCopy()
-			ttl := int32(600)
-			patched.Spec.TTLSecondsAfterFinished = &ttl
-			if err := r.Patch(ctx, patched, client.MergeFrom(&job)); err != nil {
-				logger.Error(err, "patch TTL on successful Ansible Job", "job", jobName)
-			}
-		}
+		patchJobTTL(ctx, r.Client, &job, 600)
 		_ = r.setEnvCondition(ctx, env, "InfrastructureReady", metav1.ConditionTrue,
 			reason, "Ansible Job "+jobName+" completed")
 		return r.setEnvPhase(ctx, env, nextPhase)
 	}
 	if job.Status.Failed > 0 {
 		logger.Info("Ansible Job failed", "job", jobName)
+		patchJobTTL(ctx, r.Client, &job, 86400)
 		_ = r.setEnvCondition(ctx, env, "InfrastructureReady", metav1.ConditionFalse,
 			"AnsibleFailed", "Ansible Job "+jobName+" failed; check logs")
 		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
@@ -158,32 +253,21 @@ func (r *EnvironmentReconciler) runAnsiblePhase(ctx context.Context,
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-// reconcileProvisioningMonitoring installs the Helm-based Prometheus/Grafana
-// stack and writes per-environment scrape targets.
-func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Context,
-	env *dfaasv1.Environment) (ctrl.Result, error) {
-
-	mm := &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
-	if err := mm.Deploy(ctx); err != nil {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+// patchJobTTL sets Spec.TTLSecondsAfterFinished on a finished Ansible Job
+// to drive Job-controller auto-cleanup. Used with ttlSec=600 on success and
+// ttlSec=86400 (24h grace) on failure. Idempotent: skips when TTL is
+// already set so re-reconciles do not churn.
+func patchJobTTL(ctx context.Context, c client.Client, job *batchv1.Job, ttlSec int32) {
+	if job.Spec.TTLSecondsAfterFinished != nil {
+		return
 	}
-	ready, _ := mm.Check(ctx)
-	if !ready {
-		_ = r.setEnvCondition(ctx, env, "MonitoringReady", metav1.ConditionFalse,
-			"WaitingPods", "Monitoring pods not ready yet")
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	patched := job.DeepCopy()
+	ttl := ttlSec
+	patched.Spec.TTLSecondsAfterFinished = &ttl
+	if err := c.Patch(ctx, patched, client.MergeFrom(job)); err != nil {
+		log.FromContext(ctx).Error(err, "patch TTL on Ansible Job",
+			"job", job.Name, "ttlSeconds", ttlSec)
 	}
-
-	_ = r.setEnvCondition(ctx, env, "MonitoringReady", metav1.ConditionTrue,
-		"PodsRunning", "Monitoring stack up")
-	_ = mm.ReconcileTargets(ctx, env)
-
-	// Stamp k6/dfaas node summaries on the Environment so LoadTest can resolve
-	// remote clusters without walking the spec.
-	if err := r.syncNodeStatus(ctx, env); err != nil {
-		return ctrl.Result{}, err
-	}
-	return r.setEnvPhase(ctx, env, dfaasv1.EnvReady)
 }
 
 // syncNodeStatus surfaces k6/dfaas node info into status, for fast lookup by

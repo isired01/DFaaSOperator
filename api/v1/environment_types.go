@@ -13,16 +13,15 @@ package v1
 import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 // EnvironmentPhase tracks the infrastructure lifecycle.
-// +kubebuilder:validation:Enum=Idle;ProvisioningVMs;ProvisioningK6;ProvisioningMonitoring;Ready;Failed
+// +kubebuilder:validation:Enum=Idle;ProvisioningVMs;ProvisioningInfra;Ready;Failed
 type EnvironmentPhase string
 
 const (
-	EnvIdle                   EnvironmentPhase = "Idle"
-	EnvProvisioningVMs        EnvironmentPhase = "ProvisioningVMs"
-	EnvProvisioningK6         EnvironmentPhase = "ProvisioningK6"
-	EnvProvisioningMonitoring EnvironmentPhase = "ProvisioningMonitoring"
-	EnvReady                  EnvironmentPhase = "Ready"
-	EnvFailed                 EnvironmentPhase = "Failed"
+	EnvIdle              EnvironmentPhase = "Idle"
+	EnvProvisioningVMs   EnvironmentPhase = "ProvisioningVMs"
+	EnvProvisioningInfra EnvironmentPhase = "ProvisioningInfra"
+	EnvReady             EnvironmentPhase = "Ready"
+	EnvFailed            EnvironmentPhase = "Failed"
 )
 
 // EnvironmentNode declares one machine in the federation.
@@ -44,8 +43,6 @@ type EnvironmentNode struct {
 	Username string `json:"username"`
 	// +kubebuilder:validation:Required
 	Password string `json:"password"`
-	// +optional
-	PrivateKey string `json:"privateKey,omitempty"`
 
 	// BalancingStrategy is meaningful only for dfaas-worker nodes.
 	// Accepted values are the canonical strategy names recognised by

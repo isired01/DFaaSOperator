@@ -120,8 +120,6 @@ spec:
                       type: string
                     password:
                       type: string
-                    privateKey:
-                      type: string
                     role:
                       description: |-
                         NodeRole tags a node either as a dFaaS worker or as a k6 load generator
@@ -264,8 +262,7 @@ spec:
                 enum:
                 - Idle
                 - ProvisioningVMs
-                - ProvisioningK6
-                - ProvisioningMonitoring
+                - ProvisioningInfra
                 - Ready
                 - Failed
                 type: string

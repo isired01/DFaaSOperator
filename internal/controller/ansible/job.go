@@ -56,7 +56,7 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 	inventory := buildInventory(env, role, nodes, libp2pKeys)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-ansible-%s-inventory", env.Name, jobSuffix),
+			Name:      InventorySecretName(env, jobSuffix),
 			Namespace: env.Namespace,
 		},
 		StringData: map[string]string{"hosts": inventory},
@@ -64,7 +64,7 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-infra-%s-job", env.Name, jobSuffix),
+			Name:      JobNameForRole(env, jobSuffix),
 			Namespace: env.Namespace,
 		},
 		Spec: batchv1.JobSpec{
@@ -131,9 +131,10 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 // subset. Only dfaas-worker nodes get bootstrap-peer + balancing-strategy
 // vars; k6 nodes get a minimal inventory.
 //
-// libp2pKeys maps nodeID → base64 PKCS#8 ed25519 key, populated by
-// EnsureLibp2pKeys for dfaas-worker nodes. Precedence: spec.PrivateKey wins
-// when non-empty; otherwise the operator-managed key from libp2pKeys is used.
+// libp2pKeys maps nodeID → base64 PKCS#8 ed25519 key. Populated by
+// EnsureLibp2pKeys for dfaas-worker nodes (Secret-backed, generated on first
+// reconcile, optionally pre-applied for BYO peer identity). Authoritative
+// source: there is no spec field for the key.
 func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole,
 	nodes []dfaasv1.EnvironmentNode, libp2pKeys map[string]string) string {
 	var inv string
@@ -141,16 +142,9 @@ func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole,
 	case dfaasv1.RoleDfaasWorker:
 		inv = "[target_Nodess]\n"
 
-		keyForNode := func(n dfaasv1.EnvironmentNode) string {
-			if n.PrivateKey != "" {
-				return n.PrivateKey
-			}
-			return libp2pKeys[n.NodeID]
-		}
-
-		firstPeerID, _ := calcolaPeerID(keyForNode(nodes[0]))
+		firstPeerID, _ := calcolaPeerID(libp2pKeys[nodes[0].NodeID])
 		for i, n := range nodes {
-			privKey := keyForNode(n)
+			privKey := libp2pKeys[n.NodeID]
 			peerID, err := calcolaPeerID(privKey)
 			if err != nil {
 				peerID = "error-key"
@@ -194,4 +188,31 @@ func playbookConfigMapName(env *dfaasv1.Environment, role dfaasv1.NodeRole) stri
 		suffix = "k6"
 	}
 	return fmt.Sprintf("ansible-playbooks-%s-%s", suffix, env.Name)
+}
+
+// shortUID returns the first 8 chars of env.UID, or the whole UID if shorter.
+// Embedded into Job + Secret names so the reconciler never recovers a stale
+// resource from a previously-deleted Environment that happened to share the
+// same name.
+func shortUID(env *dfaasv1.Environment) string {
+	uid := string(env.UID)
+	if len(uid) > 8 {
+		return uid[:8]
+	}
+	return uid
+}
+
+// JobNameForRole returns the deterministic Ansible Job name. Includes
+// `env.UID[:8]` to scope across delete+recreate of the same env.Name, and
+// `env.Generation` so a spec edit gets a fresh Job rather than reusing the
+// previous run's status.
+func JobNameForRole(env *dfaasv1.Environment, jobSuffix string) string {
+	return fmt.Sprintf("%s-infra-%s-%s-g%d-job",
+		env.Name, jobSuffix, shortUID(env), env.Generation)
+}
+
+// InventorySecretName mirrors JobNameForRole for the per-Job inventory Secret.
+func InventorySecretName(env *dfaasv1.Environment, jobSuffix string) string {
+	return fmt.Sprintf("%s-ansible-%s-%s-g%d-inventory",
+		env.Name, jobSuffix, shortUID(env), env.Generation)
 }
