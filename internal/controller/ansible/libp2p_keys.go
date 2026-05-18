@@ -29,13 +29,12 @@ import (
 )
 
 // EnsureLibp2pKeys returns per-nodeID base64 PKCS#8 ed25519 keys for every
-// dfaas-worker node in env. Precedence at each call:
+// dfaas-worker node in env. Resolution per node:
 //
-//  1. spec.PrivateKey is non-empty → use it (never mirrored into the Secret;
-//     clearing the spec must NOT silently restore an older operator-managed key).
-//  2. operator-managed Secret <envName>-libp2p-keys carries an entry for nodeID
-//     → use it.
-//  3. otherwise generate a fresh ed25519 PKCS#8 key, persist it into the
+//  1. operator-managed Secret <envName>-libp2p-keys carries an entry for
+//     nodeID → use it (covers both auto-generated keys and the BYO escape
+//     hatch where the user pre-applies the Secret to pin a peer identity).
+//  2. otherwise generate a fresh ed25519 PKCS#8 key, persist it into the
 //     Secret, return it.
 //
 // The Secret is namespaced to env.Namespace and OwnerRef'd to env, so a
@@ -73,11 +72,6 @@ func (m *Manager) EnsureLibp2pKeys(ctx context.Context,
 	dirty := false
 	for _, n := range env.Spec.Nodes {
 		if n.Role != dfaasv1.RoleDfaasWorker {
-			continue
-		}
-
-		if n.PrivateKey != "" {
-			out[n.NodeID] = n.PrivateKey
 			continue
 		}
 

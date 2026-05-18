@@ -12,7 +12,6 @@ spec:
       capacity: MEDIUM
       username: isaia
       password: root
-      privateKey: MC4CAQAwBQYDK2VwBCIEIODgFN+A8KkNvY8ozKDMXdQV2fehNH43Ba+MYpOzihsJ
       balancingStrategy: alllocalstrategy
       functions:
         - name: figlet

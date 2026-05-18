@@ -37,9 +37,13 @@ The operator ships as a single Deployment that runs **two controllers** against 
 
 ### `Environment`
 ```
-"" / Idle / Failed → ProvisioningVMs → ProvisioningK6 → ProvisioningMonitoring → Ready
+"" / Idle / Failed → ProvisioningVMs → ProvisioningInfra → Ready
+                                       ├─ K6 Ansible Job ─┐
+                                       └─ Monitoring Helm ┘  (parallel; fan-in)
 ```
-Re-provisioning only runs when `spec.generation` changes. A finalizer (`dfaas.dfaas.io/environment-finalizer`) cleans per-environment Prometheus scrape-target entries on delete.
+`ProvisioningInfra` runs the K6 Ansible Job and the Helm-based monitoring install concurrently and advances to `Ready` only when **both** terminate. If either fails the surviving stream is still allowed to finish, then the phase becomes `Failed` with per-component `K6Ready` / `MonitoringReady` Conditions for granular diagnosis.
+
+Re-provisioning only runs when `spec.generation` changes. A finalizer (`dfaas.dfaas.io/environment-finalizer`) cleans per-environment Prometheus scrape-target entries on delete. Ansible Jobs auto-cleanup with `TTLSecondsAfterFinished=600` on success and `86400` (24h) on failure.
 
 ### `LoadTest`
 ```
@@ -129,4 +133,4 @@ The management-cluster Prometheus federates worker metrics via `/federate?match[
 - **Balancing strategies — partial support.** Supported out of the box: `staticstrategy`, `alllocalstrategy`, `recalcstrategy`. The latter requires `Function.maxRate` (emitted as `dfaas.maxrate` OpenFaaS label). `nodemarginstrategy` and `rlagentstrategy` have incomplete upstream documentation and may require additional labels not yet emitted by the operator — use them at your own risk.
 
 > [!IMPORTANT]
-> Target VMs must be reachable via SSH from the cluster network and the credentials in `Environment.spec.nodes[].password` / `privateKey` must be valid before applying the manifest. The operator does **not** distribute SSH keys.
+> Target VMs must be reachable via SSH from the cluster network and the credentials in `Environment.spec.nodes[].password` must be valid before applying the manifest. The operator does **not** distribute SSH keys. (The dFaaS Agent libp2p identity is handled separately via the operator-managed `<env>-libp2p-keys` Secret — see CLAUDE.md.)

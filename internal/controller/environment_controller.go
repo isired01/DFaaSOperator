@@ -72,13 +72,11 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
 	case dfaasv1.EnvProvisioningVMs:
 		return r.reconcileProvisioningVMs(ctx, &env)
-	case dfaasv1.EnvProvisioningK6:
-		return r.reconcileProvisioningK6(ctx, &env)
-	case dfaasv1.EnvProvisioningMonitoring:
-		return r.reconcileProvisioningMonitoring(ctx, &env)
+	case dfaasv1.EnvProvisioningInfra:
+		return r.reconcileProvisioningInfra(ctx, &env)
 	case dfaasv1.EnvReady:
 		// Generation drifted: restart from VMs.
-		return r.setEnvPhase(ctx, &env, dfaasv1.EnvReady)
+		return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
 	}
 	return ctrl.Result{}, nil
 }

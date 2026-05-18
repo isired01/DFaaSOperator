@@ -11,6 +11,7 @@ You may obtain a copy of the License at
 package controller
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -21,6 +22,18 @@ import (
 
 	dfaasv1 "dfaas-operator/api/v1"
 )
+
+// ExporterJobName composes the deterministic exporter Job name including
+// `lt.UID[:8]` and `lt.Generation`, so re-running a LoadTest after a spec
+// edit (or a delete + recreate with the same name) never recovers a stale
+// Job from the previous incarnation.
+func ExporterJobName(lt *dfaasv1.LoadTest) string {
+	uid := string(lt.UID)
+	if len(uid) > 8 {
+		uid = uid[:8]
+	}
+	return fmt.Sprintf("%s-exporter-%s-g%d-job", lt.Name, uid, lt.Generation)
+}
 
 // createExporterJob builds the in-cluster Job that runs the dfaas-exporter
 // image to pull metrics from Prometheus over [startTime, endTime] and either
@@ -65,7 +78,7 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, 
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      lt.Name + "-exporter-job",
+			Name:      ExporterJobName(lt),
 			Namespace: lt.Namespace,
 		},
 		Spec: batchv1.JobSpec{
