@@ -58,8 +58,11 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Terminal phases — no-op.
-	if lt.Status.Phase == dfaasv1.LoadTestCompleted || lt.Status.Phase == dfaasv1.LoadTestFailed {
+	// Terminal phases — no-op. Aborted is included so re-PATCHing
+	// spec.stop on an already-aborted CR is a silent no-op.
+	if lt.Status.Phase == dfaasv1.LoadTestCompleted ||
+		lt.Status.Phase == dfaasv1.LoadTestFailed ||
+		lt.Status.Phase == dfaasv1.LoadTestAborted {
 		return ctrl.Result{}, nil
 	}
 
@@ -75,6 +78,22 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
+	// Abort short-circuit. User PATCHed spec.stop=true: dispatch remote
+	// TestRun deletions across all k6 nodes, then mark the CR terminal as
+	// Aborted (the CR persists as a historical record — no deletion).
+	// Only honored from "" / Pending / Running per user-confirmed scope.
+	// Drafts (suspended=true, phase=Pending) are allowed: abortLoadTest is
+	// a no-op on the remote side (no TestRuns dispatched yet) and just
+	// flips phase to Aborted as an "abandoned draft" historical marker.
+	if lt.Spec.Stop {
+		inAbortWindow := lt.Status.Phase == "" ||
+			lt.Status.Phase == dfaasv1.LoadTestPending ||
+			lt.Status.Phase == dfaasv1.LoadTestRunning
+		if inAbortWindow {
+			return r.abortLoadTest(ctx, &lt, &env)
+		}
+	}
+
 	// Strict create-time gate: a LoadTest may only enter the FSM if its
 	// Environment is already Ready. Submitting a LoadTest against a
 	// Pending / Provisioning / Failed Environment fails fast with an
@@ -82,7 +101,11 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// may never come up. Only runs on the very first reconcile
 	// (`phase == ""`); once the LoadTest has moved past it, Environment
 	// drift out of Ready does NOT retroactively cancel the run.
-	if lt.Status.Phase == "" && env.Status.Phase != dfaasv1.EnvReady {
+	//
+	// RELAXED for drafts: when spec.suspended is true the LoadTest is
+	// just saved, not executed, so the Environment does not need to be
+	// Ready yet. Existence is still required (NotFound above fails).
+	if lt.Status.Phase == "" && !lt.Spec.Suspended && env.Status.Phase != dfaasv1.EnvReady {
 		return r.failLoadTest(ctx, &lt,
 			fmt.Sprintf("environment %q is %q; it must be Ready before creating a LoadTest",
 				env.Name, env.Status.Phase))
@@ -104,11 +127,36 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Block while Environment is mid-flight (only reachable post-first-reconcile
-	// when the Environment drifts out of Ready, e.g. spec edited).
-	if env.Status.Phase != dfaasv1.EnvReady {
-		logger.Info("waiting for environment", "env", env.Name, "phase", env.Status.Phase)
-		return r.setLoadTestPhase(ctx, &lt, dfaasv1.LoadTestPending)
+	// Run-once guard + suspended gate. Only consult spec.suspended in the
+	// pre-execution window (phase empty or Pending). Once the test has
+	// entered Running/Exporting (or terminal, already short-circuited above)
+	// spec.suspended changes are ignored — the state machine is immutable.
+	preExecution := lt.Status.Phase == "" || lt.Status.Phase == dfaasv1.LoadTestPending
+	if preExecution {
+		if lt.Spec.Suspended {
+			// Suspended gate: stamp the Condition and hold at Pending.
+			// Mirrors batch/v1.Job.spec.suspend semantics — no new phase.
+			_ = r.setLoadTestCondition(ctx, &lt, "Suspended", metav1.ConditionTrue,
+				"DraftSaved",
+				"LoadTest saved as draft — PATCH spec.suspended=false to start")
+			if lt.Status.Phase == "" {
+				return r.setLoadTestPhase(ctx, &lt, dfaasv1.LoadTestPending)
+			}
+			return ctrl.Result{}, nil
+		}
+
+		// Not suspended (or just un-suspended): flip the Condition to False
+		// so the UI clears the Draft badge before the phase machine fires.
+		_ = r.setLoadTestCondition(ctx, &lt, "Suspended", metav1.ConditionFalse,
+			"Activated", "LoadTest is active")
+
+		// Block while Environment is mid-flight (only reachable
+		// post-first-reconcile or when un-suspending a draft against an
+		// Environment that is not Ready yet).
+		if env.Status.Phase != dfaasv1.EnvReady {
+			logger.Info("waiting for environment", "env", env.Name, "phase", env.Status.Phase)
+			return r.setLoadTestPhase(ctx, &lt, dfaasv1.LoadTestPending)
+		}
 	}
 
 	// Phase machine.

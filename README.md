@@ -37,20 +37,22 @@ The operator ships as a single Deployment that runs **two controllers** against 
 
 ### `Environment`
 ```
-"" / Idle / Failed → ProvisioningVMs → ProvisioningInfra → Ready
-                                       ├─ K6 Ansible Job ─┐
-                                       └─ Monitoring Helm ┘  (parallel; fan-in)
+"" / Idle / Failed → ProvisioningVMs            → ProvisioningInfra                              → ProvisioningMonitoring → Ready
+                     (no-op placeholder)          ├─ Ansible dfaas-worker Job ─┐                  (Helm install seq)
+                                                  └─ Ansible k6-load-gen Job  ─┘  parallel; fan-in
 ```
-`ProvisioningInfra` runs the K6 Ansible Job and the Helm-based monitoring install concurrently and advances to `Ready` only when **both** terminate. If either fails the surviving stream is still allowed to finish, then the phase becomes `Failed` with per-component `K6Ready` / `MonitoringReady` Conditions for granular diagnosis.
+`ProvisioningVMs` is a no-op placeholder for future VM-lifecycle integration (terraform / cloud-init / Cluster API). `ProvisioningInfra` runs the two Ansible Jobs concurrently and advances only when **both** terminate; if either fails the surviving stream is still allowed to finish, then the phase becomes `Failed` with per-component `DfaasWorkersReady` / `K6Ready` Conditions for granular diagnosis. `ProvisioningMonitoring` is sequential: Helm install Prometheus + Grafana + scrape-target reconcile.
 
 Re-provisioning only runs when `spec.generation` changes. A finalizer (`dfaas.dfaas.io/environment-finalizer`) cleans per-environment Prometheus scrape-target entries on delete. Ansible Jobs auto-cleanup with `TTLSecondsAfterFinished=600` on success and `86400` (24h) on failure.
 
 ### `LoadTest`
 ```
+Pending (Conditions[Suspended]=True)   ← Save as Draft (spec.suspended=true)
+   on PATCH spec.suspended=false:
 Pending → Running → Exporting → Completed
                               ↘ Failed
 ```
-The reconciler watches the target `Environment`: a Pending LoadTest auto-resumes when the env reaches `Ready`.
+The reconciler watches the target `Environment`: a Pending LoadTest auto-resumes when the env reaches `Ready`. A LoadTest created with `spec.suspended: true` (used by the UI for "Save as Draft") stays at `Pending` with `Conditions[Suspended]=True` until the user PATCHes `spec.suspended: false`; mirrors `batch/v1.Job.spec.suspend`. Run-once: once the LoadTest enters `Running`/`Exporting`/`Completed`/`Failed`, further changes to `spec.suspended` are ignored.
 
 ## 🧩 Components
 

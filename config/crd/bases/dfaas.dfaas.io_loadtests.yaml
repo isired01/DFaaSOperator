@@ -70,11 +70,60 @@ spec:
                     - credentialsSecretRef
                     - folderId
                     type: object
-                  queries:
-                    description: PromQL queries pipe-joined and passed to the exporter
-                      as $QUERIES.
+                  metrics:
+                    description: |-
+                      Metrics is the structured list of entries to export. Replaces the
+                      old plaintext Queries []string; the new shape carries type, alias
+                      and free-text comment alongside the PromQL string. Passed to the
+                      exporter Job as the JSON-encoded env var METRICS_JSON.
                     items:
-                      type: string
+                      description: |-
+                        MetricExportEntry describes one metric the exporter should query during
+                        the LoadTest's Exporting phase. All four fields participate in the CSV
+                        output (Type and Comment become metadata columns; MetricName is the alias
+                        the CSV uses as identifier; Query is the PromQL string actually executed).
+
+                        Naming rule: when Type=raw and MetricName is empty, the operator falls
+                        back to MetricName = Query (the bare metric name doubles as alias).
+                        When Type=custom-promql, MetricName MUST be set (no sensible default
+                        from an arbitrary expression). Enforced via the CEL XValidation below.
+                      properties:
+                        comment:
+                          description: |-
+                            Comment is free-text human description, surfaced into the CSV
+                            "comment" column for post-test analysis.
+                          type: string
+                        metricName:
+                          description: |-
+                            MetricName is the alias / identifier surfaced in the CSV "metric"
+                            column. Required when Type=custom-promql. Optional when Type=raw:
+                            if empty, the operator falls back to MetricName = Query (so the
+                            bare metric name doubles as alias).
+                          type: string
+                        query:
+                          description: |-
+                            Query is the PromQL string sent to Prometheus. For Type=raw this
+                            is a bare metric name (e.g. node_memory_MemAvailable_bytes); for
+                            Type=custom-promql it is a full expression (e.g. rate(...)).
+                            Required for both types.
+                          minLength: 1
+                          type: string
+                        type:
+                          description: |-
+                            Type is documentary — it classifies the query for the UI and the
+                            CSV "type" column. The backend executes Query verbatim regardless.
+                          enum:
+                          - raw
+                          - custom-promql
+                          type: string
+                      required:
+                      - query
+                      - type
+                      type: object
+                      x-kubernetes-validations:
+                      - message: metricName is required when type is custom-promql
+                        rule: self.type != 'custom-promql' || (has(self.metricName)
+                          && size(self.metricName) > 0)
                     minItems: 1
                     type: array
                   step:
@@ -82,7 +131,7 @@ spec:
                     description: Step for QueryRange (Go duration string).
                     type: string
                 required:
-                - queries
+                - metrics
                 type: object
               perNodeLoad:
                 description: One entry per k6-load-generator node the test should
@@ -126,6 +175,30 @@ spec:
                   type: object
                 minItems: 1
                 type: array
+              stop:
+                default: false
+                description: |-
+                  Stop, when set to true, triggers a multi-cluster cascading abort:
+                  the reconciler deletes every remote TestRun for this LoadTest across
+                  all k6-load-generator nodes, then marks the central CR terminal as
+                  Aborted (preserving it as a historical record — the CR is NOT
+                  deleted). Only honored while phase is "" / Pending / Running;
+                  PATCHes after Exporting / Completed / Failed / Aborted are ignored
+                  (the state machine is immutable post-terminal).
+                type: boolean
+              suspended:
+                default: false
+                description: |-
+                  Suspended marks the LoadTest as a "Save as Draft": when true, the
+                  reconciler keeps phase=Pending, stamps Conditions[Suspended]=True,
+                  and does NOT dispatch any k6 TestRun. PATCHing to false activates
+                  the test (the Suspended Condition flips to False, phase advances to
+                  Running). Once execution begins (phase=Running or beyond), changes
+                  to this field are ignored — the run-once guard makes the state
+                  machine immutable post-start.
+
+                  Pattern mirrors batch/v1.Job.spec.suspend.
+                type: boolean
               targetEnvironment:
                 description: Name of an Environment in the same namespace.
                 type: string
@@ -211,6 +284,7 @@ spec:
                 - Exporting
                 - Completed
                 - Failed
+                - Aborted
                 type: string
               startTime:
                 format: date-time

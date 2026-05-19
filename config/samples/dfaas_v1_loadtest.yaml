@@ -5,6 +5,16 @@ metadata:
   namespace: default
 spec:
   targetEnvironment: env-sample
+  # suspended: true   # Save-as-Draft: holds phase=Pending + stamps
+                      # Conditions[Suspended]=True, no k6 dispatch.
+                      # PATCH to false to activate. UI sets this on
+                      # create; default false for plain `kubectl apply`.
+  # stop: true        # Abort: PATCH spec.stop=true to delete every remote
+                      # TestRun across k6 nodes and transition the CR to
+                      # the terminal "Aborted" phase (CR persists as
+                      # historical record). Only honored from Pending or
+                      # Running. Stamps Conditions[Ready]=False
+                      # reason=UserAborted on completion.
   perNodeLoad:
     - nodeID: k6-gen-1
       vus: 50
@@ -13,9 +23,15 @@ spec:
         name: loadtest-sample-script
   metricsExport:
     step: 15s
-    queries:
-      - rate(node_cpu_seconds_total[1m])
-      - node_memory_MemAvailable_bytes
+    metrics:
+      - type: raw
+        metricName: mem_available
+        query: node_memory_MemAvailable_bytes
+        comment: "Memoria libera per nodo (bare metric)"
+      - type: custom-promql
+        metricName: cpu_rate
+        query: rate(node_cpu_seconds_total[1m])
+        comment: "CPU usage rate per nodo (PromQL expression)"
     # googleDrive is optional. When unset, the exporter dumps the CSV to
     # stdout between markers "----- BEGIN CSV -----" / "----- END CSV -----"
     # (retrievable via `kubectl logs job/<loadtest>-exporter-job`).

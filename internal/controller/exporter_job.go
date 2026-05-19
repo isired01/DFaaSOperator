@@ -11,8 +11,8 @@ You may obtain a copy of the License at
 package controller
 
 import (
+	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -38,8 +38,22 @@ func ExporterJobName(lt *dfaasv1.LoadTest) string {
 // createExporterJob builds the in-cluster Job that runs the dfaas-exporter
 // image to pull metrics from Prometheus over [startTime, endTime] and either
 // upload a CSV to Google Drive or print it to stdout.
-func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, endTime time.Time) *batchv1.Job {
-	queries := strings.Join(lt.Spec.MetricsExport.Queries, "|")
+func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, endTime time.Time) (*batchv1.Job, error) {
+	// Resolve raw-type defaults: when Type=raw and MetricName is empty,
+	// the bare metric name (Query) doubles as the alias. CEL validation
+	// already guarantees custom-promql entries have MetricName set.
+	resolved := make([]dfaasv1.MetricExportEntry, len(lt.Spec.MetricsExport.Metrics))
+	for i, m := range lt.Spec.MetricsExport.Metrics {
+		resolved[i] = m
+		if resolved[i].MetricName == "" && resolved[i].Type == dfaasv1.MetricTypeRaw {
+			resolved[i].MetricName = resolved[i].Query
+		}
+	}
+	metricsJSON, err := json.Marshal(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("encode metrics payload: %w", err)
+	}
+
 	step := lt.Spec.MetricsExport.Step
 	if step == "" {
 		step = "15s"
@@ -47,7 +61,7 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, 
 
 	env := []corev1.EnvVar{
 		{Name: "PROM_URL", Value: "http://prometheus-server.monitoring.svc.cluster.local:9090"},
-		{Name: "QUERIES", Value: queries},
+		{Name: "METRICS_JSON", Value: string(metricsJSON)},
 		{Name: "START_TIME", Value: startTime.UTC().Format(time.RFC3339)},
 		{Name: "END_TIME", Value: endTime.UTC().Format(time.RFC3339)},
 		{Name: "STEP", Value: step},
@@ -100,7 +114,7 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, 
 		},
 	}
 	_ = ctrl.SetControllerReference(lt, job, r.Scheme)
-	return job
+	return job, nil
 }
 
 func int32Ptr(i int32) *int32 { return &i }

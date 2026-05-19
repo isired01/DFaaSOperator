@@ -67,6 +67,34 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
+	// Generation drift: spec was edited after a successful run. Reset stale
+	// Conditions, delete previous-gen Ansible Jobs (avoid concurrent runs on
+	// the same VMs), and restart the FSM from ProvisioningVMs.
+	// observedGeneration is NOT touched here — it gets re-stamped only when
+	// the new run reaches Ready, which is the canonical signal the UI uses
+	// to compute isUpdating = (metadata.generation > status.observedGeneration).
+	// Generation drift handling. Stale-gen Job cleanup is idempotent and runs
+	// on every tick while observedGeneration trails Generation — picks up
+	// previous-gen Jobs whether the edit happened at Ready or mid-flight.
+	// Phase-reset + Conditions-reset only fire when the previous run had
+	// already reached Ready; otherwise we'd loop forever (drift block keeps
+	// resetting to VMs while VMs handler keeps advancing). Mid-flight drift
+	// is absorbed automatically because JobNameForRole embeds env.Generation,
+	// so the next ensure*Job hits NotFound and creates the new-gen Job.
+	if env.Status.ObservedGeneration > 0 && env.Status.ObservedGeneration < env.Generation {
+		if err := r.cleanupStaleGenJobs(ctx, &env); err != nil {
+			logger.Error(err, "stale-gen Job cleanup failed")
+		}
+		if env.Status.Phase == dfaasv1.EnvReady {
+			logger.Info("generation drift detected post-Ready — restarting provisioning",
+				"observed", env.Status.ObservedGeneration, "current", env.Generation)
+			if err := r.resetTransientConditions(ctx, &env); err != nil {
+				logger.Error(err, "reset transient Conditions failed")
+			}
+			return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
+		}
+	}
+
 	switch env.Status.Phase {
 	case "", dfaasv1.EnvIdle, dfaasv1.EnvFailed:
 		return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
@@ -74,6 +102,8 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.reconcileProvisioningVMs(ctx, &env)
 	case dfaasv1.EnvProvisioningInfra:
 		return r.reconcileProvisioningInfra(ctx, &env)
+	case dfaasv1.EnvProvisioningMonitoring:
+		return r.reconcileProvisioningMonitoring(ctx, &env)
 	case dfaasv1.EnvReady:
 		// Generation drifted: restart from VMs.
 		return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
@@ -81,9 +111,12 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{}, nil
 }
 
-// setEnvPhase patches status.phase, retrying on conflict to absorb informer
-// cache-lag the same way the old Esperimento reconciler did. When transitioning
+// setEnvPhase patches status.phase, retrying on conflict. When transitioning
 // into Ready it also stamps observedGeneration so future ticks short-circuit.
+// Returns no Requeue: the Status().Update emits a watch event that triggers
+// reconcile when the informer cache catches up. Returning Requeue:true here
+// would race the cache and re-fire the same phase handler for ~3s of log
+// spam until the watch event arrived.
 func (r *EnvironmentReconciler) setEnvPhase(ctx context.Context,
 	env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase) (ctrl.Result, error) {
 
@@ -98,10 +131,7 @@ func (r *EnvironmentReconciler) setEnvPhase(ctx context.Context,
 		}
 		return r.Status().Update(ctx, latest)
 	})
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{}, err
 }
 
 func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {

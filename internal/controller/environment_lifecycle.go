@@ -12,6 +12,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -50,61 +51,134 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 	return ctrl.Result{}, nil
 }
 
-// reconcileProvisioningVMs creates an Ansible Job that runs the base-OS +
-// dFaaS playbook against the dfaas-worker nodes. Before the Job is created,
-// it materializes operator-managed libp2p keys for any dfaas-worker node that
-// did not ship a `privateKey` in spec. Phase advances to ProvisioningInfra
-// (parallel K6 + Monitoring) once the Job succeeds.
+// reconcileProvisioningVMs is currently a placeholder. The VMs are assumed
+// to already exist (provisioned out-of-band).
 func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
-	am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
-	keys, err := am.EnsureLibp2pKeys(ctx, env)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	return r.runAnsiblePhase(ctx, env,
-		dfaasv1.RoleDfaasWorker,
-		"vms",
-		dfaasv1.EnvProvisioningInfra,
-		"VMsProvisioned",
-		keys,
-	)
+	log.FromContext(ctx).Info("ProvisioningVMs is a no-op placeholder — advancing",
+		"env", env.Name)
+	_ = r.setEnvCondition(ctx, env, "VMsReady", metav1.ConditionTrue,
+		"Skipped", "VMs assumed pre-existing — placeholder phase")
+	return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningInfra)
 }
 
-// reconcileProvisioningInfra runs the K6 Ansible Job and the monitoring stack
-// install concurrently (side-by-side resources, not goroutines). Fan-in:
-// advances to Ready only when BOTH have reached a terminal state and both
-// succeeded; transitions to Failed only after BOTH have settled, so the
-// Conditions reflect a coherent picture (e.g. "K6 failed, Monitoring OK")
+// reconcileProvisioningInfra runs the dfaas-worker Ansible Job and the k6
+// Ansible Job concurrently (side-by-side resources, not goroutines). Fan-in:
+// advances to ProvisioningMonitoring only when BOTH have reached a terminal
+// state and succeeded; transitions to Failed only after BOTH have settled,
+// so the Conditions reflect a coherent picture (e.g. "dfaas OK, k6 failed")
 // rather than aborting one mid-flight.
 func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
 
-	k6Done, k6Failed, err := r.ensureK6Job(ctx, env)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	monDone, monFailed, err := r.ensureMonitoring(ctx, env)
+	am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
+	libp2pKeys, err := am.EnsureLibp2pKeys(ctx, env)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
+	vmsDone, vmsFailed, err := r.ensureVMsJob(ctx, env, libp2pKeys)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	k6Done, k6Failed, err := r.ensureK6Job(ctx, env)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	vmsTerminal := vmsDone || vmsFailed
 	k6Terminal := k6Done || k6Failed
-	monTerminal := monDone || monFailed
-	if !(k6Terminal && monTerminal) {
+	if !(vmsTerminal && k6Terminal) {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
-	if k6Failed || monFailed {
+	if vmsFailed || k6Failed {
 		_ = r.setEnvCondition(ctx, env, "InfrastructureReady", metav1.ConditionFalse,
-			"InfraFailed", "K6 or Monitoring provisioning failed; inspect K6Ready and MonitoringReady conditions")
+			"InfraFailed",
+			"dfaas-worker or k6 provisioning failed; inspect DfaasWorkersReady and K6Ready conditions")
 		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
 	}
 	_ = r.setEnvCondition(ctx, env, "InfrastructureReady", metav1.ConditionTrue,
-		"InfraReady", "K6 and Monitoring provisioning completed")
+		"InfraReady", "dfaas-worker and k6 Ansible Jobs completed")
+	return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningMonitoring)
+}
+
+// reconcileProvisioningMonitoring installs Prometheus + Grafana via Helm,
+// reconciles per-environment scrape targets, and stamps node status. Runs
+// AFTER ProvisioningInfra so worker /metrics endpoints already exist when
+// the first scrape fires.
+func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Context,
+	env *dfaasv1.Environment) (ctrl.Result, error) {
+
+	done, failed, err := r.ensureMonitoring(ctx, env)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if failed {
+		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
+	}
+	if !done {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
 	if err := r.syncNodeStatus(ctx, env); err != nil {
 		return ctrl.Result{}, err
 	}
 	return r.setEnvPhase(ctx, env, dfaasv1.EnvReady)
+}
+
+// ensureVMsJob is the non-advancing variant for the dfaas-worker Ansible
+// Job, used by ProvisioningInfra fan-in. Returns done/failed flags and
+// stamps the DfaasWorkersReady Condition; never calls setEnvPhase.
+func (r *EnvironmentReconciler) ensureVMsJob(ctx context.Context,
+	env *dfaasv1.Environment, libp2pKeys map[string]string) (done bool, failed bool, err error) {
+	logger := log.FromContext(ctx)
+
+	if !env.HasNodeWithRole(dfaasv1.RoleDfaasWorker) {
+		logger.Info("no dfaas-worker nodes, skipping VMs Ansible phase")
+		_ = r.setEnvCondition(ctx, env, "DfaasWorkersReady", metav1.ConditionTrue,
+			"NoWorkers", "no dfaas-worker nodes in spec — phase skipped")
+		return true, false, nil
+	}
+
+	jobName := ansible.JobNameForRole(env, "vms")
+	var job batchv1.Job
+	getErr := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: env.Namespace}, &job)
+
+	if apierrors.IsNotFound(getErr) {
+		logger.Info("creating Ansible Job for dfaas-worker", "job", jobName)
+		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
+		newJob, secret, err := am.CreateJobForRole(ctx, env, dfaasv1.RoleDfaasWorker, "vms", libp2pKeys)
+		if err != nil {
+			return false, false, err
+		}
+		if err := r.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
+			return false, false, err
+		}
+		if err := r.Create(ctx, newJob); err != nil && !apierrors.IsAlreadyExists(err) {
+			return false, false, err
+		}
+		_ = r.setEnvCondition(ctx, env, "DfaasWorkersReady", metav1.ConditionFalse,
+			"AnsibleRunning", "dfaas-worker Ansible Job started")
+		return false, false, nil
+	}
+	if getErr != nil {
+		return false, false, getErr
+	}
+
+	if job.Status.Succeeded > 0 {
+		patchJobTTL(ctx, r.Client, &job, 600)
+		_ = r.setEnvCondition(ctx, env, "DfaasWorkersReady", metav1.ConditionTrue,
+			"VMsProvisioned", "dfaas-worker Ansible Job "+jobName+" completed")
+		return true, false, nil
+	}
+	if job.Status.Failed > 0 {
+		patchJobTTL(ctx, r.Client, &job, 86400)
+		_ = r.setEnvCondition(ctx, env, "DfaasWorkersReady", metav1.ConditionFalse,
+			"AnsibleFailed", "dfaas-worker Ansible Job "+jobName+" failed; check logs")
+		return false, true, nil
+	}
+	_ = r.setEnvCondition(ctx, env, "DfaasWorkersReady", metav1.ConditionFalse,
+		"AnsibleRunning", "dfaas-worker Ansible Job "+jobName+" in progress")
+	return false, false, nil
 }
 
 // ensureK6Job is the non-advancing variant of runAnsiblePhase used by the
@@ -190,69 +264,6 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 	return true, false, nil
 }
 
-// runAnsiblePhase is the shared "ensure Ansible Job, wait, advance phase"
-// loop used by VM provisioning (the only remaining sequential phase). For
-// the parallel K6 + Monitoring phase use the non-advancing helpers above.
-func (r *EnvironmentReconciler) runAnsiblePhase(ctx context.Context,
-	env *dfaasv1.Environment,
-	role dfaasv1.NodeRole, jobSuffix string,
-	nextPhase dfaasv1.EnvironmentPhase, reason string,
-	libp2pKeys map[string]string,
-) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	jobName := ansible.JobNameForRole(env, jobSuffix)
-	var job batchv1.Job
-	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: env.Namespace}, &job)
-
-	if apierrors.IsNotFound(err) {
-		// If no nodes match the role, skip the whole phase.
-		if !env.HasNodeWithRole(role) {
-			logger.Info("no nodes for role, skipping phase",
-				"role", role, "nextPhase", nextPhase)
-			return r.setEnvPhase(ctx, env, nextPhase)
-		}
-
-		logger.Info("creating Ansible Job for phase", "role", role, "job", jobName)
-
-		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
-		newJob, secret, err := am.CreateJobForRole(ctx, env, role, jobSuffix, libp2pKeys)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
-			return ctrl.Result{}, err
-		}
-		if err := r.Create(ctx, newJob); err != nil && !apierrors.IsAlreadyExists(err) {
-			return ctrl.Result{}, err
-		}
-		_ = r.setEnvCondition(ctx, env, "InfrastructureReady", metav1.ConditionFalse,
-			"AnsibleStarted", "Ansible Job started for role "+string(role))
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if job.Status.Succeeded > 0 {
-		logger.Info("Ansible Job succeeded", "job", jobName)
-		patchJobTTL(ctx, r.Client, &job, 600)
-		_ = r.setEnvCondition(ctx, env, "InfrastructureReady", metav1.ConditionTrue,
-			reason, "Ansible Job "+jobName+" completed")
-		return r.setEnvPhase(ctx, env, nextPhase)
-	}
-	if job.Status.Failed > 0 {
-		logger.Info("Ansible Job failed", "job", jobName)
-		patchJobTTL(ctx, r.Client, &job, 86400)
-		_ = r.setEnvCondition(ctx, env, "InfrastructureReady", metav1.ConditionFalse,
-			"AnsibleFailed", "Ansible Job "+jobName+" failed; check logs")
-		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
-	}
-
-	logger.Info("Ansible Job in progress", "job", jobName)
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-}
-
 // patchJobTTL sets Spec.TTLSecondsAfterFinished on a finished Ansible Job
 // to drive Job-controller auto-cleanup. Used with ttlSec=600 on success and
 // ttlSec=86400 (24h grace) on failure. Idempotent: skips when TTL is
@@ -318,4 +329,66 @@ func (r *EnvironmentReconciler) setEnvCondition(ctx context.Context,
 		})
 		return r.Status().Update(ctx, latest)
 	})
+}
+
+// resetTransientConditions flips every operator-managed provisioning
+// Condition to False with reason=Updating. Called on generation drift so
+// the UI stops showing stale True values during the update window. The
+// ensure* helpers will re-stamp these Conditions to the appropriate state
+// (False/AnsibleRunning, True/Provisioned, etc.) as the new-gen FSM
+// progresses. No new Condition types are introduced.
+func (r *EnvironmentReconciler) resetTransientConditions(ctx context.Context,
+	env *dfaasv1.Environment) error {
+
+	transient := []string{
+		"VMsReady",
+		"DfaasWorkersReady",
+		"K6Ready",
+		"InfrastructureReady",
+		"MonitoringReady",
+	}
+	for _, t := range transient {
+		if err := r.setEnvCondition(ctx, env, t, metav1.ConditionFalse,
+			"Updating",
+			"Environment spec edited; reconciler is restarting provisioning"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cleanupStaleGenJobs deletes Ansible Jobs for env whose generation label
+// does not match env.Generation. Idempotent — no-op if no stale Jobs.
+// Used on generation drift to abort old-gen Ansible runs before starting
+// the new one (avoids two Ansible playbooks racing on the same VMs).
+func (r *EnvironmentReconciler) cleanupStaleGenJobs(ctx context.Context,
+	env *dfaasv1.Environment) error {
+	logger := log.FromContext(ctx)
+
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs,
+		client.InNamespace(env.Namespace),
+		client.MatchingLabels{ansible.LabelEnvironment: env.Name},
+	); err != nil {
+		return fmt.Errorf("list jobs: %w", err)
+	}
+
+	currentGen := fmt.Sprintf("%d", env.Generation)
+	propagation := metav1.DeletePropagationBackground
+	for i := range jobs.Items {
+		j := &jobs.Items[i]
+		if j.Labels[ansible.LabelGeneration] == currentGen {
+			continue
+		}
+		logger.Info("deleting stale-gen Ansible Job",
+			"job", j.Name,
+			"staleGen", j.Labels[ansible.LabelGeneration],
+			"currentGen", currentGen)
+		if err := r.Delete(ctx, j, &client.DeleteOptions{
+			PropagationPolicy: &propagation,
+		}); err != nil && !apierrors.IsNotFound(err) {
+			logger.Error(err, "delete stale Job", "job", j.Name)
+		}
+	}
+	return nil
 }

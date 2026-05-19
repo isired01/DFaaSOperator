@@ -16,7 +16,7 @@ import (
 )
 
 // LoadTestPhase tracks the lifecycle of a single load test.
-// +kubebuilder:validation:Enum=Pending;Running;Exporting;Completed;Failed
+// +kubebuilder:validation:Enum=Pending;Running;Exporting;Completed;Failed;Aborted
 type LoadTestPhase string
 
 const (
@@ -25,6 +25,7 @@ const (
 	LoadTestExporting LoadTestPhase = "Exporting"
 	LoadTestCompleted LoadTestPhase = "Completed"
 	LoadTestFailed    LoadTestPhase = "Failed"
+	LoadTestAborted   LoadTestPhase = "Aborted"
 )
 
 // PerNodeLoad is the FE-supplied per-k6-machine load. The reconciler creates
@@ -50,11 +51,64 @@ type PerNodeLoad struct {
 	ScriptConfigMap corev1.LocalObjectReference `json:"scriptConfigMap"`
 }
 
+// MetricsExportType discriminates how the entry's query is interpreted
+// (documentary; the backend executes the query string as-is in both cases).
+// +kubebuilder:validation:Enum=raw;custom-promql
+type MetricsExportType string
+
+const (
+	// MetricTypeRaw: query is a bare Prometheus metric name (no functions).
+	MetricTypeRaw MetricsExportType = "raw"
+	// MetricTypeCustomPromQL: query is an arbitrary PromQL expression.
+	MetricTypeCustomPromQL MetricsExportType = "custom-promql"
+)
+
+// MetricExportEntry describes one metric the exporter should query during
+// the LoadTest's Exporting phase. All four fields participate in the CSV
+// output (Type and Comment become metadata columns; MetricName is the alias
+// the CSV uses as identifier; Query is the PromQL string actually executed).
+//
+// Naming rule: when Type=raw and MetricName is empty, the operator falls
+// back to MetricName = Query (the bare metric name doubles as alias).
+// When Type=custom-promql, MetricName MUST be set (no sensible default
+// from an arbitrary expression). Enforced via the CEL XValidation below.
+//
+// +kubebuilder:validation:XValidation:rule="self.type != 'custom-promql' || (has(self.metricName) && size(self.metricName) > 0)",message="metricName is required when type is custom-promql"
+type MetricExportEntry struct {
+	// Type is documentary — it classifies the query for the UI and the
+	// CSV "type" column. The backend executes Query verbatim regardless.
+	// +kubebuilder:validation:Required
+	Type MetricsExportType `json:"type"`
+
+	// MetricName is the alias / identifier surfaced in the CSV "metric"
+	// column. Required when Type=custom-promql. Optional when Type=raw:
+	// if empty, the operator falls back to MetricName = Query (so the
+	// bare metric name doubles as alias).
+	// +optional
+	MetricName string `json:"metricName,omitempty"`
+
+	// Query is the PromQL string sent to Prometheus. For Type=raw this
+	// is a bare metric name (e.g. node_memory_MemAvailable_bytes); for
+	// Type=custom-promql it is a full expression (e.g. rate(...)).
+	// Required for both types.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Query string `json:"query"`
+
+	// Comment is free-text human description, surfaced into the CSV
+	// "comment" column for post-test analysis.
+	// +optional
+	Comment string `json:"comment,omitempty"`
+}
+
 // MetricsExportSpec drives the exporter Job that runs after k6 finishes.
 type MetricsExportSpec struct {
-	// PromQL queries pipe-joined and passed to the exporter as $QUERIES.
+	// Metrics is the structured list of entries to export. Replaces the
+	// old plaintext Queries []string; the new shape carries type, alias
+	// and free-text comment alongside the PromQL string. Passed to the
+	// exporter Job as the JSON-encoded env var METRICS_JSON.
 	// +kubebuilder:validation:MinItems=1
-	Queries []string `json:"queries"`
+	Metrics []MetricExportEntry `json:"metrics"`
 
 	// Step for QueryRange (Go duration string).
 	// +kubebuilder:default="15s"
@@ -77,6 +131,30 @@ type LoadTestSpec struct {
 
 	// +kubebuilder:validation:Required
 	MetricsExport MetricsExportSpec `json:"metricsExport"`
+
+	// Suspended marks the LoadTest as a "Save as Draft": when true, the
+	// reconciler keeps phase=Pending, stamps Conditions[Suspended]=True,
+	// and does NOT dispatch any k6 TestRun. PATCHing to false activates
+	// the test (the Suspended Condition flips to False, phase advances to
+	// Running). Once execution begins (phase=Running or beyond), changes
+	// to this field are ignored — the run-once guard makes the state
+	// machine immutable post-start.
+	//
+	// Pattern mirrors batch/v1.Job.spec.suspend.
+	// +kubebuilder:default=false
+	// +optional
+	Suspended bool `json:"suspended,omitempty"`
+
+	// Stop, when set to true, triggers a multi-cluster cascading abort:
+	// the reconciler deletes every remote TestRun for this LoadTest across
+	// all k6-load-generator nodes, then marks the central CR terminal as
+	// Aborted (preserving it as a historical record — the CR is NOT
+	// deleted). Only honored while phase is "" / Pending / Running;
+	// PATCHes after Exporting / Completed / Failed / Aborted are ignored
+	// (the state machine is immutable post-terminal).
+	// +kubebuilder:default=false
+	// +optional
+	Stop bool `json:"stop,omitempty"`
 }
 
 // TestRunRef records one remote TestRun dispatched on a k6 machine's k3s.

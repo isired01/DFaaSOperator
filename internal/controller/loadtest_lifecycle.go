@@ -203,7 +203,10 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 		if lt.Status.StartTime == nil || lt.Status.EndTime == nil {
 			return r.failLoadTest(ctx, lt, "missing StartTime/EndTime; cannot run exporter")
 		}
-		newJob := r.createExporterJob(lt, lt.Status.StartTime.Time, lt.Status.EndTime.Time)
+		newJob, err := r.createExporterJob(lt, lt.Status.StartTime.Time, lt.Status.EndTime.Time)
+		if err != nil {
+			return r.failLoadTest(ctx, lt, fmt.Sprintf("build exporter job: %v", err))
+		}
 		if err := r.Create(ctx, newJob); err != nil && !apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{}, err
 		}
@@ -283,6 +286,76 @@ func (r *LoadTestReconciler) mirrorScriptConfigMap(ctx context.Context,
 	}
 	return r.Dispatcher.ApplyConfigMap(ctx, secretRef,
 		perNode.ScriptConfigMap.Name, "default", src.Data)
+}
+
+// abortLoadTest performs the multi-cluster cascading abort: best-effort
+// deletes every remote TestRun for lt across all k6-load-generator nodes
+// listed in env.Status.K6Nodes, then marks the central CR terminal as
+// Aborted with Conditions[Ready]=False reason=UserAborted.
+//
+// Target set = union of:
+//   - lt.Status.TestRuns (authoritative for what was successfully dispatched)
+//   - spec.PerNodeLoad with deterministic names (catches TestRuns that exist
+//     remotely but were never stamped into status — e.g. startK6 errored
+//     mid-loop before reaching the status update).
+//
+// Per-node errors are logged but do NOT abort the loop — every node is
+// attempted on each tick. If any node errored we Requeue after 10s and
+// retry the full set (idempotent via DeleteTestRun's IgnoreNotFound).
+// Once ALL targets dispatch cleanly, phase + Condition are stamped.
+func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
+	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	k6Index := map[string]dfaasv1.K6NodeStatus{}
+	for _, n := range env.Status.K6Nodes {
+		k6Index[n.NodeID] = n
+	}
+
+	type target struct{ nodeID, secretName, trName, trNs string }
+	targets := map[string]target{}
+	for _, ref := range lt.Status.TestRuns {
+		k6Node, ok := k6Index[ref.NodeID]
+		if !ok || k6Node.KubeconfigSecret == "" {
+			continue
+		}
+		targets[ref.NodeID+"|"+ref.Name] = target{
+			nodeID: ref.NodeID, secretName: k6Node.KubeconfigSecret,
+			trName: ref.Name, trNs: ref.Namespace,
+		}
+	}
+	for _, perNode := range lt.Spec.PerNodeLoad {
+		k6Node, ok := k6Index[perNode.NodeID]
+		if !ok || k6Node.KubeconfigSecret == "" {
+			continue
+		}
+		trName := fmt.Sprintf("%s-%s", lt.Name, sanitize(perNode.NodeID))
+		targets[perNode.NodeID+"|"+trName] = target{
+			nodeID: perNode.NodeID, secretName: k6Node.KubeconfigSecret,
+			trName: trName, trNs: "default",
+		}
+	}
+
+	var failed int
+	for _, t := range targets {
+		secretRef := types.NamespacedName{Name: t.secretName, Namespace: lt.Namespace}
+		remoteKey := types.NamespacedName{Name: t.trName, Namespace: t.trNs}
+		if err := r.Dispatcher.DeleteTestRun(ctx, secretRef, remoteKey); err != nil {
+			logger.Error(err, "remote TestRun delete failed",
+				"node", t.nodeID, "testRun", t.trName)
+			failed++
+			continue
+		}
+		logger.Info("remote TestRun aborted", "node", t.nodeID, "testRun", t.trName)
+	}
+	if failed > 0 {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	_ = r.setLoadTestCondition(ctx, lt, "Ready", metav1.ConditionFalse,
+		"UserAborted",
+		"The test was manually aborted from the UI. Remote worker resources have been reclaimed.")
+	return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestAborted)
 }
 
 // sanitize lowercases and replaces non-DNS-1123 chars with "-", to make Names

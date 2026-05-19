@@ -54,10 +54,12 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 	playbookCMName := playbookConfigMapName(env, role)
 
 	inventory := buildInventory(env, role, nodes, libp2pKeys)
+	labels := jobLabels(env, role)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      InventorySecretName(env, jobSuffix),
 			Namespace: env.Namespace,
+			Labels:    labels,
 		},
 		StringData: map[string]string{"hosts": inventory},
 	}
@@ -66,6 +68,7 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      JobNameForRole(env, jobSuffix),
 			Namespace: env.Namespace,
+			Labels:    labels,
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit: int32Ptr(3),
@@ -215,4 +218,24 @@ func JobNameForRole(env *dfaasv1.Environment, jobSuffix string) string {
 func InventorySecretName(env *dfaasv1.Environment, jobSuffix string) string {
 	return fmt.Sprintf("%s-ansible-%s-%s-g%d-inventory",
 		env.Name, jobSuffix, shortUID(env), env.Generation)
+}
+
+// Label keys for Ansible Jobs + inventory Secrets. Used by the operator's
+// stale-gen cleanup helper to select previous-generation resources via
+// `client.MatchingLabels` on Environment-spec drift.
+const (
+	LabelEnvironment = "dfaas.io/environment"
+	LabelRole        = "dfaas.io/role"
+	LabelGeneration  = "dfaas.io/generation"
+)
+
+// jobLabels returns the canonical label set for an Ansible Job + its
+// inventory Secret. Includes env.Name, role and env.Generation so the
+// reconciler can List+Delete previous-gen resources without parsing names.
+func jobLabels(env *dfaasv1.Environment, role dfaasv1.NodeRole) map[string]string {
+	return map[string]string{
+		LabelEnvironment: env.Name,
+		LabelRole:        string(role),
+		LabelGeneration:  fmt.Sprintf("%d", env.Generation),
+	}
 }

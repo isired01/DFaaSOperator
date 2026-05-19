@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/api"
@@ -17,35 +17,67 @@ import (
 	"google.golang.org/api/option"
 )
 
+// MetricEntry mirrors the operator's MetricExportEntry. The operator
+// resolves raw-type metricName defaults before serialization, so each
+// entry here always has both metricName and query populated.
+type MetricEntry struct {
+	Type       string `json:"type"`
+	MetricName string `json:"metricName"`
+	Query      string `json:"query"`
+	Comment    string `json:"comment,omitempty"`
+}
+
 func main() {
-	// 1. Recupero parametri dalle Env Var (configurate dall'Operator)
+	// 1. Recupero parametri dalle Env Var (configurate dall'Operator).
 	promURL := os.Getenv("PROM_URL")
-	queries := strings.Split(os.Getenv("QUERIES"), "|")
 	startStr := os.Getenv("START_TIME")
 	endStr := os.Getenv("END_TIME")
 	stepStr := os.Getenv("STEP")
 	expName := os.Getenv("EXP_NAME")
+	metricsJSON := os.Getenv("METRICS_JSON")
 
-	// Destinazione opzionale Google Drive (set dall'Operator se
-	// exp.Spec.GoogleDrive è valorizzato sulla CR). Se vuote: fallback stdout.
+	if metricsJSON == "" {
+		log.Fatalf("METRICS_JSON env var is empty")
+	}
+	var metrics []MetricEntry
+	if err := json.Unmarshal([]byte(metricsJSON), &metrics); err != nil {
+		log.Fatalf("METRICS_JSON parse error: %v", err)
+	}
+	if len(metrics) == 0 {
+		log.Fatalf("METRICS_JSON contains zero entries")
+	}
+
+	// Destinazione opzionale Google Drive (impostata dall'Operator se
+	// spec.metricsExport.googleDrive è valorizzata). Se vuote: fallback stdout.
 	gdriveFolderID := os.Getenv("GDRIVE_FOLDER_ID")
 	gdriveCredPath := os.Getenv("GDRIVE_CREDENTIALS_PATH")
 
-	// 2. Parsing dei tempi e dello step
-	start, _ := time.Parse(time.RFC3339, startStr)
-	end, _ := time.Parse(time.RFC3339, endStr)
-	step, _ := time.ParseDuration(stepStr)
+	// 2. Parsing dei tempi e dello step.
+	start, err := time.Parse(time.RFC3339, startStr)
+	if err != nil {
+		log.Fatalf("Errore parsing START_TIME %q: %v", startStr, err)
+	}
+	end, err := time.Parse(time.RFC3339, endStr)
+	if err != nil {
+		log.Fatalf("Errore parsing END_TIME %q: %v", endStr, err)
+	}
+	step, err := time.ParseDuration(stepStr)
+	if err != nil {
+		log.Fatalf("Errore parsing STEP %q: %v", stepStr, err)
+	}
 
-	// 3. Setup Client Prometheus
+	// 3. Setup Client Prometheus.
 	client, err := api.NewClient(api.Config{Address: promURL})
 	if err != nil {
 		log.Fatalf("Errore client Prometheus: %v", err)
 	}
 	promAPI := v1.NewAPI(client)
 
+	// 4. Creazione File CSV Locale (Temporaneo).
 	outDir := "tmp/export"
-	// 4. Creazione File CSV Locale (Temporaneo)
-	_ = os.MkdirAll(outDir, 0755)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		log.Fatalf("Errore creazione directory %s: %v", outDir, err)
+	}
 	fileName := fmt.Sprintf("%s/%s_report.csv", outDir, expName)
 	file, err := os.Create(fileName)
 	if err != nil {
@@ -53,25 +85,33 @@ func main() {
 	}
 
 	writer := csv.NewWriter(file)
-	_ = writer.Write([]string{"Timestamp", "ID_Nodo", "Query", "Valore", "Labels"})
+	_ = writer.Write([]string{
+		"Timestamp", "ID_Nodo", "Type", "MetricName", "Query", "Comment", "Valore", "Labels",
+	})
 
-	// 5. Estrazione Dati da Prometheus
+	// 5. Estrazione Dati da Prometheus.
 	ctx := context.Background()
 	queryRange := v1.Range{Start: start, End: end, Step: step}
 
 	fmt.Printf("📊 Avvio estrazione metriche per l'esperimento: %s...\n", expName)
-	for _, q := range queries {
-		if q == "" {
+	for _, m := range metrics {
+		if m.Query == "" {
+			fmt.Printf("⚠️ Salto entry %q: query vuota\n", m.MetricName)
 			continue
 		}
 
-		result, _, err := promAPI.QueryRange(ctx, q, queryRange)
+		result, _, err := promAPI.QueryRange(ctx, m.Query, queryRange)
 		if err != nil {
-			fmt.Printf("⚠️ Errore query %s: %v\n", q, err)
+			fmt.Printf("⚠️ Errore query %s (%s): %v\n", m.MetricName, m.Query, err)
 			continue
 		}
 
-		matrix, _ := result.(model.Matrix)
+		matrix, ok := result.(model.Matrix)
+		if !ok {
+			fmt.Printf("⚠️ Query %s: risultato non Matrix (tipo=%T), salto\n", m.MetricName, result)
+			continue
+		}
+
 		for _, series := range matrix {
 			nodeID := string(series.Metric["nodo_id"])
 			if nodeID == "" {
@@ -83,7 +123,10 @@ func main() {
 				_ = writer.Write([]string{
 					pair.Timestamp.Time().Format(time.RFC3339),
 					nodeID,
-					q,
+					m.Type,
+					m.MetricName,
+					m.Query,
+					m.Comment,
 					pair.Value.String(),
 					allLabels,
 				})
@@ -91,8 +134,11 @@ func main() {
 		}
 	}
 
-	// Fondamentale: chiudiamo il writer e il file prima di leggerlo / caricarlo.
+	// Chiudiamo writer + file prima di leggerlo / caricarlo.
 	writer.Flush()
+	if err := writer.Error(); err != nil {
+		log.Fatalf("Errore CSV writer: %v", err)
+	}
 	if err := file.Close(); err != nil {
 		log.Fatalf("Errore chiusura file CSV: %v", err)
 	}
@@ -123,7 +169,7 @@ func dumpToStdout(fileName string) {
 }
 
 // uploadToGoogleDrive carica il CSV nella cartella Drive identificata da
-// folderID, autenticandosi con un service-account JSON letto da credPath.
+// folderID, autenticandosi con il service-account JSON letto da credPath.
 func uploadToGoogleDrive(ctx context.Context, fileName, expName, folderID, credPath string) error {
 	credJSON, err := os.ReadFile(credPath)
 	if err != nil {

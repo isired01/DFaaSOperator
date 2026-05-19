@@ -13,15 +13,16 @@ package v1
 import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 // EnvironmentPhase tracks the infrastructure lifecycle.
-// +kubebuilder:validation:Enum=Idle;ProvisioningVMs;ProvisioningInfra;Ready;Failed
+// +kubebuilder:validation:Enum=Idle;ProvisioningVMs;ProvisioningInfra;ProvisioningMonitoring;Ready;Failed
 type EnvironmentPhase string
 
 const (
-	EnvIdle              EnvironmentPhase = "Idle"
-	EnvProvisioningVMs   EnvironmentPhase = "ProvisioningVMs"
-	EnvProvisioningInfra EnvironmentPhase = "ProvisioningInfra"
-	EnvReady             EnvironmentPhase = "Ready"
-	EnvFailed            EnvironmentPhase = "Failed"
+	EnvIdle                   EnvironmentPhase = "Idle"
+	EnvProvisioningVMs        EnvironmentPhase = "ProvisioningVMs"
+	EnvProvisioningInfra      EnvironmentPhase = "ProvisioningInfra"
+	EnvProvisioningMonitoring EnvironmentPhase = "ProvisioningMonitoring"
+	EnvReady                  EnvironmentPhase = "Ready"
+	EnvFailed                 EnvironmentPhase = "Failed"
 )
 
 // EnvironmentNode declares one machine in the federation.

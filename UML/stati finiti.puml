@@ -20,12 +20,16 @@ state INITIAL_STATE {
 
 state INFRASTRUCTURE_PROVISIONING {
   INFRASTRUCTURE_PROVISIONING : Creazione macchine virtuali
+  state INSTALLING_DFAAS {
+  INSTALLING_DFAAS : Installazione dFaaS Agent, OpenFaaS e HAProxy...
 }
 
-state INSTALLING_DFAAS {
+  state INSTALLING_DFAAS {
   INSTALLING_DFAAS : Installazione dFaaS Agent, OpenFaaS e HAProxy...
-  INSTALLING_DFAAS : Configurazione rete P2P
 }
+}
+
+
 
 state PROVISIONING_MONITORING {
   PROVISIONING_MONITORING : Installazione stack monitoring(Prometheus, Grafana e MinIO)
