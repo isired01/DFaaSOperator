@@ -26,7 +26,7 @@ import (
 const environmentFinalizer = "dfaas.dfaas.io/environment-finalizer"
 
 // EnvironmentReconciler owns the Environment CRD lifecycle: it walks the
-// infrastructure FSM (ProvisioningVMs → ProvisioningK6 → ProvisioningMonitoring
+// infrastructure FSM (ProvisioningVMs → ProvisioningInfra → ProvisioningMonitoring
 // → Ready) by delegating each phase to the helpers in the ansible/ and
 // monitoring/ subpackages. Once an Environment is Ready it stays idle until
 // the spec changes (detected via generation drift).
@@ -85,8 +85,9 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		if err := r.cleanupStaleGenJobs(ctx, &env); err != nil {
 			logger.Error(err, "stale-gen Job cleanup failed")
 		}
-		if env.Status.Phase == dfaasv1.EnvReady {
-			logger.Info("generation drift detected post-Ready — restarting provisioning",
+		if env.Status.Phase == dfaasv1.EnvReady || env.Status.Phase == dfaasv1.EnvFailed {
+			logger.Info("generation drift detected — restarting provisioning",
+				"phase", env.Status.Phase,
 				"observed", env.Status.ObservedGeneration, "current", env.Generation)
 			if err := r.resetTransientConditions(ctx, &env); err != nil {
 				logger.Error(err, "reset transient Conditions failed")
@@ -96,7 +97,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	switch env.Status.Phase {
-	case "", dfaasv1.EnvIdle, dfaasv1.EnvFailed:
+	case "", dfaasv1.EnvIdle:
 		return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
 	case dfaasv1.EnvProvisioningVMs:
 		return r.reconcileProvisioningVMs(ctx, &env)
@@ -107,6 +108,13 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	case dfaasv1.EnvReady:
 		// Generation drifted: restart from VMs.
 		return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
+	case dfaasv1.EnvFailed:
+		// Terminal failure. Recovery requires either a spec edit (drift block
+		// restarts the FSM at the top of Reconcile) or delete-and-recreate.
+		// No auto-restart — that would loop forever against persistently-failing
+		// Ansible Jobs whose status survives across reconciles.
+		logger.V(1).Info("environment failed, awaiting spec edit or recreation")
+		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{}, nil
 }

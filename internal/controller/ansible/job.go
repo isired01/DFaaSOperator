@@ -64,6 +64,10 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 		StringData: map[string]string{"hosts": inventory},
 	}
 
+	// PodReplacementPolicy=Failed retains failed Pods for post-mortem debug:
+	// Job controller waits for full Pod termination before replacing and does
+	// not delete failed Pods on BackoffLimit exceeded (TTL handles cleanup).
+	prFailed := batchv1.Failed
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      JobNameForRole(env, jobSuffix),
@@ -71,7 +75,8 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 			Labels:    labels,
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit: int32Ptr(3),
+			BackoffLimit:         int32Ptr(3),
+			PodReplacementPolicy: &prFailed,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					ServiceAccountName: saName,
@@ -119,7 +124,9 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 							},
 						},
 					},
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					// RestartPolicyNever ensures each retry creates a distinct Pod;
+					// OnFailure restarts the container in-place and loses prior attempt logs.
+					RestartPolicy: corev1.RestartPolicyNever,
 				},
 			},
 		},

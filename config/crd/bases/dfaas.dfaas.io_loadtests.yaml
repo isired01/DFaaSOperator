@@ -175,6 +175,13 @@ spec:
                   type: object
                 minItems: 1
                 type: array
+              startAt:
+                description: |-
+                  StartAt schedules the LoadTest to start at this wall-clock instant.
+                  Requires Suspended=true. The controller PATCHes Suspended=false at fire
+                  time when the target Environment is Ready. RFC3339 UTC.
+                format: date-time
+                type: string
               stop:
                 default: false
                 description: |-

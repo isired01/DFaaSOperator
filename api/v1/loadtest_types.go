@@ -145,6 +145,13 @@ type LoadTestSpec struct {
 	// +optional
 	Suspended bool `json:"suspended,omitempty"`
 
+	// StartAt schedules the LoadTest to start at this wall-clock instant.
+	// Requires Suspended=true. The controller PATCHes Suspended=false at fire
+	// time when the target Environment is Ready. RFC3339 UTC.
+	// +optional
+	// +kubebuilder:validation:Format=date-time
+	StartAt *metav1.Time `json:"startAt,omitempty"`
+
 	// Stop, when set to true, triggers a multi-cluster cascading abort:
 	// the reconciler deletes every remote TestRun for this LoadTest across
 	// all k6-load-generator nodes, then marks the central CR terminal as

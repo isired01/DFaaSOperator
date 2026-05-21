@@ -90,13 +90,18 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, 
 		})
 	}
 
+	// PodReplacementPolicy=Failed retains failed Pods for post-mortem debug:
+	// Job controller waits for full Pod termination before replacing and does
+	// not delete failed Pods on BackoffLimit exceeded (TTL handles cleanup).
+	prFailed := batchv1.Failed
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ExporterJobName(lt),
 			Namespace: lt.Namespace,
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit: int32Ptr(2),
+			BackoffLimit:         int32Ptr(2),
+			PodReplacementPolicy: &prFailed,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -107,8 +112,10 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, 
 							VolumeMounts: volumeMounts,
 						},
 					},
-					Volumes:       volumes,
-					RestartPolicy: corev1.RestartPolicyOnFailure,
+					Volumes: volumes,
+					// RestartPolicyNever ensures each retry creates a distinct Pod;
+					// OnFailure restarts the container in-place and loses prior attempt logs.
+					RestartPolicy: corev1.RestartPolicyNever,
 				},
 			},
 		},

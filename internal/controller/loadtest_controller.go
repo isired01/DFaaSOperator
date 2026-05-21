@@ -13,6 +13,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -30,6 +31,8 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/k6dispatch"
 )
+
+const loadTestFinalizer = "dfaas.dfaas.io/loadtest-finalizer"
 
 // LoadTestReconciler owns the LoadTest CRD lifecycle. It uses a Lookup
 // pattern against the referenced Environment: nothing happens until the
@@ -56,6 +59,18 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	var lt dfaasv1.LoadTest
 	if err := r.Get(ctx, req.NamespacedName, &lt); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Deletion handling. Fires BEFORE the terminal short-circuit so a
+	// `kubectl delete loadtest` on any phase (including Running) goes through
+	// handleLoadTestDeletion, which aborts remote TestRuns then removes the
+	// finalizer. Mirrors the Environment finalizer pattern.
+	if !lt.DeletionTimestamp.IsZero() {
+		return r.handleLoadTestDeletion(ctx, &lt)
+	}
+	if !controllerutil.ContainsFinalizer(&lt, loadTestFinalizer) {
+		controllerutil.AddFinalizer(&lt, loadTestFinalizer)
+		return ctrl.Result{}, r.Update(ctx, &lt)
 	}
 
 	// Terminal phases — no-op. Aborted is included so re-PATCHing
@@ -90,7 +105,59 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			lt.Status.Phase == dfaasv1.LoadTestPending ||
 			lt.Status.Phase == dfaasv1.LoadTestRunning
 		if inAbortWindow {
-			return r.abortLoadTest(ctx, &lt, &env)
+			return r.abortLoadTest(ctx, &lt, &env, "UserAborted",
+				"The test was manually aborted from the UI. Remote worker resources have been reclaimed.")
+		}
+	}
+
+	// Scheduled-start branch. When spec.startAt is set and we are still in
+	// the pre-execution window with spec.suspended=true (the gateway-enforced
+	// invariant for a scheduled draft), the reconciler owns the activation:
+	// it is the SOLE writer that flips spec.suspended=false at fire time.
+	// Skipping the branch when !lt.Spec.Suspended covers two states: the user
+	// cleared the draft manually (run-now override) or this reconcile is the
+	// one immediately following our own fire-PATCH (suspended already false,
+	// let the normal phase machine pick up).
+	if lt.Spec.StartAt != nil &&
+		(lt.Status.Phase == "" || lt.Status.Phase == dfaasv1.LoadTestPending) &&
+		lt.Spec.Suspended {
+
+		fireT := lt.Spec.StartAt.Time
+		switch {
+		case time.Now().Before(fireT):
+			// Armed: future startAt. Stamp Ready=False/Scheduled and requeue
+			// exactly at the fire instant. The Suspended branch below still
+			// runs on subsequent reconciles to keep the draft Condition fresh.
+			_ = r.setLoadTestCondition(ctx, &lt, "Ready", metav1.ConditionFalse,
+				"Scheduled", "armed for "+fireT.UTC().Format(time.RFC3339))
+			return ctrl.Result{RequeueAfter: time.Until(fireT)}, nil
+
+		case env.Status.Phase != dfaasv1.EnvReady:
+			// Fire time elapsed but the target Environment is not Ready.
+			// Hold the schedule (do NOT activate) and poll every 10s until
+			// env settles. Covers create-time drafts armed against a still-
+			// provisioning Environment as well as transient env drift.
+			_ = r.setLoadTestCondition(ctx, &lt, "Ready", metav1.ConditionFalse,
+				"ScheduledDelayedEnvNotReady",
+				fmt.Sprintf("schedule fired at %s; waiting for env %s phase=%s",
+					fireT.UTC().Format(time.RFC3339), env.Name, env.Status.Phase))
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+
+		default:
+			// Fire: env Ready, startAt elapsed. PATCH self spec.suspended=false
+			// via merge-patch with retry-on-conflict, then requeue so the
+			// normal phase machine picks up the activated test on next pass.
+			patchErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				return r.Patch(ctx, &lt, client.RawPatch(types.MergePatchType,
+					[]byte(`{"spec":{"suspended":false}}`)))
+			})
+			if patchErr != nil {
+				return ctrl.Result{}, patchErr
+			}
+			_ = r.setLoadTestCondition(ctx, &lt, "Ready", metav1.ConditionFalse,
+				"ScheduledFired",
+				"schedule fired at "+fireT.UTC().Format(time.RFC3339))
+			return ctrl.Result{Requeue: true}, nil
 		}
 	}
 

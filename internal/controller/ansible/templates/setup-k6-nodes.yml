@@ -124,26 +124,61 @@
             | replace('https://127.0.0.1:6443', 'https://' + ansible_host + ':6443')
           }}
 
-    # Push the kubeconfig back to the management cluster as a Secret named
-    # exactly Environment.spec.nodes[i].k6KubeconfigSecret (set by the FE).
-    # delegate_to: localhost runs this on the Ansible Job pod, which has an
-    # in-cluster ServiceAccount with Secrets-create RBAC in env.Namespace
-    # granted by ansible.Manager.EnsureRBAC at Job creation time.
-    - name: "Push kubeconfig Secret to management cluster"
+    - name: "Validate rendered kubeconfig is non-empty and shaped like a kubeconfig"
+      ansible.builtin.assert:
+        that:
+          - kubeconfig_rendered | length > 0
+          - "'apiVersion:' in kubeconfig_rendered"
+          - "'clusters:' in kubeconfig_rendered"
+          - "'users:' in kubeconfig_rendered"
+        fail_msg: "kubeconfig_rendered is empty or malformed; refusing to push a broken Secret"
+
+    # Bypass kubernetes.core.k8s: under alpine ansible 2.18.6 the python
+    # kubernetes client (v36.0.0) has a bug where Configuration.auth_settings()
+    # checks for 'BearerToken' in api_key but load_kube_config writes the
+    # token under api_key['authorization'] — keys don't match, no
+    # Authorization header is attached, the API server returns 401 on
+    # GET /version. Both `host`+`api_key` and `kubeconfig:` parameters hit
+    # the same broken loader. Talking to the management API directly with
+    # uri: bypasses the python lib entirely. Server-side apply against the
+    # named resource URL is create-or-update idempotent in a single PATCH.
+    # Body uses data.kubeconfig with b64encode to avoid YAML-in-YAML indentation pitfalls; clientcmd.Load on the operator side reads Secret.Data["kubeconfig"] as []byte (client-go auto-decodes base64).
+    - name: "Read in-pod SA token (trim trailing newline)"
       delegate_to: localhost
       become: false
-      kubernetes.core.k8s:
-        state: present
-        apply: true
-        definition:
+      ansible.builtin.set_fact:
+        sa_token: "{{ lookup('file', '/var/run/secrets/kubernetes.io/serviceaccount/token') | trim }}"
+      no_log: true
+
+    - name: "Push kubeconfig Secret to management cluster (server-side apply)"
+      delegate_to: localhost
+      become: false
+      ansible.builtin.uri:
+        url: "https://kubernetes.default.svc.cluster.local/api/v1/namespaces/{{ env_namespace }}/secrets/{{ mgmt_secret_name }}?fieldManager=dfaas-ansible&force=true"
+        method: PATCH
+        ca_path: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        headers:
+          Authorization: "Bearer {{ sa_token }}"
+          Content-Type: "application/apply-patch+yaml"
+          Accept: "application/json"
+        body_format: raw
+        body: |
           apiVersion: v1
           kind: Secret
           type: Opaque
           metadata:
-            name: "{{ mgmt_secret_name }}"
-            namespace: "{{ env_namespace }}"
+            name: {{ mgmt_secret_name }}
+            namespace: {{ env_namespace }}
             labels:
-              dfaas.io/env: "{{ env_name }}"
+              dfaas.io/env: {{ env_name }}
               dfaas.io/node-id: "{{ node_id }}"
-          stringData:
-            kubeconfig: "{{ kubeconfig_rendered }}"
+          data:
+            kubeconfig: {{ kubeconfig_rendered | b64encode }}
+        status_code: [200, 201]
+        return_content: false
+        timeout: 30
+      register: push_secret
+      retries: 3
+      delay: 5
+      until: push_secret.status in [200, 201]
+      no_log: true
