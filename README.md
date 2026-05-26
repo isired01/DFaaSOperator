@@ -29,7 +29,7 @@ The operator ships as a single Deployment that runs **two controllers** against 
        Environment.Ready                     | Exporter Job   |
                                              | Prometheus →   |
                                              | CSV (stdout/   |
-                                             |  Google Drive) |
+                                             |  S3 bucket)    |
                                              +----------------+
 ```
 
@@ -59,7 +59,7 @@ The reconciler watches the target `Environment`: a Pending LoadTest auto-resumes
 | Component                                                | Path                                     | Image                                                                        |
 | -------------------------------------------------------- | ---------------------------------------- | ---------------------------------------------------------------------------- |
 | Operator (`Environment` + `LoadTest` controllers)        | `cmd/` + `internal/controller/`          | built from repo root `Dockerfile`                                            |
-| Data exporter (Prometheus → CSV + optional Drive upload) | `dataExporter/`                          | `ghcr.io/isired01/dfaas-exporter:latest` (multi-arch, separate `Dockerfile`) |
+| Data exporter (Prometheus → CSV + optional S3 upload)    | `dataExporter/`                          | `ghcr.io/isired01/dfaas-exporter:latest` (multi-arch, separate `Dockerfile`) |
 | Ansible playbooks (worker + k6 provisioning)             | `internal/controller/ansible/templates/` | `alpine/ansible:2.18.6` (see note below)                                     |
 | Monitoring stack (Prometheus + Grafana, Helm-managed)    | `internal/controller/monitoring/charts/` | vendored `.tgz` chart bundles                                                |
 | Front-end + API gateway (separate repo)                  | `https://github.com/isired01/DFaaS_UI`   | —                                                                            |
@@ -70,7 +70,7 @@ The reconciler watches the target `Environment`: a Pending LoadTest auto-resumes
 - Go ≥ 1.25 for local development
 - Docker + buildx (multi-arch exporter image)
 - A Helm-compatible cluster (no extra installation needed — the operator drives Helm via the embedded SDK)
-- Optional, for Drive export: a Google Cloud project with the Drive API enabled, a service account, and a **Google Workspace Shared Drive** (My Drive doesn't work — service accounts have no personal quota)
+- Optional, for S3 export: an S3-compatible endpoint (AWS S3, MinIO, R2, Wasabi, etc.) and an access-key pair with `s3:HeadBucket`, `s3:CreateBucket`, `s3:PutObject` on the target account
 
 ## 🏁 Getting Started
 
@@ -107,23 +107,39 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 ## 📊 Metrics export
 
-During the `Exporting` phase, the LoadTestReconciler creates `<loadtest>-exporter-job` running the `dfaas-exporter` image. It pulls metrics from the management-cluster Prometheus over `[startTime, endTime]` (queries come from `spec.metricsExport.queries`) and writes them to a CSV.
+During the `Exporting` phase, the LoadTestReconciler creates `<loadtest>-exporter-job` running the `dfaas-exporter` image. It pulls metrics from the management-cluster Prometheus over `[startTime, endTime]` (entries come from `spec.metricsExport.metrics`) and writes them to a CSV.
 
-The destination depends on `spec.metricsExport.googleDrive`:
+The destination is decided on the **Environment**, not the LoadTest: every LoadTest targeting a given Environment exports to the same place. Set `Environment.spec.s3ConfigRef.name` to point at an S3 server configuration registered as a labeled Secret in the cluster-scoped `dfaas-s3` namespace.
 
-| Configuration           | Behaviour                                                                                                                                                                                                  |
-| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `googleDrive` **unset** | CSV dumped to stdout between `----- BEGIN CSV -----` / `----- END CSV -----` markers. Retrievable with `kubectl logs job/<loadtest>-exporter-job`.                                                         |
-| `googleDrive` **set**   | Service-account JSON is read from a Secret you provisioned manually (key `credentials.json`), the file is uploaded into the configured Drive folder via `drive.Files.Create(...).SupportsAllDrives(true)`. |
+| Configuration                | Behaviour                                                                                                                                          |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `s3ConfigRef` **unset**      | CSV dumped to stdout between `----- BEGIN CSV -----` / `----- END CSV -----` markers. Retrievable with `kubectl logs job/<loadtest>-exporter-job`. |
+| `s3ConfigRef` **set**        | Exporter `HeadBucket` → `CreateBucket` (when missing) → `PutObject` against the registered endpoint. Bucket name is derived from the Environment. |
 
-Provision the credentials Secret out-of-band — the operator does **not** create it:
+**Bucket per environment.** The exporter computes the bucket name deterministically from the Environment name + the first 6 hex chars of the Environment UID, yielding a name like `my-env-a1b2c3` that satisfies S3's 3–63 char DNS rule and avoids global-namespace collisions. The bucket is created on the first LoadTest export and reused for every subsequent one in that Environment. Object key per upload: `metrics/<loadtest-name>/<UTC RFC3339-compact>.csv`.
+
+**S3 config provisioning.** The operator only consumes S3 configs; it does **not** create them. Either let the gateway write the Secret via the UI's "S3 Configurations" tab, or `kubectl apply` one directly:
 
 ```bash
-kubectl create secret generic <credentialsSecretRef> -n <namespace> \
-  --from-file=credentials.json=/path/to/service-account.json
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: example-s3
+  namespace: dfaas-s3
+  labels:
+    dfaas.io/s3-config: "true"
+type: Opaque
+stringData:
+  endpoint: http://minio.minio.svc:9000  # leave empty for AWS default
+  region: us-east-1
+  access_key_id: <ACCESS_KEY>
+  secret_access_key: <SECRET_KEY>
+  force_path_style: "true"               # required for MinIO; "false" for AWS
+EOF
 ```
 
-The Drive folder **must live inside a Workspace Shared Drive** with the service account added as Content manager, otherwise upload fails with `storageQuotaExceeded` (service accounts have no personal storage quota).
+At LoadTest export time the operator mirrors the referenced Secret into the LoadTest namespace with an OwnerRef → LoadTest, so the local copy cascades on LoadTest delete (cross-namespace Secret mounts are not supported by Kubernetes — the mirror is required).
 
 The management-cluster Prometheus federates worker metrics via `/federate?match[]={job!=""}`, so PromQL like `rate(node_cpu_seconds_total[1m])` and `container_memory_working_set_bytes` resolve against each worker's local Prometheus. UIs are exposed as NodePort: Prometheus on `http://<management-node-ip>:30090`, Grafana on `:30300`.
 
@@ -131,7 +147,7 @@ The management-cluster Prometheus federates worker metrics via `/federate?match[
 
 - **`alpine/ansible:2.18.6`** is pinned ([`internal/controller/ansible/job.go`](internal/controller/ansible/job.go)) instead of `latest` / `2.20.0` because of an upstream bug in the `mschuchard.general` collection (`No module named 'mschuchard'` — broken absolute imports inside `plugins/module_utils/*.py` that escape the `ansible_collections.*` namespace at remote-execution time). Bug reproduces identically on ansible-core 2.18.6 and 2.20.0, so the operator side-steps the collection entirely and shells out to `faas-cli` for OpenFaaS function deployment. The pin makes the failure trivially reproducible if you want to verify against upstream; bump it back once the collection is patched.
 - **Worker VMs must have correct clocks** (NTP enabled) — `apt update` rejects Release files dated in the future, which blocks the dfaas-worker provisioning job.
-- **Google Drive export requires a Shared Drive.** Personal `@gmail.com` accounts and Workspace tiers that disable Shared Drives cannot use this path; fall back to stdout dump (`googleDrive` unset) or wire an alternative storage (MinIO/S3) if persistence beyond Pod GC is required.
+- **S3 bucket cleanup is out of scope.** Deleting an Environment leaves its bucket (and every CSV inside) intact. Manage S3 retention out-of-band — the operator never issues `DeleteBucket`.
 - **Balancing strategies — partial support.** Supported out of the box: `staticstrategy`, `alllocalstrategy`, `recalcstrategy`. The latter requires `Function.maxRate` (emitted as `dfaas.maxrate` OpenFaaS label). `nodemarginstrategy` and `rlagentstrategy` have incomplete upstream documentation and may require additional labels not yet emitted by the operator — use them at your own risk.
 
 > [!IMPORTANT]

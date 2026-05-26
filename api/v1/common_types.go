@@ -79,16 +79,3 @@ type Link struct {
 	NodeB     string `json:"nodeB"`
 	LatencyMs int    `json:"latencyMs"`
 }
-
-// GoogleDriveConfig is the optional Google Drive destination used by the
-// dataExporter Job. If nil the exporter writes the CSV to stdout (recoverable
-// via `kubectl logs`).
-type GoogleDriveConfig struct {
-	// +kubebuilder:validation:Required
-	FolderID string `json:"folderId"`
-
-	// CredentialsSecretRef references a Secret in the resource's namespace
-	// holding key "credentials.json" with the Google service-account JSON.
-	// +kubebuilder:validation:Required
-	CredentialsSecretRef string `json:"credentialsSecretRef"`
-}

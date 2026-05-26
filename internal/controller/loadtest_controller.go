@@ -50,7 +50,8 @@ type LoadTestReconciler struct {
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=loadtests/finalizers,verbs=update
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=environments,verbs=get;list;watch
 //+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups="",resources=configmaps;secrets,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
 func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

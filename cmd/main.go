@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -29,6 +30,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -95,7 +97,22 @@ func main() {
 		TLSOpts: tlsOpts,
 	})
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	// Bootstrap the dfaas-s3 namespace before the manager starts. Uses a
+	// direct client (cache not yet running) so the very first Environment
+	// reconcile and the gateway's first POST /api/s3-configs can both find
+	// the namespace already in place.
+	cfg := ctrl.GetConfigOrDie()
+	bootstrapClient, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "unable to build bootstrap client")
+		os.Exit(1)
+	}
+	if err := controller.EnsureS3Namespace(context.Background(), bootstrapClient); err != nil {
+		setupLog.Error(err, "unable to ensure S3 config namespace")
+		os.Exit(1)
+	}
+
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress:   metricsAddr,

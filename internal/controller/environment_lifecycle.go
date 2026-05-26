@@ -176,6 +176,11 @@ func (r *EnvironmentReconciler) ensureVMsJob(ctx context.Context,
 			"AnsibleFailed", "dfaas-worker Ansible Job "+jobName+" failed; check logs")
 		return false, true, nil
 	}
+	logger.Info("dfaas-worker Ansible Job still running",
+		"job", jobName,
+		"active", job.Status.Active,
+		"succeeded", job.Status.Succeeded,
+		"failed", job.Status.Failed)
 	_ = r.setEnvCondition(ctx, env, "DfaasWorkersReady", metav1.ConditionFalse,
 		"AnsibleRunning", "dfaas-worker Ansible Job "+jobName+" in progress")
 	return false, false, nil
@@ -232,6 +237,11 @@ func (r *EnvironmentReconciler) ensureK6Job(ctx context.Context,
 			"AnsibleFailed", "K6 Ansible Job "+jobName+" failed; check logs")
 		return false, true, nil
 	}
+	logger.Info("k6 Ansible Job still running",
+		"job", jobName,
+		"active", job.Status.Active,
+		"succeeded", job.Status.Succeeded,
+		"failed", job.Status.Failed)
 	_ = r.setEnvCondition(ctx, env, "K6Ready", metav1.ConditionFalse,
 		"AnsibleRunning", "K6 Ansible Job "+jobName+" in progress")
 	return false, false, nil

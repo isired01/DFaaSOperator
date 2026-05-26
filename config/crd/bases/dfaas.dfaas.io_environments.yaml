@@ -142,6 +142,21 @@ spec:
                   type: object
                 minItems: 1
                 type: array
+              s3ConfigRef:
+                description: |-
+                  S3ConfigRef points at a cluster-scoped S3 server configuration
+                  registered in namespace "dfaas-s3" (Secret with label
+                  "dfaas.io/s3-config=true"). When set, LoadTests targeting this
+                  Environment export their metrics CSV to that S3 endpoint under a
+                  bucket derived from the Environment name. When nil, the exporter
+                  falls back to dumping the CSV to its Pod stdout.
+                properties:
+                  name:
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
               topology:
                 description: Topology declares inter-node network shaping (latency
                   injection).

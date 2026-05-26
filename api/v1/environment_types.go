@@ -70,6 +70,24 @@ type EnvironmentSpec struct {
 	// CleanupOnDelete drives the finalizer's behavior.
 	// +kubebuilder:default=false
 	CleanupOnDelete bool `json:"cleanupOnDelete,omitempty"`
+
+	// S3ConfigRef points at a cluster-scoped S3 server configuration
+	// registered in namespace "dfaas-s3" (Secret with label
+	// "dfaas.io/s3-config=true"). When set, LoadTests targeting this
+	// Environment export their metrics CSV to that S3 endpoint under a
+	// bucket derived from the Environment name. When nil, the exporter
+	// falls back to dumping the CSV to its Pod stdout.
+	// +optional
+	S3ConfigRef *S3ConfigRef `json:"s3ConfigRef,omitempty"`
+}
+
+// S3ConfigRef references one S3 server configuration by name. The actual
+// credentials + endpoint live in Secret "dfaas-s3/<name>" with the keys
+// "endpoint", "region", "access_key_id", "secret_access_key",
+// "force_path_style".
+type S3ConfigRef struct {
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
 }
 
 // K6NodeStatus mirrors per-k6-machine connectivity info so the LoadTest

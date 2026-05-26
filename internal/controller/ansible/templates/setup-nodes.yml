@@ -160,8 +160,8 @@
         status_code: [200, 401]
       register: gateway_check
       until: gateway_check.status in [200, 401]
-      retries: 40
-      delay: 10
+      retries: 10 #diminuiti da 40 a 10 
+      delay: 5 #diminuiti da 10 a 5
 
     # faas_list returns the raw CLI command, not a parsed list — keep a single
     # shell call to get a parseable name list, then drive the destructive op

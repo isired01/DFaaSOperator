@@ -55,21 +55,6 @@ spec:
                 description: MetricsExportSpec drives the exporter Job that runs after
                   k6 finishes.
                 properties:
-                  googleDrive:
-                    description: GoogleDrive is the optional CSV destination. nil
-                      → stdout.
-                    properties:
-                      credentialsSecretRef:
-                        description: |-
-                          CredentialsSecretRef references a Secret in the resource's namespace
-                          holding key "credentials.json" with the Google service-account JSON.
-                        type: string
-                      folderId:
-                        type: string
-                    required:
-                    - credentialsSecretRef
-                    - folderId
-                    type: object
                   metrics:
                     description: |-
                       Metrics is the structured list of entries to export. Replaces the

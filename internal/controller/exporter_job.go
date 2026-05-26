@@ -18,6 +18,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	dfaasv1 "dfaas-operator/api/v1"
@@ -37,8 +38,13 @@ func ExporterJobName(lt *dfaasv1.LoadTest) string {
 
 // createExporterJob builds the in-cluster Job that runs the dfaas-exporter
 // image to pull metrics from Prometheus over [startTime, endTime] and either
-// upload a CSV to Google Drive or print it to stdout.
-func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, endTime time.Time) (*batchv1.Job, error) {
+// upload a CSV to S3 (bucket-per-environment, auto-created on first run) or
+// print it to stdout. The S3 credentials are sourced from a mirrored Secret
+// in the LoadTest namespace named by s3ConfigSecretName; pass empty to skip
+// S3 wiring and fall back to the stdout path inside dataExporter.
+func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
+	env *dfaasv1.Environment, startTime, endTime time.Time,
+	s3ConfigSecretName string) (*batchv1.Job, error) {
 	// Resolve raw-type defaults: when Type=raw and MetricName is empty,
 	// the bare metric name (Query) doubles as the alias. CEL validation
 	// already guarantees custom-promql entries have MetricName set.
@@ -59,7 +65,7 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, 
 		step = "15s"
 	}
 
-	env := []corev1.EnvVar{
+	envVars := []corev1.EnvVar{
 		{Name: "PROM_URL", Value: "http://prometheus-server.monitoring.svc.cluster.local:9090"},
 		{Name: "METRICS_JSON", Value: string(metricsJSON)},
 		{Name: "START_TIME", Value: startTime.UTC().Format(time.RFC3339)},
@@ -68,26 +74,50 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, 
 		{Name: "EXP_NAME", Value: lt.Name},
 	}
 
-	var volumes []corev1.Volume
-	var volumeMounts []corev1.VolumeMount
-
-	if lt.Spec.MetricsExport.GoogleDrive != nil {
-		gd := lt.Spec.MetricsExport.GoogleDrive
-		env = append(env,
-			corev1.EnvVar{Name: "GDRIVE_FOLDER_ID", Value: gd.FolderID},
-			corev1.EnvVar{Name: "GDRIVE_CREDENTIALS_PATH", Value: "/var/run/gdrive/credentials.json"},
+	// S3 wiring: when an S3 config Secret was mirrored into this namespace,
+	// surface its keys as env vars via secretKeyRef so credentials are never
+	// embedded in the Job spec. The exporter binary dispatches on
+	// S3_BUCKET_PREFIX being non-empty (stdout fallback otherwise).
+	if s3ConfigSecretName != "" {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "S3_ENDPOINT", ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: s3ConfigSecretName},
+					Key:                  "endpoint",
+					// AWS default endpoint is fine when the key is absent.
+					Optional: ptr.To(true),
+				},
+			}},
+			corev1.EnvVar{Name: "S3_REGION", ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: s3ConfigSecretName},
+					Key:                  "region",
+				},
+			}},
+			corev1.EnvVar{Name: "S3_ACCESS_KEY_ID", ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: s3ConfigSecretName},
+					Key:                  "access_key_id",
+				},
+			}},
+			corev1.EnvVar{Name: "S3_SECRET_ACCESS_KEY", ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: s3ConfigSecretName},
+					Key:                  "secret_access_key",
+				},
+			}},
+			corev1.EnvVar{Name: "S3_FORCE_PATH_STYLE", ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: s3ConfigSecretName},
+					Key:                  "force_path_style",
+				},
+			}},
+			// Plain envs feed the bucket-name + object-key composition inside
+			// the exporter. S3_BUCKET_PREFIX is the dispatch signal.
+			corev1.EnvVar{Name: "S3_BUCKET_PREFIX", Value: env.Name},
+			corev1.EnvVar{Name: "ENV_UID", Value: string(env.UID)},
+			corev1.EnvVar{Name: "LOADTEST_NAME", Value: lt.Name},
 		)
-		volumes = append(volumes, corev1.Volume{
-			Name: "gdrive-creds",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{SecretName: gd.CredentialsSecretRef},
-			},
-		})
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      "gdrive-creds",
-			MountPath: "/var/run/gdrive",
-			ReadOnly:  true,
-		})
 	}
 
 	// PodReplacementPolicy=Failed retains failed Pods for post-mortem debug:
@@ -106,13 +136,11 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest, startTime, 
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:         "exporter",
-							Image:        "ghcr.io/isired01/dfaas-exporter:latest",
-							Env:          env,
-							VolumeMounts: volumeMounts,
+							Name:  "exporter",
+							Image: "ghcr.io/isired01/dfaas-exporter:latest",
+							Env:   envVars,
 						},
 					},
-					Volumes: volumes,
 					// RestartPolicyNever ensures each retry creates a distinct Pod;
 					// OnFailure restarts the container in-place and loses prior attempt logs.
 					RestartPolicy: corev1.RestartPolicyNever,

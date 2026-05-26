@@ -340,9 +340,10 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 }
 
 // runExporter creates the in-cluster Job that pulls metrics from Prometheus
-// over [StartTime, EndTime] and uploads to Google Drive (or stdout).
+// over [StartTime, EndTime] and uploads to S3 (when env.spec.s3ConfigRef is
+// set) or dumps to stdout.
 func (r *LoadTestReconciler) runExporter(ctx context.Context,
-	lt *dfaasv1.LoadTest, _ *dfaasv1.Environment) (ctrl.Result, error) {
+	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	jobName := ExporterJobName(lt)
@@ -354,7 +355,30 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 		if lt.Status.StartTime == nil || lt.Status.EndTime == nil {
 			return r.failLoadTest(ctx, lt, "missing StartTime/EndTime; cannot run exporter")
 		}
-		newJob, err := r.createExporterJob(lt, lt.Status.StartTime.Time, lt.Status.EndTime.Time)
+
+		// Resolve the Environment's S3 config (optional). When set, we
+		// fetch the source Secret from dfaas-s3, mirror it into the
+		// LoadTest namespace (cross-namespace mounts are impossible), and
+		// pass the local mirror name into the exporter Job builder. The
+		// mirror carries an OwnerRef back to the LoadTest so it cascades
+		// on LoadTest deletion.
+		var s3SecretName string
+		if env.Spec.S3ConfigRef != nil {
+			mirrored, mirrorErr := r.ensureMirroredS3Secret(ctx, lt, env.Spec.S3ConfigRef.Name)
+			if mirrorErr != nil {
+				if apierrors.IsNotFound(mirrorErr) {
+					_ = r.setLoadTestCondition(ctx, lt, "Ready", metav1.ConditionFalse,
+						"S3ConfigMissing",
+						fmt.Sprintf("S3 config %q not found in namespace %s",
+							env.Spec.S3ConfigRef.Name, S3ConfigNamespace))
+					return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
+				}
+				return ctrl.Result{}, mirrorErr
+			}
+			s3SecretName = mirrored
+		}
+
+		newJob, err := r.createExporterJob(lt, env, lt.Status.StartTime.Time, lt.Status.EndTime.Time, s3SecretName)
 		if err != nil {
 			return r.failLoadTest(ctx, lt, fmt.Sprintf("build exporter job: %v", err))
 		}
@@ -386,6 +410,46 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 	}
 	logger.Info("exporter Job running")
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// ensureMirroredS3Secret copies the S3 config Secret out of the cluster-
+// scoped registry namespace (S3ConfigNamespace) into the LoadTest's own
+// namespace under the same name. The mirror carries an OwnerRef back to the
+// LoadTest so deleting the LoadTest cascades the local copy — credentials do
+// not outlive the test that consumed them. Idempotent: re-runs update the
+// data block in place. Returns the mirrored Secret name. apierrors.IsNotFound
+// on the source is the caller-handled "S3ConfigMissing" path.
+func (r *LoadTestReconciler) ensureMirroredS3Secret(ctx context.Context,
+	lt *dfaasv1.LoadTest, configName string) (string, error) {
+
+	var src corev1.Secret
+	srcKey := types.NamespacedName{Name: configName, Namespace: S3ConfigNamespace}
+	if err := r.Get(ctx, srcKey, &src); err != nil {
+		return "", err
+	}
+
+	mirror := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      configName,
+			Namespace: lt.Namespace,
+		},
+	}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, mirror, func() error {
+		if mirror.Labels == nil {
+			mirror.Labels = map[string]string{}
+		}
+		mirror.Labels[S3ConfigLabel] = "true"
+		mirror.Type = src.Type
+		mirror.Data = make(map[string][]byte, len(src.Data))
+		for k, v := range src.Data {
+			mirror.Data[k] = v
+		}
+		return controllerutil.SetControllerReference(lt, mirror, r.Scheme)
+	})
+	if err != nil {
+		return "", fmt.Errorf("mirror S3 config %q: %w", configName, err)
+	}
+	return mirror.Name, nil
 }
 
 // buildRemoteTestRun assembles an unstructured k6.io/v1alpha1 TestRun manifest

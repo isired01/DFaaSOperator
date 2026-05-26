@@ -1,9 +1,9 @@
 # Stage 1: Build
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
-RUN go mod init dfaas-exporter && \
-    go mod tidy
 ARG TARGETOS
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -o exporter main.go

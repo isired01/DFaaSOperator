@@ -27,19 +27,15 @@ spec:
       - type: raw
         metricName: mem_available
         query: node_memory_MemAvailable_bytes
-        comment: "Memoria libera per nodo (bare metric)"
+        comment: "Free memory per node (bare metric)"
       - type: custom-promql
         metricName: cpu_rate
         query: rate(node_cpu_seconds_total[1m])
-        comment: "CPU usage rate per nodo (PromQL expression)"
-    # googleDrive is optional. When unset, the exporter dumps the CSV to
-    # stdout between markers "----- BEGIN CSV -----" / "----- END CSV -----"
+        comment: "CPU usage rate per node (PromQL expression)"
+    # CSV destination is decided on the Environment (spec.s3ConfigRef).
+    # When the Environment has no s3ConfigRef, the exporter dumps the CSV
+    # to stdout between markers "----- BEGIN CSV -----" / "----- END CSV -----"
     # (retrievable via `kubectl logs job/<loadtest>-exporter-job`).
-    # To enable Drive upload, set folderId + credentialsSecretRef and create
-    # the Secret out-of-band. Requires a Shared Drive (Workspace).
-    # googleDrive:
-    #   folderId: <shared-drive-folder-id>
-    #   credentialsSecretRef: google-credentials-secret
 ---
 apiVersion: v1
 kind: ConfigMap

@@ -113,10 +113,6 @@ type MetricsExportSpec struct {
 	// Step for QueryRange (Go duration string).
 	// +kubebuilder:default="15s"
 	Step string `json:"step,omitempty"`
-
-	// GoogleDrive is the optional CSV destination. nil → stdout.
-	// +optional
-	GoogleDrive *GoogleDriveConfig `json:"googleDrive,omitempty"`
 }
 
 // LoadTestSpec is the desired state of one load test against an Environment.
