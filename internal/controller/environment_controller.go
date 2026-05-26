@@ -13,6 +13,8 @@ package controller
 import (
 	"context"
 
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -70,22 +72,13 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// Generation drift: spec was edited after a successful run. Reset stale
 	// Conditions, delete previous-gen Ansible Jobs (avoid concurrent runs on
 	// the same VMs), and restart the FSM from ProvisioningVMs.
-	// observedGeneration is NOT touched here — it gets re-stamped only when
-	// the new run reaches Ready, which is the canonical signal the UI uses
-	// to compute isUpdating = (metadata.generation > status.observedGeneration).
-	// Generation drift handling. Stale-gen Job cleanup is idempotent and runs
-	// on every tick while observedGeneration trails Generation — picks up
-	// previous-gen Jobs whether the edit happened at Ready or mid-flight.
-	// Phase-reset + Conditions-reset only fire when the previous run had
-	// already reached Ready; otherwise we'd loop forever (drift block keeps
-	// resetting to VMs while VMs handler keeps advancing). Mid-flight drift
-	// is absorbed automatically because JobNameForRole embeds env.Generation,
-	// so the next ensure*Job hits NotFound and creates the new-gen Job.
 	if env.Status.ObservedGeneration > 0 && env.Status.ObservedGeneration < env.Generation {
 		if err := r.cleanupStaleGenJobs(ctx, &env); err != nil {
 			logger.Error(err, "stale-gen Job cleanup failed")
 		}
-		if env.Status.Phase == dfaasv1.EnvReady || env.Status.Phase == dfaasv1.EnvFailed {
+		if env.Status.Phase == dfaasv1.EnvReady ||
+			env.Status.Phase == dfaasv1.EnvDegraded ||
+			env.Status.Phase == dfaasv1.EnvFailed {
 			logger.Info("generation drift detected — restarting provisioning",
 				"phase", env.Status.Phase,
 				"observed", env.Status.ObservedGeneration, "current", env.Generation)
@@ -108,11 +101,17 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	case dfaasv1.EnvReady:
 		// Generation drifted: restart from VMs.
 		return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
+	case dfaasv1.EnvDegraded:
+		// Non-terminal: infra is up but monitoring is broken. Tests are
+		// still permitted. Recovery is via spec edit (drift block above)
+		// or explicit deletion+recreate. Like EnvFailed we do not auto-
+		// retry — that would loop forever against a persistently broken
+		// chart / OCI registry.
+		logger.V(1).Info("environment degraded, awaiting spec edit or recreation")
+		return ctrl.Result{}, nil
 	case dfaasv1.EnvFailed:
 		// Terminal failure. Recovery requires either a spec edit (drift block
 		// restarts the FSM at the top of Reconcile) or delete-and-recreate.
-		// No auto-restart — that would loop forever against persistently-failing
-		// Ansible Jobs whose status survives across reconciles.
 		logger.V(1).Info("environment failed, awaiting spec edit or recreation")
 		return ctrl.Result{}, nil
 	}
@@ -121,10 +120,8 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 // setEnvPhase patches status.phase, retrying on conflict. When transitioning
 // into Ready it also stamps observedGeneration so future ticks short-circuit.
-// Returns no Requeue: the Status().Update emits a watch event that triggers
-// reconcile when the informer cache catches up. Returning Requeue:true here
-// would race the cache and re-fire the same phase handler for ~3s of log
-// spam until the watch event arrived.
+// Stamps the top-level EnvCondReady aggregator (P1) and clears the
+// EnvCondUpdating flag on Ready (P8).
 func (r *EnvironmentReconciler) setEnvPhase(ctx context.Context,
 	env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase) (ctrl.Result, error) {
 
@@ -137,9 +134,62 @@ func (r *EnvironmentReconciler) setEnvPhase(ctx context.Context,
 		if phase == dfaasv1.EnvReady {
 			latest.Status.ObservedGeneration = latest.Generation
 		}
+		stampEnvAggregate(latest, phase)
 		return r.Status().Update(ctx, latest)
 	})
 	return ctrl.Result{}, err
+}
+
+// stampEnvAggregate writes both the EnvCondReady aggregator and the
+// EnvCondUpdating flag on the in-memory Environment. Pure function on the
+// status slice; caller must persist via Status().Update.
+func stampEnvAggregate(env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase) {
+	var status metav1.ConditionStatus
+	var reason, message string
+
+	switch phase {
+	case dfaasv1.EnvReady:
+		status = metav1.ConditionTrue
+		reason = dfaasv1.EnvReasonAllSubsystemsReady
+		message = "infrastructure + monitoring up"
+	case dfaasv1.EnvDegraded:
+		status = metav1.ConditionFalse
+		reason = dfaasv1.EnvReasonDegraded
+		message = "infrastructure up, monitoring stack unavailable; LoadTests are still permitted"
+	case dfaasv1.EnvFailed:
+		status = metav1.ConditionFalse
+		reason = dfaasv1.EnvReasonFailed
+		message = "provisioning failed; spec edit or delete+recreate required"
+	case "", dfaasv1.EnvIdle:
+		status = metav1.ConditionUnknown
+		reason = dfaasv1.EnvReasonInitializing
+		message = "awaiting first reconcile"
+	default:
+		status = metav1.ConditionFalse
+		reason = dfaasv1.EnvReasonProvisioning
+		message = "subsystems still provisioning"
+	}
+
+	meta.SetStatusCondition(&env.Status.Conditions, metav1.Condition{
+		Type:    dfaasv1.EnvCondReady,
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+	})
+
+	// Clear the Updating flag once we've reached a terminal phase. Leave
+	// it alone otherwise (resetTransientConditions sets it on drift; the
+	// flag stays True through every Provisioning* tick until we settle).
+	if phase == dfaasv1.EnvReady ||
+		phase == dfaasv1.EnvDegraded ||
+		phase == dfaasv1.EnvFailed {
+		meta.SetStatusCondition(&env.Status.Conditions, metav1.Condition{
+			Type:    dfaasv1.EnvCondUpdating,
+			Status:  metav1.ConditionFalse,
+			Reason:  dfaasv1.EnvReasonAllSubsystemsReady,
+			Message: "no spec update in flight",
+		})
+	}
 }
 
 func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {

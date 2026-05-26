@@ -62,10 +62,6 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Deletion handling. Fires BEFORE the terminal short-circuit so a
-	// `kubectl delete loadtest` on any phase (including Running) goes through
-	// handleLoadTestDeletion, which aborts remote TestRuns then removes the
-	// finalizer. Mirrors the Environment finalizer pattern.
 	if !lt.DeletionTimestamp.IsZero() {
 		return r.handleLoadTestDeletion(ctx, &lt)
 	}
@@ -74,8 +70,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, r.Update(ctx, &lt)
 	}
 
-	// Terminal phases — no-op. Aborted is included so re-PATCHing
-	// spec.stop on an already-aborted CR is a silent no-op.
+	// Terminal phases — no-op.
 	if lt.Status.Phase == dfaasv1.LoadTestCompleted ||
 		lt.Status.Phase == dfaasv1.LoadTestFailed ||
 		lt.Status.Phase == dfaasv1.LoadTestAborted {
@@ -87,6 +82,11 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	envKey := types.NamespacedName{Name: lt.Spec.TargetEnvironment, Namespace: lt.Namespace}
 	if err := r.Get(ctx, envKey, &env); err != nil {
 		if apierrors.IsNotFound(err) {
+			// P9: surface link state on EnvironmentLinked before failing.
+			_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
+				metav1.ConditionFalse, dfaasv1.LTReasonEnvNotFound,
+				fmt.Sprintf("environment %q not found in namespace %s",
+					lt.Spec.TargetEnvironment, lt.Namespace))
 			return r.failLoadTest(ctx, &lt,
 				fmt.Sprintf("environment %q not found in namespace %s",
 					lt.Spec.TargetEnvironment, lt.Namespace))
@@ -94,31 +94,36 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	// Abort short-circuit. User PATCHed spec.stop=true: dispatch remote
-	// TestRun deletions across all k6 nodes, then mark the CR terminal as
-	// Aborted (the CR persists as a historical record — no deletion).
-	// Only honored from "" / Pending / Running per user-confirmed scope.
-	// Drafts (suspended=true, phase=Pending) are allowed: abortLoadTest is
-	// a no-op on the remote side (no TestRuns dispatched yet) and just
-	// flips phase to Aborted as an "abandoned draft" historical marker.
+	// P9: env exists — stamp EnvironmentLinked. EnvDegraded is advisory:
+	// LoadTests against a degraded env are permitted, so we mark True with
+	// reason=EnvDegraded so consumers know to expect missing metrics later.
+	switch env.Status.Phase {
+	case dfaasv1.EnvFailed:
+		_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
+			metav1.ConditionFalse, dfaasv1.LTReasonEnvFailed,
+			fmt.Sprintf("environment %q is in phase Failed", env.Name))
+	case dfaasv1.EnvDegraded:
+		_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
+			metav1.ConditionTrue, dfaasv1.LTReasonEnvDegraded,
+			fmt.Sprintf("environment %q is Degraded — monitoring unavailable, exporter step may fail", env.Name))
+	default:
+		_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
+			metav1.ConditionTrue, dfaasv1.LTReasonEnvFound,
+			fmt.Sprintf("environment %q resolved", env.Name))
+	}
+
+	// Abort short-circuit. User PATCHed spec.stop=true.
 	if lt.Spec.Stop {
 		inAbortWindow := lt.Status.Phase == "" ||
 			lt.Status.Phase == dfaasv1.LoadTestPending ||
 			lt.Status.Phase == dfaasv1.LoadTestRunning
 		if inAbortWindow {
-			return r.abortLoadTest(ctx, &lt, &env, "UserAborted",
+			return r.abortLoadTest(ctx, &lt, &env, dfaasv1.LTReasonUserAborted,
 				"The test was manually aborted from the UI. Remote worker resources have been reclaimed.")
 		}
 	}
 
-	// Scheduled-start branch. When spec.startAt is set and we are still in
-	// the pre-execution window with spec.suspended=true (the gateway-enforced
-	// invariant for a scheduled draft), the reconciler owns the activation:
-	// it is the SOLE writer that flips spec.suspended=false at fire time.
-	// Skipping the branch when !lt.Spec.Suspended covers two states: the user
-	// cleared the draft manually (run-now override) or this reconcile is the
-	// one immediately following our own fire-PATCH (suspended already false,
-	// let the normal phase machine pick up).
+	// Scheduled-start branch (P9: stamps LTCondScheduled).
 	if lt.Spec.StartAt != nil &&
 		(lt.Status.Phase == "" || lt.Status.Phase == dfaasv1.LoadTestPending) &&
 		lt.Spec.Suspended {
@@ -126,28 +131,24 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		fireT := lt.Spec.StartAt.Time
 		switch {
 		case time.Now().Before(fireT):
-			// Armed: future startAt. Stamp Ready=False/Scheduled and requeue
-			// exactly at the fire instant. The Suspended branch below still
-			// runs on subsequent reconciles to keep the draft Condition fresh.
-			_ = r.setLoadTestCondition(ctx, &lt, "Ready", metav1.ConditionFalse,
-				"Scheduled", "armed for "+fireT.UTC().Format(time.RFC3339))
+			// Armed: future startAt.
+			_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondScheduled,
+				metav1.ConditionTrue, dfaasv1.LTReasonScheduledArmed,
+				"armed for "+fireT.UTC().Format(time.RFC3339))
 			return ctrl.Result{RequeueAfter: time.Until(fireT)}, nil
 
-		case env.Status.Phase != dfaasv1.EnvReady:
-			// Fire time elapsed but the target Environment is not Ready.
-			// Hold the schedule (do NOT activate) and poll every 10s until
-			// env settles. Covers create-time drafts armed against a still-
-			// provisioning Environment as well as transient env drift.
-			_ = r.setLoadTestCondition(ctx, &lt, "Ready", metav1.ConditionFalse,
-				"ScheduledDelayedEnvNotReady",
+		case env.Status.Phase != dfaasv1.EnvReady && env.Status.Phase != dfaasv1.EnvDegraded:
+			// Fire time elapsed but the target Environment is not ready
+			// (Degraded is treated as good-enough to dispatch — only
+			// Failed / still-Provisioning hold the schedule).
+			_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondScheduled,
+				metav1.ConditionTrue, dfaasv1.LTReasonScheduledDelayedEnvNot,
 				fmt.Sprintf("schedule fired at %s; waiting for env %s phase=%s",
 					fireT.UTC().Format(time.RFC3339), env.Name, env.Status.Phase))
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 
 		default:
-			// Fire: env Ready, startAt elapsed. PATCH self spec.suspended=false
-			// via merge-patch with retry-on-conflict, then requeue so the
-			// normal phase machine picks up the activated test on next pass.
+			// Fire.
 			patchErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 				return r.Patch(ctx, &lt, client.RawPatch(types.MergePatchType,
 					[]byte(`{"spec":{"suspended":false}}`)))
@@ -155,36 +156,21 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			if patchErr != nil {
 				return ctrl.Result{}, patchErr
 			}
-			_ = r.setLoadTestCondition(ctx, &lt, "Ready", metav1.ConditionFalse,
-				"ScheduledFired",
+			_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondScheduled,
+				metav1.ConditionTrue, dfaasv1.LTReasonScheduledFired,
 				"schedule fired at "+fireT.UTC().Format(time.RFC3339))
 			return ctrl.Result{Requeue: true}, nil
 		}
 	}
 
-	// Strict create-time gate: a LoadTest may only enter the FSM if its
-	// Environment is already Ready. Submitting a LoadTest against a
-	// Pending / Provisioning / Failed Environment fails fast with an
-	// explanatory message — no quiet Pending limbo waiting on infra that
-	// may never come up. Only runs on the very first reconcile
-	// (`phase == ""`); once the LoadTest has moved past it, Environment
-	// drift out of Ready does NOT retroactively cancel the run.
-	//
-	// RELAXED for drafts: when spec.suspended is true the LoadTest is
-	// just saved, not executed, so the Environment does not need to be
-	// Ready yet. Existence is still required (NotFound above fails).
-	if lt.Status.Phase == "" && !lt.Spec.Suspended && env.Status.Phase != dfaasv1.EnvReady {
+	// Strict create-time gate.
+	if lt.Status.Phase == "" && !lt.Spec.Suspended && env.Status.Phase != dfaasv1.EnvReady && env.Status.Phase != dfaasv1.EnvDegraded {
 		return r.failLoadTest(ctx, &lt,
 			fmt.Sprintf("environment %q is %q; it must be Ready before creating a LoadTest",
 				env.Name, env.Status.Phase))
 	}
 
-	// Stamp an OwnerReference Environment → LoadTest on first encounter so
-	// `kubectl delete environment` cascades into the dependent LoadTests via
-	// Kubernetes garbage collection. SetOwnerReference (not Controller) is
-	// the correct choice: a LoadTest is owned-by an Environment for GC
-	// purposes but is NOT controlled-by it (LoadTestReconciler is the
-	// controller). Idempotent: skip the Update when the ref is already there.
+	// OwnerReference Environment → LoadTest.
 	if !hasOwnerRef(&lt, &env) {
 		if err := controllerutil.SetOwnerReference(&env, &lt, r.Scheme); err != nil {
 			return ctrl.Result{}, err
@@ -195,17 +181,20 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Run-once guard + suspended gate. Only consult spec.suspended in the
-	// pre-execution window (phase empty or Pending). Once the test has
-	// entered Running/Exporting (or terminal, already short-circuited above)
-	// spec.suspended changes are ignored — the state machine is immutable.
+	// Run-once guard + suspended gate.
 	preExecution := lt.Status.Phase == "" || lt.Status.Phase == dfaasv1.LoadTestPending
 	if preExecution {
+		// P11: spec is editable in the pre-execution window.
+		_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondSpecLocked,
+			metav1.ConditionFalse, dfaasv1.LTReasonPending,
+			"spec editable until the test starts")
+
 		if lt.Spec.Suspended {
-			// Suspended gate: stamp the Condition and hold at Pending.
-			// Mirrors batch/v1.Job.spec.suspend semantics — no new phase.
-			_ = r.setLoadTestCondition(ctx, &lt, "Suspended", metav1.ConditionTrue,
-				"DraftSaved",
+			// Idempotent: SetStatusCondition keeps LastTransitionTime
+			// stable unless status/reason/message actually changes. Safe
+			// to stamp on every reconcile.
+			_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondSuspended,
+				metav1.ConditionTrue, dfaasv1.LTReasonDraftSaved,
 				"LoadTest saved as draft — PATCH spec.suspended=false to start")
 			if lt.Status.Phase == "" {
 				return r.setLoadTestPhase(ctx, &lt, dfaasv1.LoadTestPending)
@@ -213,18 +202,27 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			return ctrl.Result{}, nil
 		}
 
-		// Not suspended (or just un-suspended): flip the Condition to False
-		// so the UI clears the Draft badge before the phase machine fires.
-		_ = r.setLoadTestCondition(ctx, &lt, "Suspended", metav1.ConditionFalse,
-			"Activated", "LoadTest is active")
+		// P12: only stamp Activated on the True → False (or absent → False)
+		// edge. Steady-state "suspended is False" does not need to mutate
+		// the condition every tick.
+		prev := meta.FindStatusCondition(lt.Status.Conditions, dfaasv1.LTCondSuspended)
+		if prev == nil || prev.Status != metav1.ConditionFalse {
+			_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondSuspended,
+				metav1.ConditionFalse, dfaasv1.LTReasonActivated,
+				"LoadTest is active")
+		}
 
-		// Block while Environment is mid-flight (only reachable
-		// post-first-reconcile or when un-suspending a draft against an
-		// Environment that is not Ready yet).
-		if env.Status.Phase != dfaasv1.EnvReady {
+		// Block while Environment is mid-flight.
+		if env.Status.Phase != dfaasv1.EnvReady && env.Status.Phase != dfaasv1.EnvDegraded {
 			logger.Info("waiting for environment", "env", env.Name, "phase", env.Status.Phase)
 			return r.setLoadTestPhase(ctx, &lt, dfaasv1.LoadTestPending)
 		}
+	} else {
+		// P11: post-Pending the state machine is immutable; record it on
+		// the condition so consumers know PATCHes are silently ignored.
+		_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondSpecLocked,
+			metav1.ConditionTrue, dfaasv1.LTReasonPostStart,
+			"spec is immutable once the test has started")
 	}
 
 	// Phase machine.
@@ -239,7 +237,9 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	return ctrl.Result{}, nil
 }
 
-// setLoadTestPhase patches status.phase, retrying on conflict.
+// setLoadTestPhase patches status.phase, retrying on conflict. Also stamps
+// the LTCondReady aggregator (P9) and SpecLocked (P11) when transitioning
+// into a post-execution phase.
 func (r *LoadTestReconciler) setLoadTestPhase(ctx context.Context,
 	lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase) (ctrl.Result, error) {
 
@@ -249,6 +249,7 @@ func (r *LoadTestReconciler) setLoadTestPhase(ctx context.Context,
 			return err
 		}
 		latest.Status.Phase = phase
+		stampLTAggregate(latest, phase)
 		return r.Status().Update(ctx, latest)
 	})
 	if err != nil {
@@ -257,15 +258,94 @@ func (r *LoadTestReconciler) setLoadTestPhase(ctx context.Context,
 	return ctrl.Result{Requeue: true}, nil
 }
 
-// failLoadTest stamps Failed phase + a Condition with the reason.
+// stampLTAggregate writes the LTCondReady aggregator (P9) and the
+// LTCondSpecLocked latch (P11) onto the in-memory LoadTest. Pure function;
+// caller persists via Status().Update.
+func stampLTAggregate(lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase) {
+	var (
+		ready                     metav1.ConditionStatus
+		reason, message           string
+		specLocked                metav1.ConditionStatus
+		specLockedReason, specMsg string
+		stampLocked               = true
+	)
+	switch phase {
+	case dfaasv1.LoadTestCompleted:
+		ready = metav1.ConditionTrue
+		reason = dfaasv1.LTReasonCompleted
+		message = "metrics exported, test complete"
+		specLocked = metav1.ConditionTrue
+		specLockedReason = dfaasv1.LTReasonPostStart
+		specMsg = "spec is immutable post-completion"
+	case dfaasv1.LoadTestFailed:
+		ready = metav1.ConditionFalse
+		reason = dfaasv1.LTReasonFailed
+		message = "load test failed"
+		specLocked = metav1.ConditionTrue
+		specLockedReason = dfaasv1.LTReasonPostStart
+		specMsg = "spec is immutable post-failure"
+	case dfaasv1.LoadTestAborted:
+		ready = metav1.ConditionFalse
+		reason = dfaasv1.LTReasonAborted
+		message = "load test aborted"
+		specLocked = metav1.ConditionTrue
+		specLockedReason = dfaasv1.LTReasonPostStart
+		specMsg = "spec is immutable post-abort"
+	case dfaasv1.LoadTestRunning:
+		ready = metav1.ConditionFalse
+		reason = dfaasv1.LTReasonRunning
+		message = "remote TestRuns dispatched, k6 running"
+		specLocked = metav1.ConditionTrue
+		specLockedReason = dfaasv1.LTReasonPostStart
+		specMsg = "spec is immutable once the test has started"
+	case dfaasv1.LoadTestExporting:
+		ready = metav1.ConditionFalse
+		reason = dfaasv1.LTReasonExporterRunning
+		message = "k6 finished, metrics export in progress"
+		specLocked = metav1.ConditionTrue
+		specLockedReason = dfaasv1.LTReasonPostStart
+		specMsg = "spec is immutable during export"
+	case dfaasv1.LoadTestPending:
+		ready = metav1.ConditionFalse
+		reason = dfaasv1.LTReasonPending
+		message = "pending — waiting for environment or activation"
+		stampLocked = false
+	default:
+		ready = metav1.ConditionUnknown
+		reason = dfaasv1.LTReasonPending
+		message = "awaiting first reconcile"
+		stampLocked = false
+	}
+	meta.SetStatusCondition(&lt.Status.Conditions, metav1.Condition{
+		Type:    dfaasv1.LTCondReady,
+		Status:  ready,
+		Reason:  reason,
+		Message: message,
+	})
+	if stampLocked {
+		meta.SetStatusCondition(&lt.Status.Conditions, metav1.Condition{
+			Type:    dfaasv1.LTCondSpecLocked,
+			Status:  specLocked,
+			Reason:  specLockedReason,
+			Message: specMsg,
+		})
+	}
+}
+
+// failLoadTest stamps Failed phase + a generic failure message on the Ready
+// aggregator. Callers wanting a richer reason should stamp a sub-condition
+// before calling failLoadTest (the aggregator overwrites only Ready).
 func (r *LoadTestReconciler) failLoadTest(ctx context.Context,
 	lt *dfaasv1.LoadTest, message string) (ctrl.Result, error) {
 
-	_ = r.setLoadTestCondition(ctx, lt, "Ready", metav1.ConditionFalse, "Failed", message)
+	_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondReady, metav1.ConditionFalse,
+		dfaasv1.LTReasonFailed, message)
 	return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
 }
 
 // setLoadTestCondition sets a Condition on status using the rifetch-then-update pattern.
+// Omits LastTransitionTime so meta.SetStatusCondition keeps it stable across
+// reconciles that produce the same (status, reason, message) tuple (P14).
 func (r *LoadTestReconciler) setLoadTestCondition(ctx context.Context,
 	lt *dfaasv1.LoadTest, condType string, status metav1.ConditionStatus,
 	reason, message string) error {
@@ -276,20 +356,16 @@ func (r *LoadTestReconciler) setLoadTestCondition(ctx context.Context,
 			return err
 		}
 		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
-			Type:               condType,
-			Status:             status,
-			Reason:             reason,
-			Message:            message,
-			LastTransitionTime: metav1.Now(),
+			Type:    condType,
+			Status:  status,
+			Reason:  reason,
+			Message: message,
 		})
 		return r.Status().Update(ctx, latest)
 	})
 }
 
 // hasOwnerRef reports whether lt already lists env among its OwnerReferences.
-// Match is by UID (controllerutil.SetOwnerReference also matches by UID, so
-// this gate avoids needless Updates on every reconcile once the ref is in
-// place).
 func hasOwnerRef(lt *dfaasv1.LoadTest, env *dfaasv1.Environment) bool {
 	for _, o := range lt.OwnerReferences {
 		if o.UID == env.UID {
@@ -309,9 +385,6 @@ func (r *LoadTestReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// loadTestsForEnv enqueues every LoadTest in the Environment's namespace whose
-// spec.targetEnvironment matches. Fires when an Environment phase transition
-// (e.g. into Ready) should unblock its dependent LoadTests.
 func (r *LoadTestReconciler) loadTestsForEnv(ctx context.Context, obj client.Object) []reconcile.Request {
 	envName := obj.GetName()
 	var list dfaasv1.LoadTestList

@@ -93,12 +93,12 @@ func (r *LoadTestReconciler) resetDispatchAttempts(ctx context.Context,
 }
 
 // onDispatchError centralises the retry-budget bookkeeping on a dispatcher
-// error path. Bumps the counter; if it tips the budget, returns a Result that
-// transitions the LoadTest to Failed via failLoadTest (reason=DispatchFailed).
-// Otherwise returns a RequeueAfter Result and the caller short-circuits.
-// fatal=true means the caller MUST stop (counter tripped or failLoadTest ran).
+// error path. Bumps the counter; if it tips the budget, transitions the
+// LoadTest to Failed and stamps K6Dispatched=False/DispatchFailed. Otherwise
+// stamps K6Dispatched=False/<subReason> (P13) and returns a RequeueAfter
+// Result. fatal=true means the caller MUST stop.
 func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
-	lt *dfaasv1.LoadTest, dispatchErr error) (ctrl.Result, bool, error) {
+	lt *dfaasv1.LoadTest, dispatchErr error, subReason string) (ctrl.Result, bool, error) {
 	logger := log.FromContext(ctx)
 	count, bumpErr := r.bumpDispatchAttempts(ctx, lt)
 	if bumpErr != nil {
@@ -106,15 +106,19 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, true, nil
 	}
 	if count >= dispatchRetryBudget {
-		// Stamp the budget-trip reason explicitly before transitioning to
-		// Failed so the UI sees reason=DispatchFailed (failLoadTest itself
-		// stamps reason=Failed which is too generic for this path).
-		_ = r.setLoadTestCondition(ctx, lt, "Ready", metav1.ConditionFalse,
-			"DispatchFailed",
-			fmt.Sprintf("remote dispatch failed %d consecutive times: %v", count, dispatchErr))
+		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+			metav1.ConditionFalse, dfaasv1.LTReasonDispatchFailed,
+			fmt.Sprintf("remote dispatch failed %d consecutive times: %s",
+				count, condMessage(dispatchErr)))
 		res, err := r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
 		return res, true, err
 	}
+	// P13: sub-reason (ScriptMirrorFailed / StaleCleanupFailed / ApplyFailed)
+	// carries the diagnostic detail, retry-budget counter is in the message.
+	_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+		metav1.ConditionFalse, subReason,
+		fmt.Sprintf("attempt %d/%d: %s",
+			count, dispatchRetryBudget, condMessage(dispatchErr)))
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, true, nil
 }
 
@@ -123,6 +127,15 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 func (r *LoadTestReconciler) startK6(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// P9: first observation — nothing dispatched yet, status is Unknown.
+	// Subsequent calls below upgrade this to False/InFlight or True/
+	// AllDispatched. SetStatusCondition is idempotent on no transition.
+	if len(lt.Status.TestRuns) == 0 {
+		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+			metav1.ConditionUnknown, dfaasv1.LTReasonPending,
+			"awaiting first remote TestRun apply")
+	}
 
 	// Build a lookup from NodeID → kubeconfig Secret name, sourced from
 	// Environment.status.k6Nodes (populated by EnvironmentReconciler).
@@ -172,14 +185,14 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 		// spec.script.configMap in its own cluster, so the CM must exist there.
 		if err := r.mirrorScriptConfigMap(ctx, lt, perNode, secretRef); err != nil {
 			logger.Error(err, "remote script CM mirror failed", "node", perNode.NodeID)
-			res, _, oerr := r.onDispatchError(ctx, lt, err)
+			res, _, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonScriptMirrorFailed)
 			return res, oerr
 		}
 
 		// Wipe stale TestRun from previous runs so we start with fresh status.
 		if err := r.Dispatcher.DeleteTestRun(ctx, secretRef, remoteKey); err != nil {
 			logger.Error(err, "remote TestRun cleanup failed", "node", perNode.NodeID)
-			res, _, oerr := r.onDispatchError(ctx, lt, err)
+			res, _, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonStaleCleanupFailed)
 			return res, oerr
 		}
 		if _, err := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey); err == nil {
@@ -195,7 +208,7 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 			if perr := r.persistTestRuns(ctx, lt, refs); perr != nil {
 				logger.Error(perr, "persist partial TestRuns failed")
 			}
-			res, _, oerr := r.onDispatchError(ctx, lt, err)
+			res, _, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonApplyFailed)
 			return res, oerr
 		}
 
@@ -216,13 +229,26 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 			logger.Error(err, "persist TestRuns after apply failed")
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-		// Successful dispatcher round-trip — reset the budget counter.
+		// Successful dispatcher round-trip — reset the budget counter and
+		// surface partial progress on K6Dispatched (P9).
 		if err := r.resetDispatchAttempts(ctx, lt); err != nil {
 			logger.Error(err, "resetDispatchAttempts failed; non-fatal")
+		}
+		if len(refs) < len(lt.Spec.PerNodeLoad) {
+			_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+				metav1.ConditionFalse, dfaasv1.LTReasonInFlight,
+				fmt.Sprintf("%d/%d TestRun(s) dispatched",
+					len(refs), len(lt.Spec.PerNodeLoad)))
 		}
 	}
 
 	// All TestRuns dispatched — stamp StartTime + transition to Running.
+	_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+		metav1.ConditionTrue, dfaasv1.LTReasonAllDispatched,
+		fmt.Sprintf("dispatched %d remote TestRun(s)", len(refs)))
+	_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+		metav1.ConditionUnknown, dfaasv1.LTReasonRunning,
+		"k6 TestRuns dispatched, awaiting observation")
 	now := metav1.Now()
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &dfaasv1.LoadTest{}
@@ -232,12 +258,11 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 		latest.Status.StartTime = &now
 		latest.Status.TestRuns = refs
 		latest.Status.Phase = dfaasv1.LoadTestRunning
+		stampLTAggregate(latest, dfaasv1.LoadTestRunning)
 		return r.Status().Update(ctx, latest)
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
-	_ = r.setLoadTestCondition(ctx, lt, "Ready", metav1.ConditionFalse,
-		"K6Running", fmt.Sprintf("dispatched %d remote TestRun(s)", len(refs)))
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
@@ -270,7 +295,7 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 	}
 
 	allDone := true
-	var anyError bool
+	var errorCount, finishedCount int
 	updatedRefs := make([]dfaasv1.TestRunRef, len(lt.Status.TestRuns))
 	copy(updatedRefs, lt.Status.TestRuns)
 
@@ -286,7 +311,7 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 		tr, err := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey)
 		if err != nil {
 			logger.Error(err, "remote TestRun fetch failed", "node", ref.NodeID, "name", ref.Name)
-			res, _, oerr := r.onDispatchError(ctx, lt, err)
+			res, _, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonApplyFailed)
 			return res, oerr
 		}
 		// Successful dispatcher round-trip — reset the budget counter.
@@ -298,9 +323,9 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 
 		switch stage {
 		case "finished", "stopped":
-			// done
+			finishedCount++
 		case "error":
-			anyError = true
+			errorCount++
 		default:
 			allDone = false
 		}
@@ -316,14 +341,39 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 		return r.Status().Update(ctx, latest)
 	})
 
-	if anyError {
-		return r.failLoadTest(ctx, lt, "at least one remote TestRun reported an error")
-	}
+	total := len(lt.Status.TestRuns)
+	runningCount := total - finishedCount - errorCount
+
+	// P9: K6Healthy rollup with a per-node count in the message.
 	if !allDone {
+		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+			metav1.ConditionUnknown, dfaasv1.LTReasonRunning,
+			fmt.Sprintf("%d/%d finished, %d error, %d running",
+				finishedCount, total, errorCount, runningCount))
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
-	// All TestRuns done → stamp EndTime and move to Exporting.
+	switch {
+	case errorCount == 0:
+		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+			metav1.ConditionTrue, dfaasv1.LTReasonAllFinished,
+			fmt.Sprintf("%d/%d TestRun(s) finished cleanly", finishedCount, total))
+	case finishedCount == 0:
+		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+			metav1.ConditionFalse, dfaasv1.LTReasonAllFailed,
+			fmt.Sprintf("%d/%d TestRun(s) reported error", errorCount, total))
+		return r.failLoadTest(ctx, lt,
+			fmt.Sprintf("all %d remote TestRuns reported error stage", errorCount))
+	default:
+		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+			metav1.ConditionFalse, dfaasv1.LTReasonPartialFailure,
+			fmt.Sprintf("%d finished, %d error (of %d)",
+				finishedCount, errorCount, total))
+		return r.failLoadTest(ctx, lt,
+			fmt.Sprintf("%d of %d remote TestRuns reported error stage", errorCount, total))
+	}
+
+	// All TestRuns done cleanly → stamp EndTime and move to Exporting.
 	now := metav1.Now()
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &dfaasv1.LoadTest{}
@@ -332,6 +382,7 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 		}
 		latest.Status.EndTime = &now
 		latest.Status.Phase = dfaasv1.LoadTestExporting
+		stampLTAggregate(latest, dfaasv1.LoadTestExporting)
 		return r.Status().Update(ctx, latest)
 	}); err != nil {
 		return ctrl.Result{}, err
@@ -353,22 +404,19 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 	if apierrors.IsNotFound(err) {
 		logger.Info("creating exporter Job", "job", jobName)
 		if lt.Status.StartTime == nil || lt.Status.EndTime == nil {
+			_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+				metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
+				"missing StartTime/EndTime; cannot run exporter")
 			return r.failLoadTest(ctx, lt, "missing StartTime/EndTime; cannot run exporter")
 		}
 
-		// Resolve the Environment's S3 config (optional). When set, we
-		// fetch the source Secret from dfaas-s3, mirror it into the
-		// LoadTest namespace (cross-namespace mounts are impossible), and
-		// pass the local mirror name into the exporter Job builder. The
-		// mirror carries an OwnerRef back to the LoadTest so it cascades
-		// on LoadTest deletion.
 		var s3SecretName string
 		if env.Spec.S3ConfigRef != nil {
 			mirrored, mirrorErr := r.ensureMirroredS3Secret(ctx, lt, env.Spec.S3ConfigRef.Name)
 			if mirrorErr != nil {
 				if apierrors.IsNotFound(mirrorErr) {
-					_ = r.setLoadTestCondition(ctx, lt, "Ready", metav1.ConditionFalse,
-						"S3ConfigMissing",
+					_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+						metav1.ConditionFalse, dfaasv1.LTReasonS3ConfigMissing,
 						fmt.Sprintf("S3 config %q not found in namespace %s",
 							env.Spec.S3ConfigRef.Name, S3ConfigNamespace))
 					return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
@@ -380,11 +428,17 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 
 		newJob, err := r.createExporterJob(lt, env, lt.Status.StartTime.Time, lt.Status.EndTime.Time, s3SecretName)
 		if err != nil {
+			_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+				metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
+				"build exporter job: "+condMessage(err))
 			return r.failLoadTest(ctx, lt, fmt.Sprintf("build exporter job: %v", err))
 		}
 		if err := r.Create(ctx, newJob); err != nil && !apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{}, err
 		}
+		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+			metav1.ConditionUnknown, dfaasv1.LTReasonExporterRunning,
+			"exporter Job created, awaiting completion")
 		_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			latest := &dfaasv1.LoadTest{}
 			if err := r.Get(ctx, client.ObjectKeyFromObject(lt), latest); err != nil {
@@ -401,11 +455,15 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 
 	if job.Status.Succeeded > 0 {
 		logger.Info("exporter Job succeeded")
-		_ = r.setLoadTestCondition(ctx, lt, "Ready", metav1.ConditionTrue,
-			"ExportSucceeded", "metrics exported")
+		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+			metav1.ConditionTrue, dfaasv1.LTReasonExportSucceeded,
+			"metrics exported")
 		return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestCompleted)
 	}
 	if job.Status.Failed > 0 {
+		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+			metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
+			"exporter Job reported Failed")
 		return r.failLoadTest(ctx, lt, "exporter Job failed")
 	}
 	logger.Info("exporter Job running")
@@ -568,7 +626,12 @@ func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	_ = r.setLoadTestCondition(ctx, lt, "Ready", metav1.ConditionFalse,
+	// MetricsExported never ran on abort — stamp False/Skipped per P9 so
+	// UI does not show "in flight" forever on the aborted CR.
+	_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+		metav1.ConditionFalse, dfaasv1.LTReasonExportSkipped,
+		"no exporter ran — test was aborted")
+	_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondReady, metav1.ConditionFalse,
 		reason, message)
 	return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestAborted)
 }
@@ -618,7 +681,7 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 	// idempotent: DeleteTestRun uses IgnoreNotFound under the hood, and the
 	// helper transitions phase → Aborted as a side effect. We ignore the
 	// returned Result and run our own NotFound poll below.
-	if _, abortErr := r.abortLoadTest(ctx, lt, &env, "UserAborted",
+	if _, abortErr := r.abortLoadTest(ctx, lt, &env, dfaasv1.LTReasonUserAborted,
 		"LoadTest aborted on user delete"); abortErr != nil {
 		logger.Error(abortErr, "abortLoadTest during deletion failed; will retry")
 		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil

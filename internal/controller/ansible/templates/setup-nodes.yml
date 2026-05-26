@@ -163,9 +163,8 @@
       retries: 10 #diminuiti da 40 a 10 
       delay: 5 #diminuiti da 10 a 5
 
-    # faas_list returns the raw CLI command, not a parsed list — keep a single
-    # shell call to get a parseable name list, then drive the destructive op
-    # through the mschuchard.general.faas_remove module.
+    # list step intentionally shells out (faas_list RETURN only exposes the raw
+    # CLI command, not a parsed name list); remove + deploy use modules.
     - name: "Get currently-deployed function names"
       ansible.builtin.command:
         cmd: "/usr/local/bin/faas-cli list --gateway={{ openfaas_url }} --quiet"
@@ -176,8 +175,9 @@
       until: deployed_functions_raw.rc == 0
 
     - name: "Prune stale functions"
-      ansible.builtin.command:
-        cmd: "/usr/local/bin/faas-cli remove {{ item }} --gateway={{ openfaas_url }}"
+      mschuchard.general.faas_remove:
+        name: "{{ item }}"
+        gateway: "{{ openfaas_url }}"
       loop: "{{ deployed_functions_raw.stdout_lines | default([]) }}"
       when:
         - node_specific_functions is defined
@@ -185,17 +185,17 @@
         - item not in (node_specific_functions | map(attribute='name') | list)
 
     - name: "Deploy / update functions from Environment spec"
-      ansible.builtin.command:
-        cmd: >-
-          /usr/local/bin/faas-cli deploy
-          --image={{ item.image }}
-          --name={{ item.name }}
-          --gateway={{ openfaas_url }}
-          --update=true
-          --env=exec_timeout={{ item.execTimeout }}s
-          --env=max_inflight={{ item.maxInflight }}
-          --label=dfaas.timeout_ms={{ item.timeoutMs }}
-          --label=dfaas.maxrate={{ item.maxRate | default(100) }}
+      mschuchard.general.faas_deploy:
+        image: "{{ item.image }}"
+        name: "{{ item.name }}"
+        gateway: "{{ openfaas_url }}"
+        strategy: update
+        env:
+          exec_timeout: "{{ item.execTimeout }}s"
+          max_inflight: "{{ item.maxInflight }}"
+        label:
+          dfaas.timeout_ms: "{{ item.timeoutMs }}"
+          dfaas.maxrate: "{{ item.maxRate | default(100) }}"
       loop: "{{ node_specific_functions | default([]) }}"
       when: node_specific_functions is defined and (node_specific_functions | length) > 0
 

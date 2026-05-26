@@ -13,7 +13,7 @@ package v1
 import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 // EnvironmentPhase tracks the infrastructure lifecycle.
-// +kubebuilder:validation:Enum=Idle;ProvisioningVMs;ProvisioningInfra;ProvisioningMonitoring;Ready;Failed
+// +kubebuilder:validation:Enum=Idle;ProvisioningVMs;ProvisioningInfra;ProvisioningMonitoring;Ready;Degraded;Failed
 type EnvironmentPhase string
 
 const (
@@ -22,7 +22,53 @@ const (
 	EnvProvisioningInfra      EnvironmentPhase = "ProvisioningInfra"
 	EnvProvisioningMonitoring EnvironmentPhase = "ProvisioningMonitoring"
 	EnvReady                  EnvironmentPhase = "Ready"
-	EnvFailed                 EnvironmentPhase = "Failed"
+	// EnvDegraded marks an Environment whose dfaas/k6 infra is up but whose
+	// monitoring stack failed terminally. LoadTests are still permitted; the
+	// dataExporter step will surface the monitoring failure later.
+	EnvDegraded EnvironmentPhase = "Degraded"
+	EnvFailed   EnvironmentPhase = "Failed"
+)
+
+// Condition Types stamped on Environment.status.conditions (P15).
+const (
+	EnvCondReady               = "Ready"
+	EnvCondVMsReady            = "VMsReady"
+	EnvCondDfaasWorkersReady   = "DfaasWorkersReady"
+	EnvCondK6Ready             = "K6Ready"
+	EnvCondInfrastructureReady = "InfrastructureReady"
+	EnvCondMonitoringReady     = "MonitoringReady"
+	EnvCondUpdating            = "Updating"
+	EnvCondDependenciesReady   = "DependenciesReady"
+)
+
+// Condition Reasons stamped on Environment.status.conditions (P15).
+const (
+	EnvReasonSkipped            = "Skipped"
+	EnvReasonNoWorkers          = "NoWorkers"
+	EnvReasonNoK6Nodes          = "NoK6Nodes"
+	EnvReasonVMsProvisioned     = "VMsProvisioned"
+	EnvReasonK6Provisioned      = "K6Provisioned"
+	EnvReasonSSHReachable       = "SSHReachable"
+	EnvReasonSSHUnreachable     = "SSHUnreachable"
+	EnvReasonAnsibleRunning     = "AnsibleRunning"
+	EnvReasonAnsibleFailed      = "AnsibleFailed"
+	EnvReasonJobCreationFailed  = "JobCreationFailed"
+	EnvReasonHelmInstalling     = "HelmInstalling"
+	EnvReasonHelmFailed         = "HelmFailed"
+	EnvReasonWaitingPods        = "WaitingPods"
+	EnvReasonPodsRunning        = "PodsRunning"
+	EnvReasonInfraReady         = "InfraReady"
+	EnvReasonInfraFailed        = "InfraFailed"
+	EnvReasonDegraded           = "Degraded"
+	EnvReasonUpdating           = "Updating"
+	EnvReasonSpecChanged        = "SpecChanged"
+	EnvReasonInitializing       = "Initializing"
+	EnvReasonProvisioning       = "Provisioning"
+	EnvReasonAllSubsystemsReady = "AllSubsystemsReady"
+	EnvReasonFailed             = "Failed"
+	EnvReasonLibp2pKeyError     = "Libp2pKeyError"
+	EnvReasonNodeStatusError    = "NodeStatusError"
+	EnvReasonJobPending         = "JobPending"
 )
 
 // EnvironmentNode declares one machine in the federation.

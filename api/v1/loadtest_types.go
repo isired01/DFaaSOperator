@@ -28,6 +28,54 @@ const (
 	LoadTestAborted   LoadTestPhase = "Aborted"
 )
 
+// Condition Types stamped on LoadTest.status.conditions (P15).
+const (
+	LTCondReady             = "Ready"
+	LTCondSuspended         = "Suspended"
+	LTCondEnvironmentLinked = "EnvironmentLinked"
+	LTCondScheduled         = "Scheduled"
+	LTCondK6Dispatched      = "K6Dispatched"
+	LTCondK6Healthy         = "K6Healthy"
+	LTCondMetricsExported   = "MetricsExported"
+	LTCondSpecLocked        = "SpecLocked"
+)
+
+// Condition Reasons stamped on LoadTest.status.conditions (P15).
+const (
+	LTReasonDraftSaved             = "DraftSaved"
+	LTReasonActivated              = "Activated"
+	LTReasonScheduledArmed         = "ScheduledArmed"
+	LTReasonScheduledFired         = "ScheduledFired"
+	LTReasonScheduledDelayedEnvNot = "ScheduledDelayedEnvNotReady"
+	LTReasonNotScheduled           = "NotScheduled"
+	LTReasonInFlight               = "InFlight"
+	LTReasonAllDispatched          = "AllDispatched"
+	LTReasonDispatchFailed         = "DispatchFailed"
+	LTReasonPending                = "Pending"
+	LTReasonAllFinished            = "AllFinished"
+	LTReasonPartialFailure         = "PartialFailure"
+	LTReasonAllFailed              = "AllFailed"
+	LTReasonRunning                = "Running"
+	LTReasonK6Running              = "K6Running"
+	LTReasonExporterRunning        = "ExporterRunning"
+	LTReasonExportSucceeded        = "ExportSucceeded"
+	LTReasonJobFailed              = "JobFailed"
+	LTReasonExportSkipped          = "Skipped"
+	LTReasonS3ConfigMissing        = "S3ConfigMissing"
+	LTReasonUserAborted            = "UserAborted"
+	LTReasonCompleted              = "Completed"
+	LTReasonFailed                 = "Failed"
+	LTReasonAborted                = "Aborted"
+	LTReasonScriptMirrorFailed     = "ScriptMirrorFailed"
+	LTReasonStaleCleanupFailed     = "StaleCleanupFailed"
+	LTReasonApplyFailed            = "ApplyFailed"
+	LTReasonPostStart              = "PostStart"
+	LTReasonEnvNotFound            = "EnvNotFound"
+	LTReasonEnvFound               = "EnvFound"
+	LTReasonEnvFailed              = "EnvFailed"
+	LTReasonEnvDegraded            = "EnvDegraded"
+)
+
 // PerNodeLoad is the FE-supplied per-k6-machine load. The reconciler creates
 // one remote TestRun per entry against the matching k6-load-generator node's
 // k3s cluster.

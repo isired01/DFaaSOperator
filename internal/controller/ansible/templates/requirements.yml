@@ -7,3 +7,5 @@ collections:
     version: ">=3.0.0"
   - name: community.general
     version: ">=8.0.0"
+  - name: mschuchard.general
+    version: ">=1.4.2"
