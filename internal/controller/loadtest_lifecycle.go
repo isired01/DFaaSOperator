@@ -470,13 +470,19 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-// ensureMirroredS3Secret copies the S3 config Secret out of the cluster-
-// scoped registry namespace (S3ConfigNamespace) into the LoadTest's own
-// namespace under the same name. The mirror carries an OwnerRef back to the
-// LoadTest so deleting the LoadTest cascades the local copy — credentials do
-// not outlive the test that consumed them. Idempotent: re-runs update the
-// data block in place. Returns the mirrored Secret name. apierrors.IsNotFound
-// on the source is the caller-handled "S3ConfigMissing" path.
+// ensureMirroredS3Secret copies the S3 config Secret from S3ConfigNamespace
+// into the LoadTest's namespace under the same name. The mirror is a SHARED
+// same-namespace cache: any LoadTest, against any Environment, may consume
+// it. No controller OwnerRef is set — Kubernetes' single-Controller invariant
+// would otherwise pin the mirror to the first LT and block every subsequent
+// consumer with AlreadyOwnedError.
+//
+// Lifecycle is operator-out-of-band: orphans are identified by the
+// dfaas.io/s3-config=true label and may be cleaned by a future GC job or
+// `kubectl delete secret`. Storage cost is negligible (credentials < 1 KB).
+//
+// Idempotent: re-runs refresh data + label in place. apierrors.IsNotFound on
+// the source is the caller-handled "S3ConfigMissing" path.
 func (r *LoadTestReconciler) ensureMirroredS3Secret(ctx context.Context,
 	lt *dfaasv1.LoadTest, configName string) (string, error) {
 
@@ -502,7 +508,11 @@ func (r *LoadTestReconciler) ensureMirroredS3Secret(ctx context.Context,
 		for k, v := range src.Data {
 			mirror.Data[k] = v
 		}
-		return controllerutil.SetControllerReference(lt, mirror, r.Scheme)
+		// Strip any legacy controller OwnerRef from a prior LT/Env-scoped
+		// mirror. The shared model has no controller; leaving stale refs
+		// would cascade-delete the mirror when the legacy owner is GC'd.
+		mirror.OwnerReferences = nil
+		return nil
 	})
 	if err != nil {
 		return "", fmt.Errorf("mirror S3 config %q: %w", configName, err)

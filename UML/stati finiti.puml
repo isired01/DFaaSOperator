@@ -3,89 +3,122 @@ skinparam backgroundColor #FFFFFF
 skinparam state {
   BackgroundColor #E1F5FE
   BorderColor #01579B
-  BackgroundColor<<External>> #FFF9C4
-  BorderColor<<External>> #FBC02D
   BackgroundColor<<Error>> #FFCCCC
   BorderColor<<Error>> #FF0000
+  BackgroundColor<<Degraded>> #FFE0B2
+  BorderColor<<Degraded>> #E65100
 }
 
-title Architettura Logica delle Fasi dell'Esperimento (v2)
+<style>
+stateDiagram {
+  .EnvRoot {
+    BackgroundColor #A5D6A7
+    LineColor #1B5E20
+    LineThickness 6
+    FontStyle bold
+    FontSize 18
+  }
+  .LTRoot {
+    BackgroundColor #CE93D8
+    LineColor #4A148C
+    LineThickness 6
+    FontStyle bold
+    FontSize 18
+  }
+}
+</style>
 
-[*] --> INITIAL_STATE
+legend top left
+  | Colore | Significato |
+  | <#A5D6A7> | Environment FSM (radice infra) |
+  | <#CE93D8> | LoadTest FSM (radice test) |
+  Tutto parte da queste due FSM.
+endlegend
 
-state INITIAL_STATE {
-  INITIAL_STATE : Inizio Esperimento
-  INITIAL_STATE : Lettura specifica CDR (n. nodi, caratteristiche...)
+title FSM per Environment + LoadTest (v3, two-CRD split). Note: condizione canonica all'ingresso.
+
+' =====================================================================
+' Environment FSM
+' Source: internal/controller/environment_controller.go +
+'         internal/controller/environment_lifecycle.go
+' =====================================================================
+state "Environment FSM" as EnvFSM <<EnvRoot>> #A5D6A7 ##[bold]1B5E20 {
+  [*] --> Idle
+
+  state Idle
+  state ProvisioningVMs
+  ProvisioningVMs : VMsReady=True/SSHReachable
+
+  state ProvisioningInfra
+  ProvisioningInfra : InfrastructureReady=True/InfraReady
+
+  state ProvisioningMonitoring
+  ProvisioningMonitoring : MonitoringReady=True/PodsRunning
+
+  state Ready
+  Ready : Ready=True/AllSubsystemsReady
+
+  state Degraded <<Degraded>>
+  Degraded : Ready=False/Degraded
+
+  state Failed <<Error>>
+  Failed : Ready=False/Failed
+
+  Idle --> ProvisioningVMs
+  ProvisioningVMs --> ProvisioningInfra : SSH OK su tutti host
+  ProvisioningInfra --> ProvisioningMonitoring : entrambi Ansible Job Succeeded
+  ProvisioningInfra --> Failed : Ansible Job Failed (post fan-in)
+  ProvisioningMonitoring --> Ready : Helm + Check + syncNodeStatus OK
+  ProvisioningMonitoring --> Degraded : monitoringRetryBudget esaurito
+  Ready --> ProvisioningVMs : drift spec.generation
+  Degraded --> ProvisioningVMs : drift spec.generation
+  Failed --> ProvisioningVMs : drift spec.generation
 }
 
-state INFRASTRUCTURE_PROVISIONING {
-  INFRASTRUCTURE_PROVISIONING : Creazione macchine virtuali
-  state INSTALLING_DFAAS {
-  INSTALLING_DFAAS : Installazione dFaaS Agent, OpenFaaS e HAProxy...
+' =====================================================================
+' LoadTest FSM
+' Source: internal/controller/loadtest_controller.go +
+'         internal/controller/loadtest_lifecycle.go
+' =====================================================================
+state "LoadTest FSM" as LTFSM <<LTRoot>> #CE93D8 ##[bold]4A148C {
+  [*] --> Pending
+
+  state Pending
+  Pending : EnvironmentLinked=True/EnvFound
+  Pending : Ready=False/Pending
+
+  state Running
+  Running : K6Dispatched=True/AllDispatched
+  Running : SpecLocked=True/PostStart
+
+  state Exporting
+  Exporting : K6Healthy=True/AllFinished
+  Exporting : MetricsExported=Unknown/ExporterRunning
+
+  state Completed
+  Completed : MetricsExported=True/ExportSucceeded
+  Completed : Ready=True/Completed
+
+  state LTFailed <<Error>>
+  LTFailed : Failed
+  LTFailed : Ready=False/Failed
+
+  state Aborted
+  Aborted : MetricsExported=False/Skipped
+  Aborted : Ready=False/Aborted
+
+  Pending --> Pending : suspended=true (DraftSaved) | startAt>now (ScheduledArmed)
+  Pending --> Running : env Ready|Degraded AND !suspended AND startAt scaduto
+  Pending --> LTFailed : env NotFound | env Failed
+  Pending --> Aborted : stop=true (abort draft)
+  Running --> Exporting : tutti TestRun in finished|stopped
+  Running --> LTFailed : TestRun error | dispatchRetryBudget esaurito
+  Running --> Aborted : stop=true
+  Exporting --> Completed : exporter Job Succeeded
+  Exporting --> LTFailed : exporter Job Failed | S3ConfigMissing
+  Completed --> [*]
+  LTFailed --> [*]
+  Aborted --> [*]
 }
-
-  state INSTALLING_DFAAS {
-  INSTALLING_DFAAS : Installazione dFaaS Agent, OpenFaaS e HAProxy...
-}
-}
-
-
-
-state PROVISIONING_MONITORING {
-  PROVISIONING_MONITORING : Installazione stack monitoring(Prometheus, Grafana e MinIO)
-}
-
-state READY <<External>> {
-  READY : Sistema configurato e pronto
-  READY : Configurazione script k6
-}
-
-note right of READY
-  **INTERVENTO ESTERNO RICHIESTO**
-  Il controller rimane in attesa di un input
-  dal frontend o di un cambio stato manuale.
-end note
-
-state RUNNING <<External>> {
-  RUNNING : Esecuzione Job k6
-  RUNNING : Monitoraggio metriche real-time
-}
-
-state COOLDOWN {
-  COOLDOWN : Sincronizzazione dati Prometheus
-  COOLDOWN : Estrazione risultati in CSV verso MinIO
-}
-
-state CLEANUP {
-  CLEANUP : Rimozione VMs
-}
-
-state COMPLETED {
-  COMPLETED : Esperimento Terminato correttamente
-}
-
-' Transizioni basate sullo Switch Case del Controller
-INITIAL_STATE --> INFRASTRUCTURE_PROVISIONING : [case ""]
-INFRASTRUCTURE_PROVISIONING --> INSTALLING_DFAAS : [case "INFRASTRUCTURE_PROVISIONING"]
-INSTALLING_DFAAS --> PROVISIONING_MONITORING : [case "INSTALLING_DFAAS"]
-PROVISIONING_MONITORING --> READY : [case "PROVISIONING_MONITORING"]
-
-' Transizioni gestite esternamente (Frontend)
-READY --> RUNNING : Input Esterno (Frontend)
-RUNNING --> COOLDOWN : Fine Test / Input Esterno
-
-' Ripresa flusso automatico per chiusura
-COOLDOWN --> CLEANUP : [case "COOLDOWN"]
-CLEANUP --> COMPLETED : [case "CLEANUP"]
-COMPLETED --> [*] : [case "COMPLETED"]
-
-' Gestione Errori
-state FAILED <<Error>> {
-  FAILED : Snapshot log e stato errore
-}
-
-INFRASTRUCTURE_PROVISIONING --> FAILED : Errore SSH/K3s
-INSTALLING_DFAAS --> FAILED : Errore Helm/P2P
-PROVISIONING_MONITORING --> FAILED : Errore DNS/Svc
 
 @enduml

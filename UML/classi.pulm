@@ -1,56 +1,147 @@
 @startuml
-title CDR per dFaaSOperator -- Class Diagram
+title CRD per dFaaSOperator -- Class Diagram (v3, two-CRD split)
 
 skinparam class {
-    BackgroundColor<<CRD>> #E1F5FE
-    BorderColor #01579B
-}
-skinparam enum {
-    BackgroundColor #FFF9C4
-    BorderColor #FBC02D
+    BackgroundColor #FFFFFF
+    BorderColor #000000
 }
 
-' Classi Principali (Kubernetes Style)
-class "Esperimento <<CRD>>" as Esperimento {
+<style>
+classDiagram {
+  .EnvRoot {
+    BackgroundColor #A5D6A7
+    LineColor #1B5E20
+    LineThickness 6
+    FontStyle bold
+    FontSize 18
+  }
+  .LTRoot {
+    BackgroundColor #CE93D8
+    LineColor #4A148C
+    LineThickness 6
+    FontStyle bold
+    FontSize 18
+  }
+}
+</style>
+
+legend top left
+  | Colore | Significato |
+  | <#A5D6A7> | Environment CRD (radice infra) |
+  | <#CE93D8> | LoadTest CRD (radice test) |
+  Tutto parte da queste due classi.
+endlegend
+
+' =====================================================================
+' Environment CRD
+' =====================================================================
+class Environment <<EnvRoot>> #A5D6A7 ##[bold]1B5E20 {
     + metav1.ObjectMeta metadata
-    + ExperimentSpec spec
-    + ExperimentStatus status
+    + EnvironmentSpec spec
+    + EnvironmentStatus status
 }
 
-class ExperimentSpec {
-    + Federation federation
+class EnvironmentSpec {
+    + List<EnvironmentNode> nodes
     + Topology topology
-    + bool isCleanupRequested
+    + bool cleanupOnDelete
+    + S3ConfigRef s3ConfigRef
 }
 
-class ExperimentStatus {
-    + FaseEsperimento phase
-    + String message
+class EnvironmentStatus {
+    + EnvironmentPhase phase
+    + int64 observedGeneration
+    + List<K6NodeStatus> k6Nodes
+    + List<String> dfaasNodes
     + List<metav1.Condition> conditions
+    + String message
 }
 
-' Sotto-strutture Spec
-class Federation {
-    + List<Node> nodes
-}
-
-class Node {
+class EnvironmentNode {
     + String nodeID
     + String ipAddress
+    + NodeRole role
+    + NodeCapacity capacity
     + String username
     + String password
-    + String privateKey
-    + NodeCapacity capacity
     + BalancingStrategy balancingStrategy
     + List<Function> functions
 }
 
+class S3ConfigRef {
+    + String name
+}
+
+class K6NodeStatus {
+    + String nodeID
+    + String ipAddress
+    + String kubeconfigSecret
+}
+
+' =====================================================================
+' LoadTest CRD
+' =====================================================================
+class LoadTest <<LTRoot>> #CE93D8 ##[bold]4A148C {
+    + metav1.ObjectMeta metadata
+    + LoadTestSpec spec
+    + LoadTestStatus status
+}
+
+class LoadTestSpec {
+    + String targetEnvironment
+    + List<PerNodeLoad> perNodeLoad
+    + MetricsExportSpec metricsExport
+    + bool suspended
+    + metav1.Time startAt
+    + bool stop
+}
+
+class LoadTestStatus {
+    + LoadTestPhase phase
+    + metav1.Time startTime
+    + metav1.Time endTime
+    + List<TestRunRef> testRuns
+    + String exporterJob
+    + List<metav1.Condition> conditions
+    + String message
+}
+
+class PerNodeLoad {
+    + String nodeID
+    + int vus
+    + String duration
+    + LocalObjectReference scriptConfigMap
+}
+
+class MetricsExportSpec {
+    + List<MetricExportEntry> metrics
+    + String step
+}
+
+class MetricExportEntry {
+    + MetricsExportType type
+    + String metricName
+    + String query
+    + String comment
+}
+
+class TestRunRef {
+    + String nodeID
+    + String name
+    + String namespace
+    + String phase
+}
+
+' =====================================================================
+' Shared types (api/v1/common_types.go)
+' =====================================================================
 class Function {
     + String name
     + String image
     + int execTimeout
     + int maxInflight
     + int timeoutMs
+    + int32 maxRate
 }
 
 class Topology {
@@ -63,16 +154,34 @@ class Link {
     + int latencyMs
 }
 
-' Enumerazioni
-enum FaseEsperimento {
-    IDLE
-    PROVISIONING
-    READY
-    RUNNING
-    COOLDOWN
-    COMPLETED
-    FAILED
-    CLEANUP
+' =====================================================================
+' Enums -- phases
+' =====================================================================
+enum EnvironmentPhase {
+    Idle
+    ProvisioningVMs
+    ProvisioningInfra
+    ProvisioningMonitoring
+    Ready
+    Degraded
+    Failed
+}
+
+enum LoadTestPhase {
+    Pending
+    Running
+    Exporting
+    Completed
+    Failed
+    Aborted
+}
+
+' =====================================================================
+' Enums -- domain
+' =====================================================================
+enum NodeRole {
+    dfaas-worker
+    k6-load-generator
 }
 
 enum NodeCapacity {
@@ -89,20 +198,76 @@ enum BalancingStrategy {
     rlagentstrategy
 }
 
-' Relazioni Gerarchiche
-Esperimento *-- ExperimentSpec
-Esperimento *-- ExperimentStatus
+enum MetricsExportType {
+    raw
+    custom-promql
+}
 
-ExperimentSpec *-- Federation
-ExperimentSpec *-- Topology
+' =====================================================================
+' Enums -- condition vocabularies (P15)
+' =====================================================================
+enum "EnvConditionType <<Conditions>>" as EnvConditionType {
+    Ready
+    VMsReady
+    DfaasWorkersReady
+    K6Ready
+    InfrastructureReady
+    MonitoringReady
+    DependenciesReady
+    Updating
+}
 
-Federation *-- "many" Node
-Node *-- "many" Function
+enum "LTConditionType <<Conditions>>" as LTConditionType {
+    Ready
+    Suspended
+    EnvironmentLinked
+    Scheduled
+    K6Dispatched
+    K6Healthy
+    MetricsExported
+    SpecLocked
+}
+
+' =====================================================================
+' Composition arrows
+' =====================================================================
+Environment *-- EnvironmentSpec
+Environment *-- EnvironmentStatus
+
+EnvironmentSpec *-- "many" EnvironmentNode
+EnvironmentSpec *-- Topology
+EnvironmentSpec *-- S3ConfigRef
+EnvironmentStatus *-- "many" K6NodeStatus
+
+EnvironmentNode *-- "many" Function
 Topology *-- "many" Link
 
-' Relazioni con Enums
-ExperimentStatus -- FaseEsperimento
-Node -- NodeCapacity
-Node -- BalancingStrategy
+LoadTest *-- LoadTestSpec
+LoadTest *-- LoadTestStatus
+
+LoadTestSpec *-- "many" PerNodeLoad
+LoadTestSpec *-- MetricsExportSpec
+LoadTestStatus *-- "many" TestRunRef
+
+MetricsExportSpec *-- "many" MetricExportEntry
+
+' =====================================================================
+' Enum associations
+' =====================================================================
+EnvironmentStatus -- EnvironmentPhase
+EnvironmentStatus -- EnvConditionType
+EnvironmentNode -- NodeRole
+EnvironmentNode -- NodeCapacity
+EnvironmentNode -- BalancingStrategy
+
+LoadTestStatus -- LoadTestPhase
+LoadTestStatus -- LTConditionType
+MetricExportEntry -- MetricsExportType
+
+' =====================================================================
+' Cross-CRD soft reference (resolved at reconcile time by name,
+' namespace-local; OwnerRef stamped on first successful link).
+' =====================================================================
+LoadTest ..> Environment : targetEnvironment
 
 @enduml
