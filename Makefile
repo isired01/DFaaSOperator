@@ -130,18 +130,12 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 
 ##@ Helm
 
-.PHONY: helm-sync-crds
-helm-sync-crds: manifests ## Copy generated CRDs into the Helm chart crds/ folder.
-	mkdir -p $(CHART_DIR)/crds
-	cp config/crd/bases/dfaas.dfaas.io_environments.yaml $(CHART_DIR)/crds/
-	cp config/crd/bases/dfaas.dfaas.io_loadtests.yaml    $(CHART_DIR)/crds/
-
 .PHONY: helm-lint
 helm-lint: ## Lint the Helm chart.
 	helm lint $(CHART_DIR)
 
 .PHONY: helm-package
-helm-package: helm-sync-crds ## Package the Helm chart into dist/.
+helm-package: ## Package the Helm chart into dist/.
 	mkdir -p $(CHART_DEST)
 	helm package $(CHART_DIR) \
 		--version $(CHART_VERSION) \

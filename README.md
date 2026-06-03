@@ -11,6 +11,8 @@ The operator ships as a single Deployment that runs **two controllers** against 
 
 Prereqs: K8s ≥ 1.25, `kubectl` connesso al cluster, `helm` ≥ 3.8 (per OCI), pull anonimo da `ghcr.io` raggiungibile dal cluster.
 
+### Step 1 — Installa operator + UI via Helm
+
 ```bash
 helm install dfaas oci://ghcr.io/isired01/charts/dfaas \
   --version 1.0.0 \
@@ -22,7 +24,39 @@ kubectl -n dfaas-ui port-forward svc/dfaas-ui 8082:8082
 open http://localhost:8082
 ```
 
-Override values:
+### Step 2 — Crea i primi Custom Resource
+
+Esempi pronti in [`config/samples/`](config/samples/):
+
+- [`dfaas_v1_environment.yaml`](config/samples/dfaas_v1_environment.yaml) — Environment con dfaas-worker + k6-load-generator nodes
+- [`dfaas_v1_loadtest.yaml`](config/samples/dfaas_v1_loadtest.yaml) — LoadTest k6 contro l'Environment sopra
+
+**Prima di applicare devi configurare gli IP delle VM** (operator NON provvede macchine, le orchestra solo). Edita `spec.nodes[].ipAddress` con gli indirizzi delle VM Ubuntu già accese e raggiungibili in SSH:
+
+```yaml
+spec:
+  nodes:
+    - id: dfaas-worker-1
+      role: dfaas-worker
+      ipAddress: 10.0.0.5      # <— sostituisci con IP reale
+      sshUser: ubuntu
+      sshPassword: ...
+      # ...
+    - id: k6-load-generator-1
+      role: k6-load-generator
+      ipAddress: 10.0.0.6      # <— sostituisci con IP reale
+      # ...
+```
+
+Poi:
+
+```bash
+kubectl apply -f config/samples/dfaas_v1_environment.yaml
+kubectl get environment -w   # attendi phase=Ready
+kubectl apply -f config/samples/dfaas_v1_loadtest.yaml
+```
+
+### Override values
 
 ```bash
 helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 1.0.0 \
@@ -31,20 +65,24 @@ helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 1.0.0 \
   --set ui.ingress.host=dfaas.mio-cluster.example
 ```
 
-Upgrade:
+### Upgrade
 
 ```bash
+# Aggiorna SOLO operator + UI:
 helm upgrade dfaas oci://ghcr.io/isired01/charts/dfaas --version 1.1.0
-# CRDs NON sono aggiornate automaticamente. Per le CRD nuove:
-kubectl apply -f https://raw.githubusercontent.com/isired01/DFaaSOperator/v1.1.0/charts/dfaas/crds/dfaas.dfaas.io_environments.yaml
-kubectl apply -f https://raw.githubusercontent.com/isired01/DFaaSOperator/v1.1.0/charts/dfaas/crds/dfaas.dfaas.io_loadtests.yaml
+
+# Se la nuova release porta CRD modificate, applicale a mano PRIMA del chart upgrade:
+kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v1.1.0/dfaas.dfaas.io_environments.yaml
+kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v1.1.0/dfaas.dfaas.io_loadtests.yaml
 ```
 
-Uninstall:
+### Uninstall
 
 ```bash
 helm uninstall dfaas -n dfaas-operator-system
-# Le CRD restano per evitare cascade-delete dei CR. Per rimuoverle:
+
+# CRD restano (e con loro tutti i CR Environment/LoadTest esistenti).
+# Per cancellare tutto (cascade-delete pericoloso):
 kubectl delete crd environments.dfaas.dfaas.io loadtests.dfaas.dfaas.io
 ```
 

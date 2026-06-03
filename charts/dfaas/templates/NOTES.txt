@@ -5,6 +5,12 @@ UI namespace       : {{ .Values.ui.namespace }}
 Chart version      : {{ .Chart.Version }}
 App version        : {{ .Chart.AppVersion }}
 
+IMPORTANT — CRDs are NOT installed by this chart. Apply them once before
+creating any Environment or LoadTest:
+
+  kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v{{ .Chart.AppVersion }}/dfaas.dfaas.io_environments.yaml
+  kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v{{ .Chart.AppVersion }}/dfaas.dfaas.io_loadtests.yaml
+
 {{- if .Values.ui.enabled }}
 
 Open the UI:
@@ -24,7 +30,3 @@ Check operator status:
   kubectl -n {{ .Values.operator.namespace }} get deploy {{ include "dfaas.fullname" . }}-operator
   kubectl get crd | grep dfaas.dfaas.io
 {{- end }}
-
-CRD upgrades are NOT automatic. After a chart upgrade with new CRD revisions, apply manually:
-  kubectl apply -f https://raw.githubusercontent.com/isired01/DFaaSOperator/{{ .Chart.AppVersion }}/charts/dfaas/crds/dfaas.dfaas.io_environments.yaml
-  kubectl apply -f https://raw.githubusercontent.com/isired01/DFaaSOperator/{{ .Chart.AppVersion }}/charts/dfaas/crds/dfaas.dfaas.io_loadtests.yaml

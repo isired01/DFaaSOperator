@@ -69,14 +69,14 @@ jobs:
         with:
           version: v3.15.4
 
-      - name: Sync CRDs into chart
-        run: |
-          mkdir -p charts/dfaas/crds
-          cp config/crd/bases/dfaas.dfaas.io_environments.yaml charts/dfaas/crds/
-          cp config/crd/bases/dfaas.dfaas.io_loadtests.yaml    charts/dfaas/crds/
-
       - name: Helm lint
         run: helm lint charts/dfaas
+
+      - name: Attach CRDs to release (downloaded manually pre-install)
+        run: |
+          mkdir -p dist
+          cp config/crd/bases/dfaas.dfaas.io_environments.yaml dist/
+          cp config/crd/bases/dfaas.dfaas.io_loadtests.yaml    dist/
 
       - name: Package chart
         run: |
@@ -95,5 +95,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/dfaas-${{ env.VERSION_NO_V }}.tgz
+          files: |
+            dist/dfaas-${{ env.VERSION_NO_V }}.tgz
+            dist/dfaas.dfaas.io_environments.yaml
+            dist/dfaas.dfaas.io_loadtests.yaml
           generate_release_notes: true

@@ -1,5 +1,7 @@
-# Build the manager binary
-FROM golang:1.25 AS builder
+# Build the manager binary — pin builder to native BUILDPLATFORM and use
+# Go cross-compile (GOARCH=${TARGETARCH}) instead of QEMU-emulating the
+# whole compile stage. Cuts arm64 build time from ~30m to ~3m.
+FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
