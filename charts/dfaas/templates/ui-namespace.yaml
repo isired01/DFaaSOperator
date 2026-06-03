@@ -1,0 +1,8 @@
+{{- if .Values.ui.enabled }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.ui.namespace }}
+  labels:
+    {{- include "dfaas.ui.labels" . | nindent 4 }}
+{{- end }}

@@ -1,0 +1,64 @@
+{{- if .Values.operator.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dfaas.fullname" . }}-operator
+  namespace: {{ .Values.operator.namespace }}
+  labels:
+    {{- include "dfaas.operator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.operator.replicas }}
+  selector:
+    matchLabels:
+      {{- include "dfaas.operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dfaas.operator.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "dfaas.operator.sa" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: manager
+          image: {{ include "dfaas.operator.image" . }}
+          imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+          args:
+            - --leader-elect={{ .Values.operator.leaderElection.enabled }}
+          env:
+            - name: DFAAS_EXPORTER_IMAGE
+              value: {{ include "dfaas.exporter.image" . }}
+            {{- with .Values.operator.extraEnv }}
+            {{ toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: probe
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probe
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probe
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources: {{ toYaml .Values.operator.resources | nindent 12 }}
+      {{- with .Values.operator.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.tolerations }}
+      tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.affinity }}
+      affinity: {{ toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

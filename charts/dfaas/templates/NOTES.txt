@@ -1,0 +1,30 @@
+dFaaS chart installed.
+
+Operator namespace : {{ .Values.operator.namespace }}
+UI namespace       : {{ .Values.ui.namespace }}
+Chart version      : {{ .Chart.Version }}
+App version        : {{ .Chart.AppVersion }}
+
+{{- if .Values.ui.enabled }}
+
+Open the UI:
+  kubectl -n {{ .Values.ui.namespace }} port-forward svc/{{ include "dfaas.fullname" . }}-ui {{ .Values.ui.service.port }}:{{ .Values.ui.service.port }}
+  open http://localhost:{{ .Values.ui.service.port }}
+
+  {{- if .Values.ui.ingress.enabled }}
+
+Or via Ingress:
+  http://{{ .Values.ui.ingress.host }}/
+  {{- end }}
+{{- end }}
+
+{{- if .Values.operator.enabled }}
+
+Check operator status:
+  kubectl -n {{ .Values.operator.namespace }} get deploy {{ include "dfaas.fullname" . }}-operator
+  kubectl get crd | grep dfaas.dfaas.io
+{{- end }}
+
+CRD upgrades are NOT automatic. After a chart upgrade with new CRD revisions, apply manually:
+  kubectl apply -f https://raw.githubusercontent.com/isired01/DFaaSOperator/{{ .Chart.AppVersion }}/charts/dfaas/crds/dfaas.dfaas.io_environments.yaml
+  kubectl apply -f https://raw.githubusercontent.com/isired01/DFaaSOperator/{{ .Chart.AppVersion }}/charts/dfaas/crds/dfaas.dfaas.io_loadtests.yaml

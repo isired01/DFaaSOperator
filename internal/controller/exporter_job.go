@@ -13,6 +13,8 @@ package controller
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -23,6 +25,16 @@ import (
 
 	dfaasv1 "dfaas-operator/api/v1"
 )
+
+// exporterImage resolves the dataExporter image at Job-build time. The Helm
+// chart pins it via DFAAS_EXPORTER_IMAGE on the operator Deployment; the
+// fallback keeps `make run` workable locally.
+func exporterImage() string {
+	if v := strings.TrimSpace(os.Getenv("DFAAS_EXPORTER_IMAGE")); v != "" {
+		return v
+	}
+	return "ghcr.io/isired01/dfaas-exporter:latest"
+}
 
 // ExporterJobName composes the deterministic exporter Job name including
 // `lt.UID[:8]` and `lt.Generation`, so re-running a LoadTest after a spec
@@ -137,7 +149,7 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 					Containers: []corev1.Container{
 						{
 							Name:  "exporter",
-							Image: "ghcr.io/isired01/dfaas-exporter:latest",
+							Image: exporterImage(),
 							Env:   envVars,
 						},
 					},

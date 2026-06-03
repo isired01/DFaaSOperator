@@ -1,0 +1,18 @@
+{{- if and .Values.operator.enabled .Values.operator.metricsService.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dfaas.fullname" . }}-operator-metrics
+  namespace: {{ .Values.operator.namespace }}
+  labels:
+    {{- include "dfaas.operator.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "dfaas.operator.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.operator.metricsService.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

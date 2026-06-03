@@ -1,0 +1,308 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: loadtests.dfaas.dfaas.io
+spec:
+  group: dfaas.dfaas.io
+  names:
+    kind: LoadTest
+    listKind: LoadTestList
+    plural: loadtests
+    singular: loadtest
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.targetEnvironment
+      name: Environment
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: LoadTest is the schema for a single load-test run against an
+          Environment.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: LoadTestSpec is the desired state of one load test against
+              an Environment.
+            properties:
+              metricsExport:
+                description: MetricsExportSpec drives the exporter Job that runs after
+                  k6 finishes.
+                properties:
+                  metrics:
+                    description: |-
+                      Metrics is the structured list of entries to export. Replaces the
+                      old plaintext Queries []string; the new shape carries type, alias
+                      and free-text comment alongside the PromQL string. Passed to the
+                      exporter Job as the JSON-encoded env var METRICS_JSON.
+                    items:
+                      description: |-
+                        MetricExportEntry describes one metric the exporter should query during
+                        the LoadTest's Exporting phase. All four fields participate in the CSV
+                        output (Type and Comment become metadata columns; MetricName is the alias
+                        the CSV uses as identifier; Query is the PromQL string actually executed).
+
+                        Naming rule: when Type=raw and MetricName is empty, the operator falls
+                        back to MetricName = Query (the bare metric name doubles as alias).
+                        When Type=custom-promql, MetricName MUST be set (no sensible default
+                        from an arbitrary expression). Enforced via the CEL XValidation below.
+                      properties:
+                        comment:
+                          description: |-
+                            Comment is free-text human description, surfaced into the CSV
+                            "comment" column for post-test analysis.
+                          type: string
+                        metricName:
+                          description: |-
+                            MetricName is the alias / identifier surfaced in the CSV "metric"
+                            column. Required when Type=custom-promql. Optional when Type=raw:
+                            if empty, the operator falls back to MetricName = Query (so the
+                            bare metric name doubles as alias).
+                          type: string
+                        query:
+                          description: |-
+                            Query is the PromQL string sent to Prometheus. For Type=raw this
+                            is a bare metric name (e.g. node_memory_MemAvailable_bytes); for
+                            Type=custom-promql it is a full expression (e.g. rate(...)).
+                            Required for both types.
+                          minLength: 1
+                          type: string
+                        type:
+                          description: |-
+                            Type is documentary — it classifies the query for the UI and the
+                            CSV "type" column. The backend executes Query verbatim regardless.
+                          enum:
+                          - raw
+                          - custom-promql
+                          type: string
+                      required:
+                      - query
+                      - type
+                      type: object
+                      x-kubernetes-validations:
+                      - message: metricName is required when type is custom-promql
+                        rule: self.type != 'custom-promql' || (has(self.metricName)
+                          && size(self.metricName) > 0)
+                    minItems: 1
+                    type: array
+                  step:
+                    default: 15s
+                    description: Step for QueryRange (Go duration string).
+                    type: string
+                required:
+                - metrics
+                type: object
+              perNodeLoad:
+                description: One entry per k6-load-generator node the test should
+                  hit.
+                items:
+                  description: |-
+                    PerNodeLoad is the FE-supplied per-k6-machine load. The reconciler creates
+                    one remote TestRun per entry against the matching k6-load-generator node's
+                    k3s cluster.
+                  properties:
+                    duration:
+                      description: k6 test duration (Go duration string, e.g. "30s",
+                        "5m").
+                      type: string
+                    nodeID:
+                      description: NodeID must match a k6-load-generator node in the
+                        target Environment.
+                      type: string
+                    scriptConfigMap:
+                      description: |-
+                        ScriptConfigMap references a ConfigMap in the same namespace exposing
+                        key "script.js" with the k6 script for this machine. The FE writes one
+                        ConfigMap per LoadTest.
+                      properties:
+                        name:
+                          description: |-
+                            Name of the referent.
+                            More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                          type: string
+                      type: object
+                      x-kubernetes-map-type: atomic
+                    vus:
+                      description: k6 virtual-users for this machine.
+                      minimum: 1
+                      type: integer
+                  required:
+                  - duration
+                  - nodeID
+                  - scriptConfigMap
+                  - vus
+                  type: object
+                minItems: 1
+                type: array
+              startAt:
+                description: |-
+                  StartAt schedules the LoadTest to start at this wall-clock instant.
+                  Requires Suspended=true. The controller PATCHes Suspended=false at fire
+                  time when the target Environment is Ready. RFC3339 UTC.
+                format: date-time
+                type: string
+              stop:
+                default: false
+                description: |-
+                  Stop, when set to true, triggers a multi-cluster cascading abort:
+                  the reconciler deletes every remote TestRun for this LoadTest across
+                  all k6-load-generator nodes, then marks the central CR terminal as
+                  Aborted (preserving it as a historical record — the CR is NOT
+                  deleted). Only honored while phase is "" / Pending / Running;
+                  PATCHes after Exporting / Completed / Failed / Aborted are ignored
+                  (the state machine is immutable post-terminal).
+                type: boolean
+              suspended:
+                default: false
+                description: |-
+                  Suspended marks the LoadTest as a "Save as Draft": when true, the
+                  reconciler keeps phase=Pending, stamps Conditions[Suspended]=True,
+                  and does NOT dispatch any k6 TestRun. PATCHing to false activates
+                  the test (the Suspended Condition flips to False, phase advances to
+                  Running). Once execution begins (phase=Running or beyond), changes
+                  to this field are ignored — the run-once guard makes the state
+                  machine immutable post-start.
+
+                  Pattern mirrors batch/v1.Job.spec.suspend.
+                type: boolean
+              targetEnvironment:
+                description: Name of an Environment in the same namespace.
+                type: string
+            required:
+            - metricsExport
+            - perNodeLoad
+            - targetEnvironment
+            type: object
+          status:
+            description: LoadTestStatus is the observed state of a LoadTest.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              endTime:
+                format: date-time
+                type: string
+              exporterJob:
+                description: |-
+                  ExporterJob is the in-cluster Job name created during the Exporting
+                  phase.
+                type: string
+              message:
+                type: string
+              phase:
+                description: LoadTestPhase tracks the lifecycle of a single load test.
+                enum:
+                - Pending
+                - Running
+                - Exporting
+                - Completed
+                - Failed
+                - Aborted
+                type: string
+              startTime:
+                format: date-time
+                type: string
+              testRuns:
+                items:
+                  description: TestRunRef records one remote TestRun dispatched on
+                    a k6 machine's k3s.
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    nodeID:
+                      type: string
+                    phase:
+                      type: string
+                  required:
+                  - name
+                  - namespace
+                  - nodeID
+                  type: object
+                type: array
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

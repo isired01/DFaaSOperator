@@ -1,0 +1,19 @@
+apiVersion: v2
+name: dfaas
+description: dFaaS — operator (CRDs Environment/LoadTest) + UI control plane
+type: application
+version: 0.0.0
+appVersion: "0.0.0"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/isired01/DFaaSOperator
+sources:
+  - https://github.com/isired01/DFaaSOperator
+  - https://github.com/isired01/UI
+maintainers:
+  - name: Isaia
+keywords:
+  - dfaas
+  - kubernetes-operator
+  - load-testing
+  - k6
+icon: ""

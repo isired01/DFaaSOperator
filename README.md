@@ -7,6 +7,47 @@ The operator ships as a single Deployment that runs **two controllers** against 
 - **`Environment`** — federation infrastructure. Provisions VMs (dfaas-worker nodes + k6-load-generator nodes) and the operator-cluster monitoring stack. Long-lived: once `Ready`, it stays idle until the spec changes.
 - **`LoadTest`** — one k6 load test against an `Environment`. Looks up its `targetEnvironment`, waits until it is `Ready`, dispatches one remote k6 `TestRun` per k6-load-generator node, then runs a metrics exporter Job.
 
+## Install via Helm
+
+Prereqs: K8s ≥ 1.25, `kubectl` connesso al cluster, `helm` ≥ 3.8 (per OCI), pull anonimo da `ghcr.io` raggiungibile dal cluster.
+
+```bash
+helm install dfaas oci://ghcr.io/isired01/charts/dfaas \
+  --version 1.0.0 \
+  --create-namespace \
+  --namespace dfaas-operator-system
+
+# Apri la UI:
+kubectl -n dfaas-ui port-forward svc/dfaas-ui 8082:8082
+open http://localhost:8082
+```
+
+Override values:
+
+```bash
+helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 1.0.0 \
+  --set operator.replicas=2 \
+  --set ui.ingress.enabled=true \
+  --set ui.ingress.host=dfaas.mio-cluster.example
+```
+
+Upgrade:
+
+```bash
+helm upgrade dfaas oci://ghcr.io/isired01/charts/dfaas --version 1.1.0
+# CRDs NON sono aggiornate automaticamente. Per le CRD nuove:
+kubectl apply -f https://raw.githubusercontent.com/isired01/DFaaSOperator/v1.1.0/charts/dfaas/crds/dfaas.dfaas.io_environments.yaml
+kubectl apply -f https://raw.githubusercontent.com/isired01/DFaaSOperator/v1.1.0/charts/dfaas/crds/dfaas.dfaas.io_loadtests.yaml
+```
+
+Uninstall:
+
+```bash
+helm uninstall dfaas -n dfaas-operator-system
+# Le CRD restano per evitare cascade-delete dei CR. Per rimuoverle:
+kubectl delete crd environments.dfaas.dfaas.io loadtests.dfaas.dfaas.io
+```
+
 ## 🚀 What it does
 
 ```text

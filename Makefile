@@ -1,5 +1,13 @@
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= ghcr.io/isired01/dfaas-operator:latest
+# Exporter image (dataExporter binary)
+EXPORTER_IMG ?= ghcr.io/isired01/dfaas-exporter:latest
+# Helm chart settings
+CHART_DIR  ?= charts/dfaas
+CHART_DEST ?= dist
+CHART_VERSION ?= 0.0.0
+CHART_APPVERSION ?= 0.0.0
+CHART_OCI_REPO ?= oci://ghcr.io/isired01/charts
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.29.0
 
@@ -119,6 +127,30 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	mkdir -p dist
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default > dist/install.yaml
+
+##@ Helm
+
+.PHONY: helm-sync-crds
+helm-sync-crds: manifests ## Copy generated CRDs into the Helm chart crds/ folder.
+	mkdir -p $(CHART_DIR)/crds
+	cp config/crd/bases/dfaas.dfaas.io_environments.yaml $(CHART_DIR)/crds/
+	cp config/crd/bases/dfaas.dfaas.io_loadtests.yaml    $(CHART_DIR)/crds/
+
+.PHONY: helm-lint
+helm-lint: ## Lint the Helm chart.
+	helm lint $(CHART_DIR)
+
+.PHONY: helm-package
+helm-package: helm-sync-crds ## Package the Helm chart into dist/.
+	mkdir -p $(CHART_DEST)
+	helm package $(CHART_DIR) \
+		--version $(CHART_VERSION) \
+		--app-version $(CHART_APPVERSION) \
+		--destination $(CHART_DEST)
+
+.PHONY: helm-push
+helm-push: ## Push packaged chart to the OCI registry (uses CHART_OCI_REPO).
+	helm push $(CHART_DEST)/dfaas-$(CHART_VERSION).tgz $(CHART_OCI_REPO)
 
 ##@ Deployment
 

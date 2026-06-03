@@ -1,0 +1,50 @@
+{{- if .Values.ui.enabled }}
+{{- if .Values.ui.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "dfaas.ui.sa" . }}
+  namespace: {{ .Values.ui.namespace }}
+  labels:
+    {{- include "dfaas.ui.labels" . | nindent 4 }}
+---
+{{- end }}
+{{- if .Values.ui.rbac.create }}
+# UI gateway needs cluster-wide read on dFaaS CRDs + auxiliary resources
+# used by the control-plane handlers.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "dfaas.fullname" . }}-ui
+  labels:
+    {{- include "dfaas.ui.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["dfaas.dfaas.io"]
+    resources: ["environments", "loadtests"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "dfaas.fullname" . }}-ui
+  labels:
+    {{- include "dfaas.ui.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "dfaas.fullname" . }}-ui
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "dfaas.ui.sa" . }}
+    namespace: {{ .Values.ui.namespace }}
+{{- end }}
+{{- end }}

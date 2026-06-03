@@ -1,0 +1,68 @@
+# Global
+nameOverride: ""
+fullnameOverride: ""
+
+operator:
+  enabled: true
+  namespace: dfaas-operator-system
+  replicas: 1
+  image:
+    repository: ghcr.io/isired01/dfaas-operator
+    tag: ""                       # default = .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  exporterImage:
+    repository: ghcr.io/isired01/dfaas-exporter
+    tag: ""                       # default = .Chart.AppVersion
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  metricsService:
+    enabled: true
+    port: 8080
+  leaderElection:
+    enabled: true
+  extraEnv: []                    # list of {name, value}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+ui:
+  enabled: true
+  namespace: dfaas-ui
+  replicas: 1
+  image:
+    repository: ghcr.io/isired01/dfaas-control-plane
+    tag: ""                       # default = .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 300m, memory: 256Mi }
+  service:
+    type: ClusterIP
+    port: 8082
+  serviceAccount:
+    create: true
+    name: ""
+  rbac:
+    create: true
+  ingress:
+    enabled: false
+    className: ""
+    host: dfaas.local
+    annotations: {}
+    tls: []                       # list of {secretName, hosts: []}
+  env:
+    PORT: "8082"
+    CORS_ORIGINS: ""              # csv; empty = same-origin only
+
+# CRDs are installed automatically from charts/dfaas/crds/ on first install.
+# Helm does NOT manage CRDs on upgrade. Manual:
+#   kubectl apply -f https://raw.githubusercontent.com/.../charts/dfaas/crds/<file>.yaml
+crds:
+  keep: true                      # informational
+
+imagePullSecrets: []
