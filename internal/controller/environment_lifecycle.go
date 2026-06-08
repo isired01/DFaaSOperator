@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -43,6 +44,15 @@ const monitoringRetryBudget = 5
 
 // sshProbeTimeout caps each per-host SSH-reachability TCP dial (P6).
 const sshProbeTimeout = 2 * time.Second
+
+// sshAttemptsAnnotation persists the consecutive SSH-unreachable counter,
+// generation-scoped as "<generation>:<count>" so a spec edit restarts the
+// budget fresh.
+const sshAttemptsAnnotation = "dfaas.dfaas.io/ssh-attempts"
+
+// sshRetryBudget is the max consecutive SSH-unreachable rounds tolerated
+// before the Environment is moved to EnvFailed.
+const sshRetryBudget = 3
 
 // handleEnvDeletion drains per-environment cluster-wide state (Prometheus
 // targets) and removes the finalizer. Per-environment Jobs and ConfigMaps
@@ -88,11 +98,25 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 		}
 	}
 	if len(unreachable) > 0 {
-		logger.Info("VMs not SSH-reachable, retrying", "nodes", unreachable)
+		count, bumpErr := r.bumpSSHAttempts(ctx, env)
+		if bumpErr != nil {
+			logger.Error(bumpErr, "bumpSSHAttempts failed; continuing without budget enforcement")
+		}
+		if count >= sshRetryBudget {
+			logger.Info("VMs not SSH-reachable, giving up", "nodes", unreachable, "attempts", count)
+			_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
+				metav1.ConditionFalse, dfaasv1.EnvReasonSSHUnreachable,
+				fmt.Sprintf("SSH :22 dial failed for %v after %d attempts", unreachable, count))
+			return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
+		}
+		logger.Info("VMs not SSH-reachable, retrying", "nodes", unreachable, "attempts", count)
 		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
 			metav1.ConditionFalse, dfaasv1.EnvReasonSSHUnreachable,
 			fmt.Sprintf("SSH :22 dial failed for: %v", unreachable))
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	if rerr := r.resetSSHAttempts(ctx, env); rerr != nil {
+		logger.Error(rerr, "resetSSHAttempts failed; non-fatal")
 	}
 	_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonSSHReachable,
@@ -156,10 +180,31 @@ func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 			"dfaas-worker or k6 provisioning failed; inspect DfaasWorkersReady and K6Ready conditions")
 		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
 	}
+	// Both Jobs succeeded and the fan-in has settled. Now — and only now — is
+	// it safe to stamp the success TTL: neither sibling will be re-checked
+	// again from this phase, so auto-deletion can no longer trigger a recreate.
+	r.patchAnsibleJobTTL(ctx, env, "vms", 600)
+	r.patchAnsibleJobTTL(ctx, env, "k6", 600)
 	_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondInfrastructureReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonInfraReady,
 		"dfaas-worker and k6 Ansible Jobs completed")
 	return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningMonitoring)
+}
+
+// patchAnsibleJobTTL looks up the role-suffixed Ansible Job for env and sets
+// its post-finish TTL. No-op (logs at V1) if the Job is gone — e.g. a phase
+// that was skipped because the role has no nodes, so no Job was ever created.
+func (r *EnvironmentReconciler) patchAnsibleJobTTL(ctx context.Context,
+	env *dfaasv1.Environment, suffix string, ttlSec int32) {
+	var job batchv1.Job
+	name := ansible.JobNameForRole(env, suffix)
+	if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: env.Namespace}, &job); err != nil {
+		if !apierrors.IsNotFound(err) {
+			log.FromContext(ctx).Error(err, "get Ansible Job for TTL patch", "job", name)
+		}
+		return
+	}
+	patchJobTTL(ctx, r.Client, &job, ttlSec)
 }
 
 // reconcileProvisioningMonitoring installs Prometheus + Grafana via Helm,
@@ -253,7 +298,12 @@ func (r *EnvironmentReconciler) ensureVMsJob(ctx context.Context,
 	}
 
 	if job.Status.Succeeded > 0 {
-		patchJobTTL(ctx, r.Client, &job, 600)
+		// NB: do NOT set the success TTL here. While the sibling k6 Job may
+		// still be running, ProvisioningInfra keeps re-reconciling every 10s;
+		// a 600s TTL would let the Job controller delete this finished Job
+		// mid-wait, the next ensureVMsJob would hit NotFound and recreate it,
+		// re-running the playbook. The success TTL is applied once, after the
+		// fan-in settles, in reconcileProvisioningInfra.
 		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDfaasWorkersReady,
 			metav1.ConditionTrue, dfaasv1.EnvReasonVMsProvisioned,
 			"dfaas-worker Ansible Job completed")
@@ -334,7 +384,10 @@ func (r *EnvironmentReconciler) ensureK6Job(ctx context.Context,
 	}
 
 	if job.Status.Succeeded > 0 {
-		patchJobTTL(ctx, r.Client, &job, 600)
+		// NB: do NOT set the success TTL here — see ensureVMsJob. Deleting a
+		// finished Job while the sibling is still running would trigger a
+		// NotFound→recreate→rerun loop. Applied after fan-in in
+		// reconcileProvisioningInfra.
 		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondK6Ready,
 			metav1.ConditionTrue, dfaasv1.EnvReasonK6Provisioned,
 			"k6 Ansible Job completed")
@@ -453,6 +506,67 @@ func (r *EnvironmentReconciler) resetMonitoringAttempts(ctx context.Context,
 			latest.Annotations = map[string]string{}
 		}
 		latest.Annotations[monitoringAttemptsAnnotation] = "0"
+		return r.Update(ctx, latest)
+	})
+}
+
+// parseSSHAttempts decodes the "<generation>:<count>" annotation. Returns the
+// stored generation and count; (0, 0) if absent or malformed.
+func parseSSHAttempts(s string) (gen int64, count int) {
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 {
+		return 0, 0
+	}
+	g, gerr := strconv.ParseInt(parts[0], 10, 64)
+	c, cerr := strconv.Atoi(parts[1])
+	if gerr != nil || cerr != nil {
+		return 0, 0
+	}
+	return g, c
+}
+
+// bumpSSHAttempts increments the consecutive SSH-unreachable counter,
+// generation-scoped: a stored generation different from the current one
+// (spec edit) restarts the budget at 1. Returns the count for this generation.
+func (r *EnvironmentReconciler) bumpSSHAttempts(ctx context.Context,
+	env *dfaasv1.Environment) (int, error) {
+	var newVal int
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &dfaasv1.Environment{}
+		if gerr := r.Get(ctx, client.ObjectKeyFromObject(env), latest); gerr != nil {
+			return gerr
+		}
+		if latest.Annotations == nil {
+			latest.Annotations = map[string]string{}
+		}
+		storedGen, cur := parseSSHAttempts(latest.Annotations[sshAttemptsAnnotation])
+		if storedGen != latest.Generation {
+			cur = 0
+		}
+		cur++
+		latest.Annotations[sshAttemptsAnnotation] = fmt.Sprintf("%d:%d", latest.Generation, cur)
+		newVal = cur
+		return r.Update(ctx, latest)
+	})
+	return newVal, err
+}
+
+// resetSSHAttempts zeroes the counter for the current generation on success.
+// No-op when already absent or zero to avoid churn.
+func (r *EnvironmentReconciler) resetSSHAttempts(ctx context.Context,
+	env *dfaasv1.Environment) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &dfaasv1.Environment{}
+		if gerr := r.Get(ctx, client.ObjectKeyFromObject(env), latest); gerr != nil {
+			return gerr
+		}
+		if _, cur := parseSSHAttempts(latest.Annotations[sshAttemptsAnnotation]); cur == 0 {
+			return nil
+		}
+		if latest.Annotations == nil {
+			latest.Annotations = map[string]string{}
+		}
+		latest.Annotations[sshAttemptsAnnotation] = fmt.Sprintf("%d:0", latest.Generation)
 		return r.Update(ctx, latest)
 	})
 }

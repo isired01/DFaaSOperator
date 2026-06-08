@@ -39,9 +39,12 @@ import (
 // changes.
 const dispatchAttemptsAnnotation = "dfaas.dfaas.io/dispatch-attempts"
 
-// dispatchRetryBudget is the max number of consecutive identical dispatcher
-// errors tolerated before failLoadTest fires with reason=DispatchFailed.
-const dispatchRetryBudget = 5
+// dispatchRetryBudget is the max number of consecutive dispatcher errors
+// tolerated before failLoadTest fires with reason=DispatchFailed. With
+// onDispatchError's 10s RequeueAfter and the dispatcher's 10s request cap
+// (remoteRequestTimeout), ~15 attempts ≈ 5 min grace — enough for a briefly
+// unreachable k6 node to come back before the LoadTest is failed.
+const dispatchRetryBudget = 15
 
 // bumpDispatchAttempts increments the counter annotation by one with conflict
 // retry, returning the new value. The Update is on the object (not status),

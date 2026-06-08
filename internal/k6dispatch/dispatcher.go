@@ -19,6 +19,7 @@ package k6dispatch
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,6 +29,11 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// remoteRequestTimeout caps each remote-cluster API request (dial + round
+// trip). Without it a dead k6 node blocks on the OS-default TCP connect
+// (~30s), stalling the single-threaded reconcile worker.
+const remoteRequestTimeout = 10 * time.Second
 
 // TestRunGVK is the GroupVersionKind of k6-operator's TestRun.
 var TestRunGVK = schema.GroupVersionKind{
@@ -58,6 +64,7 @@ func (d *Dispatcher) remoteClient(ctx context.Context, secretRef types.Namespace
 	if err != nil {
 		return nil, fmt.Errorf("parse kubeconfig: %w", err)
 	}
+	cfg.Timeout = remoteRequestTimeout
 	return client.New(cfg, client.Options{})
 }
 

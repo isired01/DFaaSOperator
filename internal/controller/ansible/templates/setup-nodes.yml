@@ -112,6 +112,10 @@
         state: present
         kubeconfig: "{{ k3s_config }}"
       loop: [openfaas, openfaas-fn, monitoring, haproxy-controller]
+      register: ns_create
+      retries: 10
+      delay: 6
+      until: ns_create is succeeded
 
     - name: "Create local config directory on nodes"
       ansible.builtin.file:
@@ -154,14 +158,52 @@
       ansible.builtin.shell: curl -sSL https://cli.openfaas.com | sh
       when: not faas_cli_bin.stat.exists
 
-    - name: "Wait for OpenFaaS Gateway"
-      ansible.builtin.uri:
-        url: "{{ openfaas_url }}/system/functions"
-        status_code: [200, 401]
-      register: gateway_check
-      until: gateway_check.status in [200, 401]
-      retries: 10 #diminuiti da 40 a 10 
-      delay: 5 #diminuiti da 10 a 5
+    # Helm's `wait: true` only blocks when it actually applies changes. On an
+    # idempotent re-run (changed=0) it returns immediately without waiting, so
+    # the gateway pod may still be un-Ready (node rebooted / pods restarting).
+    # Wait on the Deployment's availableReplicas directly: deterministic, self-
+    # scaling to slow image pulls, and correct on re-runs. The HTTP probe that
+    # follows is then only a thin guard for NodePort endpoint propagation.
+    - name: "Ensure OpenFaaS gateway is reachable"
+      block:
+        - name: "Wait for OpenFaaS gateway Deployment to be Available"
+          kubernetes.core.k8s_info:
+            kind: Deployment
+            name: gateway
+            namespace: openfaas
+            kubeconfig: "{{ k3s_config }}"
+          register: gw_deploy
+          until: >-
+            (gw_deploy.resources | length > 0) and
+            ((gw_deploy.resources[0].status.availableReplicas | default(0)) >= 1)
+          retries: 60
+          delay: 5
+
+        - name: "Wait for OpenFaaS Gateway HTTP endpoint"
+          ansible.builtin.uri:
+            url: "{{ openfaas_url }}/system/functions"
+            status_code: [200, 401]
+          register: gateway_check
+          until: gateway_check.status in [200, 401]
+          retries: 30
+          delay: 5
+      rescue:
+        - name: "Dump OpenFaaS pod state for diagnosis"
+          kubernetes.core.k8s_info:
+            kind: Pod
+            namespace: openfaas
+            kubeconfig: "{{ k3s_config }}"
+          register: openfaas_pods
+
+        - name: "Show OpenFaaS pod names + phases"
+          ansible.builtin.debug:
+            msg: >-
+              pods={{ openfaas_pods.resources | map(attribute='metadata.name') | list }}
+              phases={{ openfaas_pods.resources | map(attribute='status.phase') | list }}
+
+        - name: "Fail after dumping diagnostics"
+          ansible.builtin.fail:
+            msg: "OpenFaaS gateway did not become reachable on {{ inventory_hostname }} — see pod dump above"
 
     # list step intentionally shells out (faas_list RETURN only exposes the raw
     # CLI command, not a parsed name list); remove + deploy use modules.
@@ -170,8 +212,8 @@
         cmd: "/usr/local/bin/faas-cli list --gateway={{ openfaas_url }} --quiet"
       register: deployed_functions_raw
       changed_when: false
-      retries: 5
-      delay: 5
+      retries: 12
+      delay: 10
       until: deployed_functions_raw.rc == 0
 
     - name: "Prune stale functions"

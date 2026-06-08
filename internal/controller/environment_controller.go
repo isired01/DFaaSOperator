@@ -107,11 +107,23 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// or explicit deletion+recreate. Like EnvFailed we do not auto-
 		// retry — that would loop forever against a persistently broken
 		// chart / OCI registry.
+		if env.Status.ObservedGeneration == 0 {
+			// Settled without ever stamping (failed before reaching Ready, or
+			// pre-dates the settle-time stamp). Record the current generation
+			// so a later spec edit is seen as drift and re-triggers provisioning.
+			return r.setEnvPhase(ctx, &env, dfaasv1.EnvDegraded)
+		}
 		logger.V(1).Info("environment degraded, awaiting spec edit or recreation")
 		return ctrl.Result{}, nil
 	case dfaasv1.EnvFailed:
 		// Terminal failure. Recovery requires either a spec edit (drift block
 		// restarts the FSM at the top of Reconcile) or delete-and-recreate.
+		if env.Status.ObservedGeneration == 0 {
+			// Settled without ever stamping (failed on first provision, or
+			// pre-dates the settle-time stamp). Record the current generation
+			// so a later spec edit is seen as drift and re-triggers provisioning.
+			return r.setEnvPhase(ctx, &env, dfaasv1.EnvFailed)
+		}
 		logger.V(1).Info("environment failed, awaiting spec edit or recreation")
 		return ctrl.Result{}, nil
 	}
@@ -119,9 +131,10 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 }
 
 // setEnvPhase patches status.phase, retrying on conflict. When transitioning
-// into Ready it also stamps observedGeneration so future ticks short-circuit.
-// Stamps the top-level EnvCondReady aggregator (P1) and clears the
-// EnvCondUpdating flag on Ready (P8).
+// into a settled phase (Ready, Failed, or Degraded) it also stamps
+// observedGeneration so future ticks short-circuit and a later spec edit is
+// seen as generation drift. Stamps the top-level EnvCondReady aggregator (P1)
+// and clears the EnvCondUpdating flag on settled phases (P8).
 func (r *EnvironmentReconciler) setEnvPhase(ctx context.Context,
 	env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase) (ctrl.Result, error) {
 
@@ -131,7 +144,17 @@ func (r *EnvironmentReconciler) setEnvPhase(ctx context.Context,
 			return err
 		}
 		latest.Status.Phase = phase
-		if phase == dfaasv1.EnvReady {
+		// Stamp observedGeneration on every *settled* outcome — Ready, Failed,
+		// and Degraded — not just Ready. It records the spec generation the
+		// controller has finished processing, so a later spec edit (generation
+		// bump) is detected as drift at the top of Reconcile and re-triggers
+		// provisioning. Without this, an Environment that failed on its very
+		// first provision kept observedGeneration == 0, the drift guard
+		// (`observedGeneration > 0`) skipped it, and editing the spec from the
+		// UI was silently ignored — wedging the Environment in Failed forever.
+		if phase == dfaasv1.EnvReady ||
+			phase == dfaasv1.EnvFailed ||
+			phase == dfaasv1.EnvDegraded {
 			latest.Status.ObservedGeneration = latest.Generation
 		}
 		stampEnvAggregate(latest, phase)

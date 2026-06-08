@@ -54,12 +54,12 @@ jobs:
 
       - name: Wait for UI image to be published
         run: |
-          for i in {1..60}; do
+          for i in {1..6}; do
             if docker manifest inspect "ghcr.io/isired01/dfaas-control-plane:${VERSION}" >/dev/null 2>&1; then
               echo "UI image ready"
               exit 0
             fi
-            echo "UI image not ready yet (attempt $i/60), sleeping 10s"
+            echo "UI image not ready yet (attempt $i/6), sleeping 10s"
             sleep 10
           done
           echo "UI image never appeared; failing release"

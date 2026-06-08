@@ -46,8 +46,30 @@
       ansible.builtin.shell:
         cmd: |
           curl -sfL https://get.k3s.io | \
-            INSTALL_K3S_EXEC="--disable traefik --disable servicelb --write-kubeconfig-mode=644" sh -
+            INSTALL_K3S_EXEC="--disable traefik --disable servicelb --write-kubeconfig-mode=644 --tls-san {{ ansible_host }}" sh -
       when: not k3s_bin.stat.exists
+
+    # The kubeconfig server URL is rewritten to {{ ansible_host }} below, so the
+    # kube-apiserver serving cert MUST carry that address as a SAN or the
+    # management operator's TLS client rejects it ("x509: certificate is valid
+    # for ..., not <ansible_host>"). --tls-san above covers fresh installs;
+    # this block self-heals nodes provisioned before the SAN was added — k3s
+    # rebuilds the serving cert (additive to its default 127.0.0.1 / node-IP /
+    # cluster SANs) on next start when the dynamic cert files are removed. The
+    # cluster CA is untouched, so any kubeconfig already pushed stays valid.
+    - name: Ensure k3s TLS SAN includes the reachable address (idempotent)
+      ansible.builtin.blockinfile:
+        path: /etc/rancher/k3s/config.yaml
+        create: true
+        mode: "0600"
+        marker: "# {mark} DFAAS tls-san"
+        block: |
+          tls-san:
+            - "{{ ansible_host }}"
+      notify: Rotate k3s serving certificate
+
+    - name: Apply any pending serving-cert rotation before using the API
+      ansible.builtin.meta: flush_handlers
 
     - name: Ensure k3s service is started + enabled
       ansible.builtin.systemd:
@@ -182,3 +204,16 @@
       delay: 5
       until: push_secret.status in [200, 201]
       no_log: true
+
+  handlers:
+    # Force k3s to regenerate the kube-apiserver serving cert with the SAN list
+    # from /etc/rancher/k3s/config.yaml. Deleting only the serving cert pair is
+    # safe: k3s recreates it from the existing cluster CA on the next start, so
+    # the CA fingerprint embedded in pushed kubeconfigs does not change.
+    - name: Rotate k3s serving certificate
+      ansible.builtin.shell:
+        cmd: |
+          systemctl stop k3s
+          rm -f /var/lib/rancher/k3s/server/tls/serving-kube-apiserver.crt \
+                /var/lib/rancher/k3s/server/tls/serving-kube-apiserver.key
+          systemctl start k3s
