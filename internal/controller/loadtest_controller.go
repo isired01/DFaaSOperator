@@ -184,32 +184,13 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Run-once guard + suspended gate.
 	preExecution := lt.Status.Phase == "" || lt.Status.Phase == dfaasv1.LoadTestPending
 	if preExecution {
-		// P11: spec is editable in the pre-execution window.
-		_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondSpecLocked,
-			metav1.ConditionFalse, dfaasv1.LTReasonPending,
-			"spec editable until the test starts")
-
 		if lt.Spec.Suspended {
-			// Idempotent: SetStatusCondition keeps LastTransitionTime
-			// stable unless status/reason/message actually changes. Safe
-			// to stamp on every reconcile.
-			_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondSuspended,
-				metav1.ConditionTrue, dfaasv1.LTReasonDraftSaved,
-				"LoadTest saved as draft — PATCH spec.suspended=false to start")
+			// Save-as-Draft: hold at Pending, dispatch nothing. PATCH
+			// spec.suspended=false to start.
 			if lt.Status.Phase == "" {
 				return r.setLoadTestPhase(ctx, &lt, dfaasv1.LoadTestPending)
 			}
 			return ctrl.Result{}, nil
-		}
-
-		// P12: only stamp Activated on the True → False (or absent → False)
-		// edge. Steady-state "suspended is False" does not need to mutate
-		// the condition every tick.
-		prev := meta.FindStatusCondition(lt.Status.Conditions, dfaasv1.LTCondSuspended)
-		if prev == nil || prev.Status != metav1.ConditionFalse {
-			_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondSuspended,
-				metav1.ConditionFalse, dfaasv1.LTReasonActivated,
-				"LoadTest is active")
 		}
 
 		// Block while Environment is mid-flight.
@@ -217,12 +198,22 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			logger.Info("waiting for environment", "env", env.Name, "phase", env.Status.Phase)
 			return r.setLoadTestPhase(ctx, &lt, dfaasv1.LoadTestPending)
 		}
-	} else {
-		// P11: post-Pending the state machine is immutable; record it on
-		// the condition so consumers know PATCHes are silently ignored.
-		_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondSpecLocked,
-			metav1.ConditionTrue, dfaasv1.LTReasonPostStart,
-			"spec is immutable once the test has started")
+	}
+
+	// Env occupancy gate (FIFO serialization). Only in the pre-execution
+	// window, for an active (non-draft) test against a usable Environment.
+	// Sits after the scheduled-fire branch, so a just-fired scheduled test is
+	// caught here on its next reconcile and queued rather than colliding with
+	// a sibling already running on the same Environment.
+	if preExecution && !lt.Spec.Suspended &&
+		(env.Status.Phase == dfaasv1.EnvReady || env.Status.Phase == dfaasv1.EnvDegraded) {
+		proceed, res, err := r.envOccupancyGate(ctx, &lt)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !proceed {
+			return res, nil
+		}
 	}
 
 	// Phase machine.
@@ -238,8 +229,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 }
 
 // setLoadTestPhase patches status.phase, retrying on conflict. Also stamps
-// the LTCondReady aggregator (P9) and SpecLocked (P11) when transitioning
-// into a post-execution phase.
+// the LTCondReady aggregator (P9).
 func (r *LoadTestReconciler) setLoadTestPhase(ctx context.Context,
 	lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase) (ctrl.Result, error) {
 
@@ -258,63 +248,40 @@ func (r *LoadTestReconciler) setLoadTestPhase(ctx context.Context,
 	return ctrl.Result{Requeue: true}, nil
 }
 
-// stampLTAggregate writes the LTCondReady aggregator (P9) and the
-// LTCondSpecLocked latch (P11) onto the in-memory LoadTest. Pure function;
-// caller persists via Status().Update.
+// stampLTAggregate writes the LTCondReady aggregator (P9) onto the in-memory
+// LoadTest. Pure function; caller persists via Status().Update.
 func stampLTAggregate(lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase) {
-	var (
-		ready                     metav1.ConditionStatus
-		reason, message           string
-		specLocked                metav1.ConditionStatus
-		specLockedReason, specMsg string
-		stampLocked               = true
-	)
+	var ready metav1.ConditionStatus
+	var reason, message string
 	switch phase {
 	case dfaasv1.LoadTestCompleted:
 		ready = metav1.ConditionTrue
 		reason = dfaasv1.LTReasonCompleted
 		message = "metrics exported, test complete"
-		specLocked = metav1.ConditionTrue
-		specLockedReason = dfaasv1.LTReasonPostStart
-		specMsg = "spec is immutable post-completion"
 	case dfaasv1.LoadTestFailed:
 		ready = metav1.ConditionFalse
 		reason = dfaasv1.LTReasonFailed
 		message = "load test failed"
-		specLocked = metav1.ConditionTrue
-		specLockedReason = dfaasv1.LTReasonPostStart
-		specMsg = "spec is immutable post-failure"
 	case dfaasv1.LoadTestAborted:
 		ready = metav1.ConditionFalse
 		reason = dfaasv1.LTReasonAborted
 		message = "load test aborted"
-		specLocked = metav1.ConditionTrue
-		specLockedReason = dfaasv1.LTReasonPostStart
-		specMsg = "spec is immutable post-abort"
 	case dfaasv1.LoadTestRunning:
 		ready = metav1.ConditionFalse
 		reason = dfaasv1.LTReasonRunning
 		message = "remote TestRuns dispatched, k6 running"
-		specLocked = metav1.ConditionTrue
-		specLockedReason = dfaasv1.LTReasonPostStart
-		specMsg = "spec is immutable once the test has started"
 	case dfaasv1.LoadTestExporting:
 		ready = metav1.ConditionFalse
 		reason = dfaasv1.LTReasonExporterRunning
 		message = "k6 finished, metrics export in progress"
-		specLocked = metav1.ConditionTrue
-		specLockedReason = dfaasv1.LTReasonPostStart
-		specMsg = "spec is immutable during export"
 	case dfaasv1.LoadTestPending:
 		ready = metav1.ConditionFalse
 		reason = dfaasv1.LTReasonPending
 		message = "pending — waiting for environment or activation"
-		stampLocked = false
 	default:
 		ready = metav1.ConditionUnknown
 		reason = dfaasv1.LTReasonPending
 		message = "awaiting first reconcile"
-		stampLocked = false
 	}
 	meta.SetStatusCondition(&lt.Status.Conditions, metav1.Condition{
 		Type:    dfaasv1.LTCondReady,
@@ -322,14 +289,6 @@ func stampLTAggregate(lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase) {
 		Reason:  reason,
 		Message: message,
 	})
-	if stampLocked {
-		meta.SetStatusCondition(&lt.Status.Conditions, metav1.Condition{
-			Type:    dfaasv1.LTCondSpecLocked,
-			Status:  specLocked,
-			Reason:  specLockedReason,
-			Message: specMsg,
-		})
-	}
 }
 
 // failLoadTest stamps Failed phase + a generic failure message on the Ready
@@ -383,6 +342,104 @@ func (r *LoadTestReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.loadTestsForEnv),
 		).
 		Complete(r)
+}
+
+// envOccupancyGate serializes LoadTests that share a target Environment into a
+// FIFO queue. It is evaluated in the pre-execution window only, just before the
+// phase machine. Returns proceed=true when this test may dispatch (env free AND
+// this test is at the front of the queue); otherwise it holds the test at
+// Pending with a Queued condition and returns a 10s requeue. The 10s polling
+// (plus MaxConcurrentReconciles=1 and the FIFO front rule) guarantees a single
+// in-flight dispatch per Environment without any extra watch wiring: when the
+// occupant reaches a terminal phase, the next tick lets the front test through.
+//
+// Queue model:
+//   - "Busy"   = a sibling LoadTest on the same env in phase Running OR Exporting
+//     (the whole execution lifecycle until terminal).
+//   - "Waiting" = siblings (incl. self) with phase ∈ {"", Pending}, not suspended,
+//     and whose schedule has already fired (startAt nil or in the past).
+//   - "Front"   = the waiting sibling with the oldest creationTimestamp
+//     (tie-break: lexicographic name). Starvation is bounded by creation order.
+func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
+	lt *dfaasv1.LoadTest) (proceed bool, res ctrl.Result, err error) {
+
+	var list dfaasv1.LoadTestList
+	if err := r.List(ctx, &list, client.InNamespace(lt.Namespace)); err != nil {
+		return false, ctrl.Result{}, err
+	}
+
+	// hold keeps this test at Pending (re-queued) with a Queued condition.
+	hold := func(reason, message string) (bool, ctrl.Result, error) {
+		if cerr := r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondQueued,
+			metav1.ConditionTrue, reason, message); cerr != nil {
+			return false, ctrl.Result{}, cerr
+		}
+		if lt.Status.Phase != dfaasv1.LoadTestPending {
+			if _, perr := r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestPending); perr != nil {
+				return false, ctrl.Result{}, perr
+			}
+		}
+		return false, ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// 1. Busy check: any *other* sibling on the same env mid-execution.
+	for i := range list.Items {
+		sib := &list.Items[i]
+		if sib.Name == lt.Name || sib.Spec.TargetEnvironment != lt.Spec.TargetEnvironment {
+			continue
+		}
+		if sib.Status.Phase == dfaasv1.LoadTestRunning ||
+			sib.Status.Phase == dfaasv1.LoadTestExporting {
+			return hold(dfaasv1.LTReasonEnvBusy,
+				fmt.Sprintf("waiting: environment %q occupied by load test %q",
+					lt.Spec.TargetEnvironment, sib.Name))
+		}
+	}
+
+	// 2. FIFO front check: pick the oldest waiting sibling.
+	now := time.Now()
+	var front *dfaasv1.LoadTest
+	for i := range list.Items {
+		sib := &list.Items[i]
+		if sib.Spec.TargetEnvironment != lt.Spec.TargetEnvironment {
+			continue
+		}
+		if sib.Status.Phase != "" && sib.Status.Phase != dfaasv1.LoadTestPending {
+			continue
+		}
+		if sib.Spec.Suspended {
+			continue
+		}
+		if sib.Spec.StartAt != nil && now.Before(sib.Spec.StartAt.Time) {
+			continue
+		}
+		if front == nil || loadTestBefore(sib, front) {
+			front = sib
+		}
+	}
+	if front != nil && front.Name != lt.Name {
+		return hold(dfaasv1.LTReasonQueuedBehind,
+			fmt.Sprintf("position behind load test %q in the queue for environment %q",
+				front.Name, lt.Spec.TargetEnvironment))
+	}
+
+	// 3. Env free and this test is the front — clear the Queued gate and let
+	// the phase machine dispatch.
+	if cerr := r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondQueued,
+		metav1.ConditionFalse, dfaasv1.LTReasonDispatching,
+		"environment free and test at front of queue — dispatching"); cerr != nil {
+		return false, ctrl.Result{}, cerr
+	}
+	return true, ctrl.Result{}, nil
+}
+
+// loadTestBefore orders two LoadTests by creationTimestamp, tie-broken by name.
+func loadTestBefore(a, b *dfaasv1.LoadTest) bool {
+	at, bt := a.CreationTimestamp.Time, b.CreationTimestamp.Time
+	if at.Equal(bt) {
+		return a.Name < b.Name
+	}
+	return at.Before(bt)
 }
 
 func (r *LoadTestReconciler) loadTestsForEnv(ctx context.Context, obj client.Object) []reconcile.Request {

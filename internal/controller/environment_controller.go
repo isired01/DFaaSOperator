@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -34,7 +35,8 @@ const environmentFinalizer = "dfaas.dfaas.io/environment-finalizer"
 // the spec changes (detected via generation drift).
 type EnvironmentReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=environments,verbs=get;list;watch;create;update;patch;delete
@@ -46,6 +48,7 @@ type EnvironmentReconciler struct {
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 //+kubebuilder:rbac:groups=apps,resources=deployments;statefulsets;daemonsets;replicasets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -65,8 +68,10 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	if env.Status.Phase == dfaasv1.EnvReady &&
 		env.Status.ObservedGeneration == env.Generation {
-		logger.V(1).Info("environment ready, generation unchanged — idle")
-		return ctrl.Result{}, nil
+		// No longer idle while Ready: run a periodic SSH liveness probe so a
+		// node that dies after provisioning is noticed instead of only
+		// surfacing when a test fails against it.
+		return r.reconcileReadyHealth(ctx, &env)
 	}
 
 	// Generation drift: spec was edited after a successful run. Reset stale
@@ -133,8 +138,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // setEnvPhase patches status.phase, retrying on conflict. When transitioning
 // into a settled phase (Ready, Failed, or Degraded) it also stamps
 // observedGeneration so future ticks short-circuit and a later spec edit is
-// seen as generation drift. Stamps the top-level EnvCondReady aggregator (P1)
-// and clears the EnvCondUpdating flag on settled phases (P8).
+// seen as generation drift. Stamps the top-level EnvCondReady aggregator (P1).
 func (r *EnvironmentReconciler) setEnvPhase(ctx context.Context,
 	env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase) (ctrl.Result, error) {
 
@@ -163,9 +167,9 @@ func (r *EnvironmentReconciler) setEnvPhase(ctx context.Context,
 	return ctrl.Result{}, err
 }
 
-// stampEnvAggregate writes both the EnvCondReady aggregator and the
-// EnvCondUpdating flag on the in-memory Environment. Pure function on the
-// status slice; caller must persist via Status().Update.
+// stampEnvAggregate writes the EnvCondReady aggregator on the in-memory
+// Environment. Pure function on the status slice; caller must persist via
+// Status().Update.
 func stampEnvAggregate(env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase) {
 	var status metav1.ConditionStatus
 	var reason, message string
@@ -199,20 +203,6 @@ func stampEnvAggregate(env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase)
 		Reason:  reason,
 		Message: message,
 	})
-
-	// Clear the Updating flag once we've reached a terminal phase. Leave
-	// it alone otherwise (resetTransientConditions sets it on drift; the
-	// flag stays True through every Provisioning* tick until we settle).
-	if phase == dfaasv1.EnvReady ||
-		phase == dfaasv1.EnvDegraded ||
-		phase == dfaasv1.EnvFailed {
-		meta.SetStatusCondition(&env.Status.Conditions, metav1.Condition{
-			Type:    dfaasv1.EnvCondUpdating,
-			Status:  metav1.ConditionFalse,
-			Reason:  dfaasv1.EnvReasonAllSubsystemsReady,
-			Message: "no spec update in flight",
-		})
-	}
 }
 
 func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {

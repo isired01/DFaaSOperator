@@ -19,6 +19,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -53,6 +54,23 @@ const sshAttemptsAnnotation = "dfaas.dfaas.io/ssh-attempts"
 // sshRetryBudget is the max consecutive SSH-unreachable rounds tolerated
 // before the Environment is moved to EnvFailed.
 const sshRetryBudget = 3
+
+// healthCheckInterval is the cadence of the Ready-state SSH liveness probe.
+const healthCheckInterval = time.Minute
+
+// healthRetryInterval is the faster cadence used to confirm a suspected miss
+// before giving up.
+const healthRetryInterval = 20 * time.Second
+
+// healthRetryBudget is the max consecutive unreachable health rounds tolerated
+// before a Ready Environment is moved to EnvFailed. A small budget prevents a
+// single dropped packet from flapping a healthy env into Failed.
+const healthRetryBudget = 3
+
+// healthMissesAnnotation persists the consecutive Ready-state unreachable
+// counter, generation-scoped as "<generation>:<count>". Kept separate from
+// sshAttemptsAnnotation so the health loop never clobbers provisioning state.
+const healthMissesAnnotation = "dfaas.dfaas.io/health-misses"
 
 // handleEnvDeletion drains per-environment cluster-wide state (Prometheus
 // targets) and removes the finalizer. Per-environment Jobs and ConfigMaps
@@ -139,6 +157,170 @@ func probeSSH(ip string) bool {
 	return true
 }
 
+// reconcileReadyHealth runs the periodic SSH (:22) liveness probe while an
+// Environment is Ready. It replaces the old idle short-circuit: a node that
+// dies after provisioning is now noticed within ~3 minutes instead of only
+// when a test fails against it.
+//
+// Cadence is driven entirely by the returned RequeueAfter (60s healthy, 20s
+// while confirming a miss). The reconciler advances its own FSM by
+// re-reconciling on its status writes, so this method is throttled on
+// status.lastHealthCheck: without that guard each health write would
+// re-enqueue immediately and hot-loop. The throttle window shrinks to
+// healthRetryInterval while the NodesReachable condition is False so misses
+// are confirmed faster.
+//
+// After healthRetryBudget consecutive unreachable rounds the Environment is
+// moved to EnvFailed; recovery is manual (spec edit → drift → re-provision),
+// matching the user decision and the existing Failed semantics.
+func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
+	env *dfaasv1.Environment) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if len(env.Spec.Nodes) == 0 {
+		return ctrl.Result{RequeueAfter: healthCheckInterval}, nil
+	}
+
+	// Throttle against our own status writes.
+	if last := env.Status.LastHealthCheck; last != nil {
+		due := healthCheckInterval
+		if c := meta.FindStatusCondition(env.Status.Conditions, dfaasv1.EnvCondNodesReachable); c != nil &&
+			c.Status == metav1.ConditionFalse {
+			due = healthRetryInterval
+		}
+		if elapsed := time.Since(last.Time); elapsed < due {
+			return ctrl.Result{RequeueAfter: due - elapsed}, nil
+		}
+	}
+
+	var unreachable []string
+	for _, n := range env.Spec.Nodes {
+		if !probeSSH(n.IPAddress) {
+			unreachable = append(unreachable, n.NodeID)
+		}
+	}
+
+	if len(unreachable) == 0 {
+		if rerr := r.resetHealthMisses(ctx, env); rerr != nil {
+			logger.Error(rerr, "resetHealthMisses failed; non-fatal")
+		}
+		if err := r.markNodesReachable(ctx, env); err != nil {
+			logger.Error(err, "stamp NodesReachable=True failed; retrying")
+		}
+		return ctrl.Result{RequeueAfter: healthCheckInterval}, nil
+	}
+
+	count, bumpErr := r.bumpHealthMisses(ctx, env)
+	if bumpErr != nil {
+		logger.Error(bumpErr, "bumpHealthMisses failed; continuing without budget enforcement")
+	}
+	if r.Recorder != nil {
+		r.Recorder.Eventf(env, corev1.EventTypeWarning, dfaasv1.EnvReasonSSHUnreachable,
+			"SSH :22 unreachable for nodes %v (attempt %d/%d)", unreachable, count, healthRetryBudget)
+	}
+	if count >= healthRetryBudget {
+		logger.Info("Ready environment nodes unreachable; transitioning to Failed",
+			"nodes", unreachable, "attempts", count)
+		_ = r.markNodesUnreachable(ctx, env,
+			fmt.Sprintf("SSH :22 dial failed for %v after %d consecutive health checks", unreachable, count))
+		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
+	}
+	logger.Info("Ready environment nodes unreachable; will retry",
+		"nodes", unreachable, "attempts", count)
+	_ = r.markNodesUnreachable(ctx, env,
+		fmt.Sprintf("SSH :22 dial failed for %v (attempt %d/%d)", unreachable, count, healthRetryBudget))
+	return ctrl.Result{RequeueAfter: healthRetryInterval}, nil
+}
+
+// markNodesReachable stamps NodesReachable=True and refreshes lastHealthCheck
+// in a single status update (one write per healthy round → one re-enqueue,
+// caught by the throttle).
+func (r *EnvironmentReconciler) markNodesReachable(ctx context.Context,
+	env *dfaasv1.Environment) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &dfaasv1.Environment{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(env), latest); err != nil {
+			return err
+		}
+		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+			Type:    dfaasv1.EnvCondNodesReachable,
+			Status:  metav1.ConditionTrue,
+			Reason:  dfaasv1.EnvReasonSSHReachable,
+			Message: "all declared nodes reachable on :22",
+		})
+		now := metav1.Now()
+		latest.Status.LastHealthCheck = &now
+		return r.Status().Update(ctx, latest)
+	})
+}
+
+// markNodesUnreachable stamps NodesReachable=False with msg and refreshes
+// lastHealthCheck in a single status update.
+func (r *EnvironmentReconciler) markNodesUnreachable(ctx context.Context,
+	env *dfaasv1.Environment, msg string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &dfaasv1.Environment{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(env), latest); err != nil {
+			return err
+		}
+		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+			Type:    dfaasv1.EnvCondNodesReachable,
+			Status:  metav1.ConditionFalse,
+			Reason:  dfaasv1.EnvReasonSSHUnreachable,
+			Message: msg,
+		})
+		now := metav1.Now()
+		latest.Status.LastHealthCheck = &now
+		return r.Status().Update(ctx, latest)
+	})
+}
+
+// bumpHealthMisses increments the consecutive Ready-state unreachable counter,
+// generation-scoped (a spec edit restarts the budget). Mirrors bumpSSHAttempts
+// but on a dedicated annotation so provisioning state is never clobbered.
+func (r *EnvironmentReconciler) bumpHealthMisses(ctx context.Context,
+	env *dfaasv1.Environment) (int, error) {
+	var newVal int
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &dfaasv1.Environment{}
+		if gerr := r.Get(ctx, client.ObjectKeyFromObject(env), latest); gerr != nil {
+			return gerr
+		}
+		if latest.Annotations == nil {
+			latest.Annotations = map[string]string{}
+		}
+		storedGen, cur := parseSSHAttempts(latest.Annotations[healthMissesAnnotation])
+		if storedGen != latest.Generation {
+			cur = 0
+		}
+		cur++
+		latest.Annotations[healthMissesAnnotation] = fmt.Sprintf("%d:%d", latest.Generation, cur)
+		newVal = cur
+		return r.Update(ctx, latest)
+	})
+	return newVal, err
+}
+
+// resetHealthMisses zeroes the health-miss counter for the current generation.
+// No-op when already zero to avoid annotation churn (and a spurious re-enqueue).
+func (r *EnvironmentReconciler) resetHealthMisses(ctx context.Context,
+	env *dfaasv1.Environment) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &dfaasv1.Environment{}
+		if gerr := r.Get(ctx, client.ObjectKeyFromObject(env), latest); gerr != nil {
+			return gerr
+		}
+		if _, cur := parseSSHAttempts(latest.Annotations[healthMissesAnnotation]); cur == 0 {
+			return nil
+		}
+		if latest.Annotations == nil {
+			latest.Annotations = map[string]string{}
+		}
+		latest.Annotations[healthMissesAnnotation] = fmt.Sprintf("%d:0", latest.Generation)
+		return r.Update(ctx, latest)
+	})
+}
+
 // reconcileProvisioningInfra runs the dfaas-worker Ansible Job and the k6
 // Ansible Job concurrently (side-by-side resources, not goroutines). Fan-in:
 // advances to ProvisioningMonitoring only when BOTH have reached a terminal
@@ -151,14 +333,9 @@ func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 	am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
 	libp2pKeys, err := am.EnsureLibp2pKeys(ctx, env)
 	if err != nil {
-		// P3: surface libp2p key failure on DependenciesReady.
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDependenciesReady,
-			metav1.ConditionFalse, dfaasv1.EnvReasonLibp2pKeyError,
-			"libp2p key ensure failed: "+condMessage(err))
+		log.FromContext(ctx).Error(err, "libp2p key ensure failed; retrying")
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
-	_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDependenciesReady,
-		metav1.ConditionTrue, dfaasv1.EnvReasonInfraReady, "libp2p keys ready")
 
 	vmsDone, vmsFailed, err := r.ensureVMsJob(ctx, env, libp2pKeys)
 	if err != nil {
@@ -228,10 +405,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Cont
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	if err := r.syncNodeStatus(ctx, env); err != nil {
-		// P3: surface syncNodeStatus failure.
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDependenciesReady,
-			metav1.ConditionFalse, dfaasv1.EnvReasonNodeStatusError,
-			"syncNodeStatus failed: "+condMessage(err))
+		log.FromContext(ctx).Error(err, "syncNodeStatus failed; retrying")
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	return r.setEnvPhase(ctx, env, dfaasv1.EnvReady)
@@ -640,22 +814,28 @@ func (r *EnvironmentReconciler) setEnvCondition(ctx context.Context,
 	})
 }
 
-// resetTransientConditions handles generation drift (P8). The five
-// per-subsystem conditions are LEFT at their last-observed state — they
-// are still factually true at the instant of spec edit. The single
-// EnvCondUpdating condition is stamped True/SpecChanged to drive the UI
-// "Updating" badge from one place. EnvCondReady aggregator flips to
-// Unknown/Initializing so consumers stop trusting the previous True.
+// resetTransientConditions handles generation drift (P8): the spec was edited
+// after a settled run, so every condition is reset to Unknown — none is
+// trustworthy until the fresh provisioning pass re-stamps it. The Ready
+// aggregator plus the five per-subsystem conditions all flip to
+// Unknown/Updating so consumers stop trusting the previous values.
 func (r *EnvironmentReconciler) resetTransientConditions(ctx context.Context,
 	env *dfaasv1.Environment) error {
-	if err := r.setEnvCondition(ctx, env, dfaasv1.EnvCondUpdating,
-		metav1.ConditionTrue, dfaasv1.EnvReasonSpecChanged,
-		"Environment spec edited; reconciler is restarting provisioning"); err != nil {
-		return err
+	for _, condType := range []string{
+		dfaasv1.EnvCondReady,
+		dfaasv1.EnvCondVMsReady,
+		dfaasv1.EnvCondDfaasWorkersReady,
+		dfaasv1.EnvCondK6Ready,
+		dfaasv1.EnvCondInfrastructureReady,
+		dfaasv1.EnvCondMonitoringReady,
+	} {
+		if err := r.setEnvCondition(ctx, env, condType,
+			metav1.ConditionUnknown, dfaasv1.EnvReasonUpdating,
+			"spec edited; re-provisioning — condition will be re-evaluated"); err != nil {
+			return err
+		}
 	}
-	return r.setEnvCondition(ctx, env, dfaasv1.EnvCondReady,
-		metav1.ConditionUnknown, dfaasv1.EnvReasonInitializing,
-		"spec edited; awaiting provisioning to settle")
+	return nil
 }
 
 // cleanupStaleGenJobs deletes Ansible Jobs for env whose generation label

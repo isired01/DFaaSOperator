@@ -263,6 +263,13 @@ spec:
                   - nodeID
                   type: object
                 type: array
+              lastHealthCheck:
+                description: |-
+                  LastHealthCheck is the wall-clock time of the most recent Ready-state
+                  SSH liveness probe round. Stamped each time the periodic check runs
+                  while the Environment is Ready.
+                format: date-time
+                type: string
               message:
                 type: string
               observedGeneration:

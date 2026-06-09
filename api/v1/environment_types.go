@@ -37,8 +37,9 @@ const (
 	EnvCondK6Ready             = "K6Ready"
 	EnvCondInfrastructureReady = "InfrastructureReady"
 	EnvCondMonitoringReady     = "MonitoringReady"
-	EnvCondUpdating            = "Updating"
-	EnvCondDependenciesReady   = "DependenciesReady"
+	// EnvCondNodesReachable reflects the per-minute SSH (:22) liveness probe
+	// run against every declared node while the Environment is Ready.
+	EnvCondNodesReachable = "NodesReachable"
 )
 
 // Condition Reasons stamped on Environment.status.conditions (P15).
@@ -154,6 +155,12 @@ type EnvironmentStatus struct {
 	// metadata.generation == status.observedGeneration and phase == Ready.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// LastHealthCheck is the wall-clock time of the most recent Ready-state
+	// SSH liveness probe round. Stamped each time the periodic check runs
+	// while the Environment is Ready.
+	// +optional
+	LastHealthCheck *metav1.Time `json:"lastHealthCheck,omitempty"`
 
 	// +optional
 	K6Nodes []K6NodeStatus `json:"k6Nodes,omitempty"`

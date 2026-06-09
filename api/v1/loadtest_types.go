@@ -31,13 +31,12 @@ const (
 // Condition Types stamped on LoadTest.status.conditions (P15).
 const (
 	LTCondReady             = "Ready"
-	LTCondSuspended         = "Suspended"
 	LTCondEnvironmentLinked = "EnvironmentLinked"
 	LTCondScheduled         = "Scheduled"
+	LTCondQueued            = "Queued"
 	LTCondK6Dispatched      = "K6Dispatched"
 	LTCondK6Healthy         = "K6Healthy"
 	LTCondMetricsExported   = "MetricsExported"
-	LTCondSpecLocked        = "SpecLocked"
 )
 
 // Condition Reasons stamped on LoadTest.status.conditions (P15).
@@ -74,6 +73,10 @@ const (
 	LTReasonEnvFound               = "EnvFound"
 	LTReasonEnvFailed              = "EnvFailed"
 	LTReasonEnvDegraded            = "EnvDegraded"
+	// Queue-gate reasons (FIFO serialization on a shared Environment).
+	LTReasonEnvBusy      = "EnvBusy"
+	LTReasonQueuedBehind = "QueuedBehind"
+	LTReasonDispatching  = "Dispatching"
 )
 
 // PerNodeLoad is the FE-supplied per-k6-machine load. The reconciler creates
