@@ -146,18 +146,77 @@ func main() {
 	}
 	fmt.Printf("local export complete: %s\n", fileName)
 
-	// 6. Destination: S3 when S3_BUCKET_PREFIX is set, otherwise stdout.
+	// 6. Destination: S3 when S3_BUCKET_PREFIX is set, otherwise stdout. The
+	// bucket is computed once and reused by both the metrics CSV and the
+	// per-VM k6 logs.
 	bucketPrefix := os.Getenv("S3_BUCKET_PREFIX")
-	if bucketPrefix == "" {
+	loadtestName := os.Getenv("LOADTEST_NAME")
+	s3Enabled := bucketPrefix != ""
+	var bucket string
+	if s3Enabled {
+		bucket = bucketNameFor(bucketPrefix, os.Getenv("ENV_UID"))
+	}
+
+	if !s3Enabled {
 		fmt.Println("S3 not configured. Dumping CSV to stdout:")
 		dumpToStdout(fileName)
+	} else {
+		key := objectKeyFor(loadtestName)
+		if err := uploadToS3(ctx, fileName, bucket, key); err != nil {
+			log.Fatalf("S3 upload: %v", err)
+		}
+	}
+
+	// 7. Per-VM k6 end-of-test summaries: one file per node under K6_LOG_DIR
+	// (projected from the operator's per-node ConfigMaps). Shipped the same
+	// way as metrics — S3 when configured, else stdout. A missing/empty dir
+	// (no k6 logs) is tolerated without error.
+	exportK6Logs(ctx, s3Enabled, bucket, loadtestName)
+}
+
+// exportK6Logs reads each "<nodeID>.log" file under K6_LOG_DIR and ships it:
+// to S3 (k6ObjectKeyFor key) when S3 is enabled, otherwise to stdout between
+// per-node markers. No-op when K6_LOG_DIR is unset, missing, or empty.
+func exportK6Logs(ctx context.Context, s3Enabled bool, bucket, loadtestName string) {
+	dir := os.Getenv("K6_LOG_DIR")
+	if dir == "" {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		fmt.Printf("k6 log dir %q read error: %v\n", dir, err)
 		return
 	}
 
-	bucket := bucketNameFor(bucketPrefix, os.Getenv("ENV_UID"))
-	key := objectKeyFor(os.Getenv("LOADTEST_NAME"))
-	if err := uploadToS3(ctx, fileName, bucket, key); err != nil {
-		log.Fatalf("S3 upload: %v", err)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
+			continue
+		}
+		nodeID := strings.TrimSuffix(e.Name(), ".log")
+		fullPath := dir + "/" + e.Name()
+
+		if s3Enabled {
+			key := k6ObjectKeyFor(loadtestName, nodeID)
+			if err := uploadToS3(ctx, fullPath, bucket, key); err != nil {
+				fmt.Printf("k6 log S3 upload for node %s failed: %v\n", nodeID, err)
+			}
+			continue
+		}
+
+		data, rerr := os.ReadFile(fullPath)
+		if rerr != nil {
+			fmt.Printf("read k6 log for node %s failed: %v\n", nodeID, rerr)
+			continue
+		}
+		fmt.Printf("----- BEGIN K6 %s -----\n", nodeID)
+		fmt.Print(string(data))
+		if len(data) > 0 && data[len(data)-1] != '\n' {
+			fmt.Println()
+		}
+		fmt.Printf("----- END K6 %s -----\n", nodeID)
 	}
 }
 
@@ -365,5 +424,15 @@ func bucketNameFor(envName, envUID string) string {
 func objectKeyFor(loadtestName string) string {
 	return fmt.Sprintf("metrics/%s/%s.csv",
 		loadtestName,
+		time.Now().UTC().Format("20060102T150405Z"))
+}
+
+// k6ObjectKeyFor builds the S3 object key for one VM's k6 end-of-test summary:
+// k6/<loadtestName>/<nodeID>-<UTC RFC3339-compact>.log. Sits in a sibling "k6/"
+// prefix to the metrics CSVs so per-test artifacts group together.
+func k6ObjectKeyFor(loadtestName, nodeID string) string {
+	return fmt.Sprintf("k6/%s/%s-%s.log",
+		loadtestName,
+		nodeID,
 		time.Now().UTC().Format("20060102T150405Z"))
 }

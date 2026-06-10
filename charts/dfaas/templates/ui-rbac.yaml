@@ -10,7 +10,7 @@ metadata:
 ---
 {{- end }}
 {{- if .Values.ui.rbac.create }}
-# UI gateway needs cluster-wide read on dFaaS CRDs + auxiliary resources
+# UI gateway needs cluster-wide read on DFaaS CRDs + auxiliary resources
 # used by the control-plane handlers.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

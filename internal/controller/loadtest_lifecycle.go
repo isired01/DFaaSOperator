@@ -397,6 +397,11 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 			fmt.Sprintf("%d of %d remote TestRuns reported error stage", errorCount, total))
 	}
 
+	// Capture each VM's k6 end-of-test summary into per-node ConfigMaps
+	// before transitioning to Exporting. Best-effort: capture failures never
+	// block the phase transition.
+	r.captureK6Logs(ctx, lt, env)
+
 	// All TestRuns done cleanly → stamp EndTime and move to Exporting.
 	now := metav1.Now()
 	if err := r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
@@ -408,6 +413,60 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{Requeue: true}, nil
+}
+
+// captureK6Logs reads each k6-load-generator VM's k6 runner-Pod logs (the
+// end-of-test summary) off the remote k3s and stores them in one ConfigMap
+// per node in lt.Namespace, named "<lt.Name>-k6log-<sanitized nodeID>". The
+// exporter Job later mounts these CMs and ships them the same way as metrics
+// (S3 when configured, else stdout).
+//
+// Whole loop is best-effort: a per-node capture error is recorded as a
+// placeholder inside the ConfigMap (so the failure is still exported) and any
+// ConfigMap write error is logged via logStatusErr — nothing here blocks the
+// Exporting transition. ConfigMaps carry an OwnerRef to the LoadTest so they
+// cascade-delete with it.
+func (r *LoadTestReconciler) captureK6Logs(ctx context.Context,
+	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) {
+	logger := log.FromContext(ctx)
+
+	k6Index := computeK6NodeIndex(env)
+	for _, ref := range lt.Status.TestRuns {
+		k6Node, ok := k6Index[ref.NodeID]
+		if !ok || k6Node.KubeconfigSecret == "" {
+			logger.Info("skipping k6 log capture: node has no kubeconfig secret", "node", ref.NodeID)
+			continue
+		}
+
+		secretRef := types.NamespacedName{Name: k6Node.KubeconfigSecret, Namespace: lt.Namespace}
+		logs, err := r.Dispatcher.GetK6RunnerLogs(ctx, secretRef, ref.Name, ref.Namespace)
+		if err != nil {
+			// Record the failure as a placeholder so the operator/user still
+			// gets a per-VM artifact noting capture did not succeed.
+			logger.Error(err, "k6 log capture failed", "node", ref.NodeID, "testRun", ref.Name)
+			logs = fmt.Sprintf("k6 log capture failed for node %s: %v", ref.NodeID, err)
+		}
+
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("%s-k6log-%s", lt.Name, sanitize(ref.NodeID)),
+				Namespace: lt.Namespace,
+			},
+		}
+		nodeID := ref.NodeID
+		logContent := logs
+		_, cerr := controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+			if cm.Labels == nil {
+				cm.Labels = map[string]string{}
+			}
+			cm.Labels["dfaas.io/loadtest-name"] = lt.Name
+			cm.Labels["dfaas.io/node-id"] = nodeID
+			cm.Labels["dfaas.io/k6-log"] = "true"
+			cm.Data = map[string]string{"k6.log": logContent}
+			return controllerutil.SetOwnerReference(lt, cm, r.Scheme)
+		})
+		logStatusErr(ctx, fmt.Sprintf("upsert k6-log ConfigMap for node %s", nodeID), cerr)
+	}
 }
 
 // runExporter creates the in-cluster Job that pulls metrics from Prometheus
@@ -446,7 +505,18 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 			s3SecretName = mirrored
 		}
 
-		newJob, err := r.createExporterJob(lt, env, lt.Status.StartTime.Time, lt.Status.EndTime.Time, s3SecretName)
+		// Per-node k6-log ConfigMaps captured at the end of observeK6. The
+		// exporter Job mounts these (one file per VM) and ships them the same
+		// way as metrics.
+		k6LogCMs := make([]k6LogConfigMapRef, 0, len(lt.Status.TestRuns))
+		for _, ref := range lt.Status.TestRuns {
+			k6LogCMs = append(k6LogCMs, k6LogConfigMapRef{
+				NodeID:    ref.NodeID,
+				ConfigMap: fmt.Sprintf("%s-k6log-%s", lt.Name, sanitize(ref.NodeID)),
+			})
+		}
+
+		newJob, err := r.createExporterJob(lt, env, lt.Status.StartTime.Time, lt.Status.EndTime.Time, s3SecretName, k6LogCMs)
 		if err != nil {
 			logStatusErr(ctx, "stamp MetricsExported=False (build failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
 				metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,

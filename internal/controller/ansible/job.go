@@ -28,7 +28,7 @@ import (
 // playbook-ConfigMap name so VM and K6 phases run independent Jobs against
 // distinct node sets. The playbook chosen depends on the role:
 //
-//   - dfaas-worker        → setup-nodes.yml (base OS + dFaaS install)
+//   - dfaas-worker        → setup-nodes.yml (base OS + DFaaS install)
 //   - k6-load-generator   → setup-k6-nodes.yml (k3s + k6-operator)
 func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment,
 	role dfaasv1.NodeRole, jobSuffix string,

@@ -1,4 +1,4 @@
-dFaaS chart installed.
+DFaaS chart installed.
 
 Operator namespace : {{ .Values.operator.namespace }}
 UI namespace       : {{ .Values.ui.namespace }}

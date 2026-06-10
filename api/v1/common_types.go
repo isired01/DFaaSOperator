@@ -20,7 +20,7 @@ const (
 	CapacityHigh   NodeCapacity = "HIGH"
 )
 
-// NodeRole tags a node either as a dFaaS worker or as a k6 load generator
+// NodeRole tags a node either as a DFaaS worker or as a k6 load generator
 // running its own k3s + k6-operator.
 // +kubebuilder:validation:Enum=dfaas-worker;k6-load-generator
 type NodeRole string

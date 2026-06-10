@@ -254,7 +254,7 @@
         state: link
         force: true
 
-    - name: "Install dFaaS Agent via Helm"
+    - name: "Install DFaaS Agent via Helm"
       kubernetes.core.helm:
         name: "dfaas-agent"
         chart_ref: "oci://ghcr.io/isired01/dfaas-agent-chart"

@@ -48,15 +48,32 @@ func ExporterJobName(lt *dfaasv1.LoadTest) string {
 	return fmt.Sprintf("%s-exporter-%s-g%d-job", lt.Name, uid, lt.Generation)
 }
 
+// k6LogConfigMapRef pairs a k6-load-generator nodeID with the ConfigMap that
+// holds its captured k6 end-of-test summary (key "k6.log"). The exporter Job
+// projects each into one file named "<nodeID>.log".
+type k6LogConfigMapRef struct {
+	NodeID    string
+	ConfigMap string
+}
+
+// k6LogMountPath is where the per-VM k6-log ConfigMaps are projected inside
+// the exporter Pod. The dataExporter binary reads it via K6_LOG_DIR.
+const k6LogMountPath = "/var/run/k6logs"
+
 // createExporterJob builds the in-cluster Job that runs the dfaas-exporter
 // image to pull metrics from Prometheus over [startTime, endTime] and either
 // upload a CSV to S3 (bucket-per-environment, auto-created on first run) or
 // print it to stdout. The S3 credentials are sourced from a mirrored Secret
 // in the LoadTest namespace named by s3ConfigSecretName; pass empty to skip
 // S3 wiring and fall back to the stdout path inside dataExporter.
+//
+// k6Logs lists the per-node ConfigMaps holding captured k6 end-of-test
+// summaries; when non-empty they are projected read-only at k6LogMountPath
+// (one "<nodeID>.log" file each) and the exporter ships them alongside the
+// metrics CSV.
 func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 	env *dfaasv1.Environment, startTime, endTime time.Time,
-	s3ConfigSecretName string) (*batchv1.Job, error) {
+	s3ConfigSecretName string, k6Logs []k6LogConfigMapRef) (*batchv1.Job, error) {
 	// Resolve raw-type defaults: when Type=raw and MetricName is empty,
 	// the bare metric name (Query) doubles as the alias. CEL validation
 	// already guarantees custom-promql entries have MetricName set.
@@ -132,6 +149,40 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 		)
 	}
 
+	// k6-log projection: one projected volume sourcing each per-node
+	// ConfigMap into a "<nodeID>.log" file, mounted read-only at
+	// k6LogMountPath. Sources are Optional so a missing/uncaptured CM does
+	// not wedge the Pod on a mount error — the exporter tolerates absent
+	// files. K6_LOG_DIR tells the exporter where to find them.
+	var volumes []corev1.Volume
+	var volumeMounts []corev1.VolumeMount
+	if len(k6Logs) > 0 {
+		sources := make([]corev1.VolumeProjection, 0, len(k6Logs))
+		for _, l := range k6Logs {
+			sources = append(sources, corev1.VolumeProjection{
+				ConfigMap: &corev1.ConfigMapProjection{
+					LocalObjectReference: corev1.LocalObjectReference{Name: l.ConfigMap},
+					Items: []corev1.KeyToPath{
+						{Key: "k6.log", Path: l.NodeID + ".log"},
+					},
+					Optional: ptr.To(true),
+				},
+			})
+		}
+		volumes = append(volumes, corev1.Volume{
+			Name: "k6logs",
+			VolumeSource: corev1.VolumeSource{
+				Projected: &corev1.ProjectedVolumeSource{Sources: sources},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "k6logs",
+			MountPath: k6LogMountPath,
+			ReadOnly:  true,
+		})
+		envVars = append(envVars, corev1.EnvVar{Name: "K6_LOG_DIR", Value: k6LogMountPath})
+	}
+
 	// PodReplacementPolicy=Failed retains failed Pods for post-mortem debug:
 	// Job controller waits for full Pod termination before replacing and does
 	// not delete failed Pods on BackoffLimit exceeded (TTL handles cleanup).
@@ -148,11 +199,13 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "exporter",
-							Image: exporterImage(),
-							Env:   envVars,
+							Name:         "exporter",
+							Image:        exporterImage(),
+							Env:          envVars,
+							VolumeMounts: volumeMounts,
 						},
 					},
+					Volumes: volumes,
 					// RestartPolicyNever ensures each retry creates a distinct Pod;
 					// OnFailure restarts the container in-place and loses prior attempt logs.
 					RestartPolicy: corev1.RestartPolicyNever,

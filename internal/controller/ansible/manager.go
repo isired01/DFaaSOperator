@@ -6,7 +6,7 @@ import (
 )
 
 // Manager runs the Ansible provisioning operations (Job, ConfigMap,
-// Helm values) for a dFaaS environment.
+// Helm values) for a DFaaS environment.
 type Manager struct {
 	client.Client
 	Scheme *runtime.Scheme

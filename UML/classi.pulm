@@ -1,5 +1,5 @@
 @startuml
-title CRD per dFaaSOperator -- Class Diagram (v3, two-CRD split)
+title CRD per DFaaSOperator -- Class Diagram (v3, two-CRD split)
 
 skinparam class {
     BackgroundColor #FFFFFF

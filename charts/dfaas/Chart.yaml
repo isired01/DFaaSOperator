@@ -1,6 +1,6 @@
 apiVersion: v2
 name: dfaas
-description: dFaaS — operator (CRDs Environment/LoadTest) + UI control plane
+description: DFaaS — operator (CRDs Environment/LoadTest) + UI control plane
 type: application
 version: 0.0.0
 appVersion: "0.0.0"

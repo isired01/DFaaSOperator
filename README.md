@@ -1,6 +1,6 @@
-# dFaaS Experiment Controller
+# DFaaS Experiment Controller
 
-Kubebuilder-scaffolded Kubernetes operator (Go 1.25, controller-runtime v0.17.3) that orchestrates **dFaaS** (distributed FaaS) experiments end-to-end: from federation provisioning to k6 load tests and metrics export.
+Kubebuilder-scaffolded Kubernetes operator (Go 1.25, controller-runtime v0.17.3) that orchestrates **DFaaS** (distributed FaaS) experiments end-to-end: from federation provisioning to k6 load tests and metrics export.
 
 The operator ships as a single Deployment that runs **two controllers** against two CRDs in `dfaas.dfaas.io/v1`:
 
