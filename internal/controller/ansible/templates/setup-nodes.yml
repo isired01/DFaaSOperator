@@ -1,6 +1,6 @@
 ---
 - name: "Setup DFaaS Node"
-  hosts: target_Nodess
+  hosts: target_nodes
   become: true
   collections:
     - mschuchard.general

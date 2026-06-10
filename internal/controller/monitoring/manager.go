@@ -1,10 +1,10 @@
-// Package monitoring incapsula la gestione del monitoring stack (Prometheus +
-// Grafana via Helm) e la configurazione dinamica dei target di service
-// discovery file-based.
+// Package monitoring encapsulates management of the monitoring stack
+// (Prometheus + Grafana via Helm) and the dynamic configuration of the
+// file-based service discovery targets.
 //
-// Asset Helm (chart .tgz e values.yaml) sono bundleati nel binario via
-// go:embed (vedi assets.go). Le operazioni di install/upgrade sono delegate
-// al wrapper SDK in internal/helm/.
+// Helm assets (chart .tgz and values.yaml) are bundled into the binary via
+// go:embed (see assets.go). Install/upgrade operations are delegated to the
+// SDK wrapper in internal/helm/.
 package monitoring
 
 import (
@@ -12,16 +12,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// Manager esegue le operazioni di provisioning monitoring (Prometheus +
-// Grafana) e la riconciliazione dei target Prometheus per un esperimento.
+// Manager runs the monitoring provisioning operations (Prometheus + Grafana)
+// and the reconciliation of Prometheus targets for an environment.
 type Manager struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
 
-// PrometheusTarget è l'unità di service discovery file-based per Prometheus.
-// Serializzato in JSON e iniettato nella ConfigMap prometheus-targets, viene
-// letto dal pod Prometheus tramite file_sd_configs.
+// PrometheusTarget is the file-based service discovery unit for Prometheus.
+// Serialized to JSON and injected into the prometheus-targets ConfigMap, it is
+// read by the Prometheus pod via file_sd_configs.
 type PrometheusTarget struct {
 	Targets []string          `json:"targets"`
 	Labels  map[string]string `json:"labels"`

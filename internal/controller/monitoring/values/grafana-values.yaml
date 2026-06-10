@@ -1,6 +1,6 @@
-# Override values per il chart grafana/grafana.
-# PoC: niente PVC, credenziali admin/admin, datasource Prometheus
-# pre-configurato puntando alla release "prometheus" nel namespace monitoring.
+# Override values for the grafana/grafana chart.
+# PoC: no PVC, admin/admin credentials, Prometheus datasource
+# pre-configured pointing at the "prometheus" release in the monitoring namespace.
 
 persistence:
   enabled: false

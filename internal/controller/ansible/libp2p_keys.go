@@ -122,7 +122,7 @@ func (m *Manager) EnsureLibp2pKeys(ctx context.Context,
 }
 
 // generateLibp2pKey returns a base64-encoded PKCS#8 ed25519 private key in the
-// exact form expected by calcolaPeerID and the Helm chart `privateKey` value
+// exact form expected by derivePeerID and the Helm chart `privateKey` value
 // at templates/setup-nodes.yml.
 func generateLibp2pKey() (string, error) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)

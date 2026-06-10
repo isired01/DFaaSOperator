@@ -72,6 +72,14 @@ const healthRetryBudget = 3
 // sshAttemptsAnnotation so the health loop never clobbers provisioning state.
 const healthMissesAnnotation = "dfaas.dfaas.io/health-misses"
 
+// jobTTLSuccessSeconds is the TTLSecondsAfterFinished applied to a successful
+// Ansible Job so the Job controller cleans it up shortly after completion.
+const jobTTLSuccessSeconds int32 = 600
+
+// jobTTLFailureGraceSeconds is the TTLSecondsAfterFinished applied to a failed
+// Ansible Job (24h), giving an audit window before auto-cleanup.
+const jobTTLFailureGraceSeconds int32 = 86400
+
 // handleEnvDeletion drains per-environment cluster-wide state (Prometheus
 // targets) and removes the finalizer. Per-environment Jobs and ConfigMaps
 // carry ControllerReferences and are garbage-collected automatically.
@@ -83,7 +91,7 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 		logger.Info("environment deletion: cleaning up Prometheus targets")
 
 		mm := &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
-		_ = mm.CleanupTargets(ctx, env)
+		logStatusErr(ctx, "cleanup Prometheus targets", mm.CleanupTargets(ctx, env))
 
 		controllerutil.RemoveFinalizer(env, environmentFinalizer)
 		if err := r.Update(ctx, env); err != nil {
@@ -103,9 +111,9 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 	logger := log.FromContext(ctx)
 
 	if len(env.Spec.Nodes) == 0 {
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
+		logStatusErr(ctx, "stamp VMsReady=True (skipped)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
 			metav1.ConditionTrue, dfaasv1.EnvReasonSkipped,
-			"no nodes declared — placeholder phase")
+			"no nodes declared — placeholder phase"))
 		return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningInfra)
 	}
 
@@ -122,23 +130,23 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 		}
 		if count >= sshRetryBudget {
 			logger.Info("VMs not SSH-reachable, giving up", "nodes", unreachable, "attempts", count)
-			_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
+			logStatusErr(ctx, "stamp VMsReady=False (budget exhausted)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
 				metav1.ConditionFalse, dfaasv1.EnvReasonSSHUnreachable,
-				fmt.Sprintf("SSH :22 dial failed for %v after %d attempts", unreachable, count))
+				fmt.Sprintf("SSH :22 dial failed for %v after %d attempts", unreachable, count)))
 			return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
 		}
 		logger.Info("VMs not SSH-reachable, retrying", "nodes", unreachable, "attempts", count)
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
+		logStatusErr(ctx, "stamp VMsReady=False (retrying)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
 			metav1.ConditionFalse, dfaasv1.EnvReasonSSHUnreachable,
-			fmt.Sprintf("SSH :22 dial failed for: %v", unreachable))
+			fmt.Sprintf("SSH :22 dial failed for: %v", unreachable)))
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	if rerr := r.resetSSHAttempts(ctx, env); rerr != nil {
 		logger.Error(rerr, "resetSSHAttempts failed; non-fatal")
 	}
-	_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
+	logStatusErr(ctx, "stamp VMsReady=True (reachable)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonSSHReachable,
-		"all declared nodes reachable on :22")
+		"all declared nodes reachable on :22"))
 	return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningInfra)
 }
 
@@ -221,14 +229,14 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 	if count >= healthRetryBudget {
 		logger.Info("Ready environment nodes unreachable; transitioning to Failed",
 			"nodes", unreachable, "attempts", count)
-		_ = r.markNodesUnreachable(ctx, env,
-			fmt.Sprintf("SSH :22 dial failed for %v after %d consecutive health checks", unreachable, count))
+		logStatusErr(ctx, "mark NodesReachable=False (budget exhausted)", r.markNodesUnreachable(ctx, env,
+			fmt.Sprintf("SSH :22 dial failed for %v after %d consecutive health checks", unreachable, count)))
 		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
 	}
 	logger.Info("Ready environment nodes unreachable; will retry",
 		"nodes", unreachable, "attempts", count)
-	_ = r.markNodesUnreachable(ctx, env,
-		fmt.Sprintf("SSH :22 dial failed for %v (attempt %d/%d)", unreachable, count, healthRetryBudget))
+	logStatusErr(ctx, "mark NodesReachable=False (retrying)", r.markNodesUnreachable(ctx, env,
+		fmt.Sprintf("SSH :22 dial failed for %v (attempt %d/%d)", unreachable, count, healthRetryBudget)))
 	return ctrl.Result{RequeueAfter: healthRetryInterval}, nil
 }
 
@@ -237,11 +245,7 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 // caught by the throttle).
 func (r *EnvironmentReconciler) markNodesReachable(ctx context.Context,
 	env *dfaasv1.Environment) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.Environment{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(env), latest); err != nil {
-			return err
-		}
+	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
 		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
 			Type:    dfaasv1.EnvCondNodesReachable,
 			Status:  metav1.ConditionTrue,
@@ -250,7 +254,7 @@ func (r *EnvironmentReconciler) markNodesReachable(ctx context.Context,
 		})
 		now := metav1.Now()
 		latest.Status.LastHealthCheck = &now
-		return r.Status().Update(ctx, latest)
+		return nil
 	})
 }
 
@@ -258,11 +262,7 @@ func (r *EnvironmentReconciler) markNodesReachable(ctx context.Context,
 // lastHealthCheck in a single status update.
 func (r *EnvironmentReconciler) markNodesUnreachable(ctx context.Context,
 	env *dfaasv1.Environment, msg string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.Environment{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(env), latest); err != nil {
-			return err
-		}
+	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
 		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
 			Type:    dfaasv1.EnvCondNodesReachable,
 			Status:  metav1.ConditionFalse,
@@ -271,7 +271,7 @@ func (r *EnvironmentReconciler) markNodesUnreachable(ctx context.Context,
 		})
 		now := metav1.Now()
 		latest.Status.LastHealthCheck = &now
-		return r.Status().Update(ctx, latest)
+		return nil
 	})
 }
 
@@ -352,19 +352,19 @@ func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	if vmsFailed || k6Failed {
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondInfrastructureReady,
+		logStatusErr(ctx, "stamp InfrastructureReady=False", r.setEnvCondition(ctx, env, dfaasv1.EnvCondInfrastructureReady,
 			metav1.ConditionFalse, dfaasv1.EnvReasonInfraFailed,
-			"dfaas-worker or k6 provisioning failed; inspect DfaasWorkersReady and K6Ready conditions")
+			"dfaas-worker or k6 provisioning failed; inspect DfaasWorkersReady and K6Ready conditions"))
 		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
 	}
 	// Both Jobs succeeded and the fan-in has settled. Now — and only now — is
 	// it safe to stamp the success TTL: neither sibling will be re-checked
 	// again from this phase, so auto-deletion can no longer trigger a recreate.
-	r.patchAnsibleJobTTL(ctx, env, "vms", 600)
-	r.patchAnsibleJobTTL(ctx, env, "k6", 600)
-	_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondInfrastructureReady,
+	r.patchAnsibleJobTTL(ctx, env, "vms", jobTTLSuccessSeconds)
+	r.patchAnsibleJobTTL(ctx, env, "k6", jobTTLSuccessSeconds)
+	logStatusErr(ctx, "stamp InfrastructureReady=True", r.setEnvCondition(ctx, env, dfaasv1.EnvCondInfrastructureReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonInfraReady,
-		"dfaas-worker and k6 Ansible Jobs completed")
+		"dfaas-worker and k6 Ansible Jobs completed"))
 	return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningMonitoring)
 }
 
@@ -411,22 +411,77 @@ func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Cont
 	return r.setEnvPhase(ctx, env, dfaasv1.EnvReady)
 }
 
+// ansibleJobSpec bundles the role-specific knobs shared by ensureVMsJob and
+// ensureK6Job so the common ensureAnsibleJob body can stamp the right
+// Condition type, reasons and messages for each provisioning stream.
+type ansibleJobSpec struct {
+	role          dfaasv1.NodeRole // node role this Job targets
+	jobSuffix     string           // suffix passed to ansible.JobNameForRole
+	condType      string           // Condition type stamped on env.status
+	skipReason    string           // reason when the role has no nodes
+	skipMessage   string           // message when the role has no nodes
+	succeedReason string           // reason on Job success
+	humanRole     string           // human-readable role name for log/messages
+	libp2pKeys    map[string]string
+}
+
 // ensureVMsJob is the non-advancing variant for the dfaas-worker Ansible
 // Job, used by ProvisioningInfra fan-in. Returns done/failed flags and
 // stamps the DfaasWorkersReady Condition; never calls setEnvPhase.
 func (r *EnvironmentReconciler) ensureVMsJob(ctx context.Context,
 	env *dfaasv1.Environment, libp2pKeys map[string]string) (done bool, failed bool, err error) {
+	return r.ensureAnsibleJob(ctx, env, ansibleJobSpec{
+		role:          dfaasv1.RoleDfaasWorker,
+		jobSuffix:     "vms",
+		condType:      dfaasv1.EnvCondDfaasWorkersReady,
+		skipReason:    dfaasv1.EnvReasonNoWorkers,
+		skipMessage:   "no dfaas-worker nodes in spec — phase skipped",
+		succeedReason: dfaasv1.EnvReasonVMsProvisioned,
+		humanRole:     "dfaas-worker",
+		libp2pKeys:    libp2pKeys,
+	})
+}
+
+// ensureK6Job is the non-advancing variant used by the parallel
+// ProvisioningInfra fan-in. Returns done/failed flags and stamps the K6Ready
+// Condition; never calls setEnvPhase.
+func (r *EnvironmentReconciler) ensureK6Job(ctx context.Context,
+	env *dfaasv1.Environment) (done bool, failed bool, err error) {
+	return r.ensureAnsibleJob(ctx, env, ansibleJobSpec{
+		role:          dfaasv1.RoleK6LoadGenerator,
+		jobSuffix:     "k6",
+		condType:      dfaasv1.EnvCondK6Ready,
+		skipReason:    dfaasv1.EnvReasonNoK6Nodes,
+		skipMessage:   "no k6-load-generator nodes in spec — phase skipped",
+		succeedReason: dfaasv1.EnvReasonK6Provisioned,
+		humanRole:     "k6",
+		libp2pKeys:    nil,
+	})
+}
+
+// ensureAnsibleJob drives one provisioning stream of the parallel
+// ProvisioningInfra fan-in: it creates the role-filtered Ansible Job on first
+// sight, then reports its terminal state via done/failed flags while stamping
+// the per-stream Condition described by spec. It never calls setEnvPhase, so
+// the caller owns the FSM transition once both streams settle.
+//
+// NB: the success TTL is NOT set here. While the sibling Job may still be
+// running, ProvisioningInfra keeps re-reconciling every 10s; a short TTL would
+// let the Job controller delete this finished Job mid-wait, the next call would
+// hit NotFound and recreate it, re-running the playbook. The success TTL is
+// applied once, after the fan-in settles, in reconcileProvisioningInfra.
+func (r *EnvironmentReconciler) ensureAnsibleJob(ctx context.Context,
+	env *dfaasv1.Environment, spec ansibleJobSpec) (done bool, failed bool, err error) {
 	logger := log.FromContext(ctx)
 
-	if !env.HasNodeWithRole(dfaasv1.RoleDfaasWorker) {
-		logger.Info("no dfaas-worker nodes, skipping VMs Ansible phase")
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDfaasWorkersReady,
-			metav1.ConditionTrue, dfaasv1.EnvReasonNoWorkers,
-			"no dfaas-worker nodes in spec — phase skipped")
+	if !env.HasNodeWithRole(spec.role) {
+		logger.Info("no nodes for role, skipping Ansible phase", "role", spec.humanRole)
+		logStatusErr(ctx, "stamp "+spec.condType+"=True (skipped)", r.setEnvCondition(ctx, env, spec.condType,
+			metav1.ConditionTrue, spec.skipReason, spec.skipMessage))
 		return true, false, nil
 	}
 
-	jobName := ansible.JobNameForRole(env, "vms")
+	jobName := ansible.JobNameForRole(env, spec.jobSuffix)
 	var job batchv1.Job
 	getErr := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: env.Namespace}, &job)
 
@@ -434,37 +489,37 @@ func (r *EnvironmentReconciler) ensureVMsJob(ctx context.Context,
 		// P7: before kicking off the Job, the observed state is "we haven't
 		// checked yet" — stamp Unknown/JobPending. Replaced by False/
 		// AnsibleRunning once the Job exists.
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDfaasWorkersReady,
+		logStatusErr(ctx, "stamp "+spec.condType+"=Unknown (job pending)", r.setEnvCondition(ctx, env, spec.condType,
 			metav1.ConditionUnknown, dfaasv1.EnvReasonJobPending,
-			"dfaas-worker Ansible Job not yet created")
+			spec.humanRole+" Ansible Job not yet created"))
 
-		logger.Info("creating Ansible Job for dfaas-worker", "job", jobName)
+		logger.Info("creating Ansible Job", "role", spec.humanRole, "job", jobName)
 		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
-		newJob, secret, jerr := am.CreateJobForRole(ctx, env, dfaasv1.RoleDfaasWorker, "vms", libp2pKeys)
+		newJob, secret, jerr := am.CreateJobForRole(ctx, env, spec.role, spec.jobSuffix, spec.libp2pKeys)
 		if jerr != nil {
 			// P2: surface CreateJobForRole failure.
-			_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDfaasWorkersReady,
+			logStatusErr(ctx, "stamp "+spec.condType+"=False (build failed)", r.setEnvCondition(ctx, env, spec.condType,
 				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
-				"build dfaas-worker Ansible Job: "+condMessage(jerr))
+				"build "+spec.humanRole+" Ansible Job: "+condMessage(jerr)))
 			return false, false, jerr
 		}
 		if cerr := r.Create(ctx, secret); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
 			// P2.
-			_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDfaasWorkersReady,
+			logStatusErr(ctx, "stamp "+spec.condType+"=False (secret create failed)", r.setEnvCondition(ctx, env, spec.condType,
 				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
-				"create dfaas-worker inventory Secret: "+condMessage(cerr))
+				"create "+spec.humanRole+" inventory Secret: "+condMessage(cerr)))
 			return false, false, cerr
 		}
 		if cerr := r.Create(ctx, newJob); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
 			// P2.
-			_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDfaasWorkersReady,
+			logStatusErr(ctx, "stamp "+spec.condType+"=False (job create failed)", r.setEnvCondition(ctx, env, spec.condType,
 				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
-				"create dfaas-worker Ansible Job: "+condMessage(cerr))
+				"create "+spec.humanRole+" Ansible Job: "+condMessage(cerr)))
 			return false, false, cerr
 		}
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDfaasWorkersReady,
+		logStatusErr(ctx, "stamp "+spec.condType+"=False (job started)", r.setEnvCondition(ctx, env, spec.condType,
 			metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleRunning,
-			"dfaas-worker Ansible Job started")
+			spec.humanRole+" Ansible Job started"))
 		return false, false, nil
 	}
 	if getErr != nil {
@@ -472,116 +527,27 @@ func (r *EnvironmentReconciler) ensureVMsJob(ctx context.Context,
 	}
 
 	if job.Status.Succeeded > 0 {
-		// NB: do NOT set the success TTL here. While the sibling k6 Job may
-		// still be running, ProvisioningInfra keeps re-reconciling every 10s;
-		// a 600s TTL would let the Job controller delete this finished Job
-		// mid-wait, the next ensureVMsJob would hit NotFound and recreate it,
-		// re-running the playbook. The success TTL is applied once, after the
-		// fan-in settles, in reconcileProvisioningInfra.
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDfaasWorkersReady,
-			metav1.ConditionTrue, dfaasv1.EnvReasonVMsProvisioned,
-			"dfaas-worker Ansible Job completed")
+		logStatusErr(ctx, "stamp "+spec.condType+"=True (completed)", r.setEnvCondition(ctx, env, spec.condType,
+			metav1.ConditionTrue, spec.succeedReason,
+			spec.humanRole+" Ansible Job completed"))
 		return true, false, nil
 	}
 	if job.Status.Failed > 0 {
-		patchJobTTL(ctx, r.Client, &job, 86400)
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDfaasWorkersReady,
+		patchJobTTL(ctx, r.Client, &job, jobTTLFailureGraceSeconds)
+		logStatusErr(ctx, "stamp "+spec.condType+"=False (job failed)", r.setEnvCondition(ctx, env, spec.condType,
 			metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleFailed,
-			"dfaas-worker Ansible Job failed; check logs")
+			spec.humanRole+" Ansible Job failed; check logs"))
 		return false, true, nil
 	}
-	logger.Info("dfaas-worker Ansible Job still running",
+	logger.Info("Ansible Job still running",
+		"role", spec.humanRole,
 		"job", jobName,
 		"active", job.Status.Active,
 		"succeeded", job.Status.Succeeded,
 		"failed", job.Status.Failed)
-	_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondDfaasWorkersReady,
+	logStatusErr(ctx, "stamp "+spec.condType+"=False (in progress)", r.setEnvCondition(ctx, env, spec.condType,
 		metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleRunning,
-		"dfaas-worker Ansible Job in progress")
-	return false, false, nil
-}
-
-// ensureK6Job is the non-advancing variant of runAnsiblePhase used by the
-// parallel ProvisioningInfra fan-in. Returns done/failed flags and stamps the
-// K6Ready Condition; never calls setEnvPhase.
-func (r *EnvironmentReconciler) ensureK6Job(ctx context.Context,
-	env *dfaasv1.Environment) (done bool, failed bool, err error) {
-	logger := log.FromContext(ctx)
-
-	if !env.HasNodeWithRole(dfaasv1.RoleK6LoadGenerator) {
-		logger.Info("no k6-load-generator nodes, skipping K6 phase")
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondK6Ready,
-			metav1.ConditionTrue, dfaasv1.EnvReasonNoK6Nodes,
-			"no k6-load-generator nodes in spec — phase skipped")
-		return true, false, nil
-	}
-
-	jobName := ansible.JobNameForRole(env, "k6")
-	var job batchv1.Job
-	getErr := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: env.Namespace}, &job)
-
-	if apierrors.IsNotFound(getErr) {
-		// P7.
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondK6Ready,
-			metav1.ConditionUnknown, dfaasv1.EnvReasonJobPending,
-			"k6 Ansible Job not yet created")
-
-		logger.Info("creating Ansible Job for K6", "job", jobName)
-		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
-		newJob, secret, jerr := am.CreateJobForRole(ctx, env, dfaasv1.RoleK6LoadGenerator, "k6", nil)
-		if jerr != nil {
-			// P2.
-			_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondK6Ready,
-				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
-				"build k6 Ansible Job: "+condMessage(jerr))
-			return false, false, jerr
-		}
-		if cerr := r.Create(ctx, secret); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
-			_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondK6Ready,
-				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
-				"create k6 inventory Secret: "+condMessage(cerr))
-			return false, false, cerr
-		}
-		if cerr := r.Create(ctx, newJob); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
-			_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondK6Ready,
-				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
-				"create k6 Ansible Job: "+condMessage(cerr))
-			return false, false, cerr
-		}
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondK6Ready,
-			metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleRunning,
-			"k6 Ansible Job started")
-		return false, false, nil
-	}
-	if getErr != nil {
-		return false, false, getErr
-	}
-
-	if job.Status.Succeeded > 0 {
-		// NB: do NOT set the success TTL here — see ensureVMsJob. Deleting a
-		// finished Job while the sibling is still running would trigger a
-		// NotFound→recreate→rerun loop. Applied after fan-in in
-		// reconcileProvisioningInfra.
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondK6Ready,
-			metav1.ConditionTrue, dfaasv1.EnvReasonK6Provisioned,
-			"k6 Ansible Job completed")
-		return true, false, nil
-	}
-	if job.Status.Failed > 0 {
-		patchJobTTL(ctx, r.Client, &job, 86400)
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondK6Ready,
-			metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleFailed,
-			"k6 Ansible Job failed; check logs")
-		return false, true, nil
-	}
-	logger.Info("k6 Ansible Job still running",
-		"job", jobName,
-		"active", job.Status.Active,
-		"succeeded", job.Status.Succeeded,
-		"failed", job.Status.Failed)
-	_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondK6Ready,
-		metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleRunning,
-		"k6 Ansible Job in progress")
+		spec.humanRole+" Ansible Job in progress"))
 	return false, false, nil
 }
 
@@ -600,10 +566,10 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 			logger.Error(bumpErr, "bumpMonitoringAttempts failed; continuing without budget enforcement")
 		}
 		if count >= monitoringRetryBudget {
-			_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
+			logStatusErr(ctx, "stamp MonitoringReady=False (helm failed)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
 				metav1.ConditionFalse, dfaasv1.EnvReasonHelmFailed,
 				fmt.Sprintf("monitoring Helm install failed %d consecutive times: %s",
-					count, condMessage(derr)))
+					count, condMessage(derr))))
 			return false, true, nil
 		}
 		// P7 + P14: first ever observation is Unknown; subsequent retries
@@ -614,9 +580,9 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 		if count == 1 {
 			condStatus = metav1.ConditionUnknown
 		}
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
+		logStatusErr(ctx, "stamp MonitoringReady (helm installing)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
 			condStatus, dfaasv1.EnvReasonHelmInstalling,
-			"monitoring Helm install in progress / retrying: "+condMessage(derr))
+			"monitoring Helm install in progress / retrying: "+condMessage(derr)))
 		return false, false, nil
 	}
 	if rerr := r.resetMonitoringAttempts(ctx, env); rerr != nil {
@@ -624,16 +590,16 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 	}
 	ready, _ := mm.Check(ctx)
 	if !ready {
-		_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
+		logStatusErr(ctx, "stamp MonitoringReady=False (waiting pods)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
 			metav1.ConditionFalse, dfaasv1.EnvReasonWaitingPods,
-			"monitoring pods not Ready yet")
+			"monitoring pods not Ready yet"))
 		return false, false, nil
 	}
 
-	_ = r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
+	logStatusErr(ctx, "stamp MonitoringReady=True", r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonPodsRunning,
-		"monitoring stack up")
-	_ = mm.ReconcileTargets(ctx, env)
+		"monitoring stack up"))
+	logStatusErr(ctx, "reconcile Prometheus targets", mm.ReconcileTargets(ctx, env))
 	return true, false, nil
 }
 
@@ -765,11 +731,7 @@ func patchJobTTL(ctx context.Context, c client.Client, job *batchv1.Job, ttlSec 
 // syncNodeStatus surfaces k6/dfaas node info into status, for fast lookup by
 // the LoadTestReconciler.
 func (r *EnvironmentReconciler) syncNodeStatus(ctx context.Context, env *dfaasv1.Environment) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.Environment{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(env), latest); err != nil {
-			return err
-		}
+	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
 		var k6 []dfaasv1.K6NodeStatus
 		var dfaas []string
 		for _, n := range latest.Spec.Nodes {
@@ -786,21 +748,48 @@ func (r *EnvironmentReconciler) syncNodeStatus(ctx context.Context, env *dfaasv1
 		}
 		latest.Status.K6Nodes = k6
 		latest.Status.DfaasNodes = dfaas
+		return nil
+	})
+}
+
+// atomicStatusUpdate runs mutate against the freshly-fetched Environment under
+// retry.RetryOnConflict and persists it via Status().Update. It is the shared
+// implementation behind the best-effort status-stamping helpers: it re-fetches
+// to absorb informer cache lag, retries on conflict, and returns the final
+// error so callers can decide whether to surface it. Fire-and-forget callers
+// should route the result through logStatusErr rather than discarding it.
+func (r *EnvironmentReconciler) atomicStatusUpdate(ctx context.Context,
+	key client.ObjectKey, mutate func(env *dfaasv1.Environment) error) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &dfaasv1.Environment{}
+		if err := r.Get(ctx, key, latest); err != nil {
+			return err
+		}
+		if err := mutate(latest); err != nil {
+			return err
+		}
 		return r.Status().Update(ctx, latest)
 	})
 }
 
+// logStatusErr logs a best-effort operation failure instead of silently
+// dropping it. op is a short human-readable label for the operation that
+// failed. Used at fire-and-forget sites (condition/status stamping, Prometheus
+// target reconcile) where a failure is non-fatal but should still be visible
+// in logs.
+func logStatusErr(ctx context.Context, op string, err error) {
+	if err != nil {
+		log.FromContext(ctx).Error(err, "best-effort operation failed", "op", op)
+	}
+}
+
 // setEnvCondition sets a Condition on Environment.status using the
-// rifetch-then-update pattern that absorbs informer cache lag.
+// re-fetch-then-update pattern that absorbs informer cache lag.
 func (r *EnvironmentReconciler) setEnvCondition(ctx context.Context,
 	env *dfaasv1.Environment, condType string, status metav1.ConditionStatus,
 	reason, message string) error {
 
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.Environment{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(env), latest); err != nil {
-			return err
-		}
+	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
 		// Note: omit LastTransitionTime — meta.SetStatusCondition stamps it
 		// only when status/reason/message actually changes. Letting the
 		// helper set it preserves stability across no-op reconciles (P14).
@@ -810,7 +799,7 @@ func (r *EnvironmentReconciler) setEnvCondition(ctx context.Context,
 			Reason:  reason,
 			Message: message,
 		})
-		return r.Status().Update(ctx, latest)
+		return nil
 	})
 }
 

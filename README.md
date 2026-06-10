@@ -9,7 +9,7 @@ The operator ships as a single Deployment that runs **two controllers** against 
 
 ## Install via Helm
 
-Prereqs: K8s ≥ 1.25, `kubectl` connesso al cluster, `helm` ≥ 3.8 (per OCI), pull anonimo da `ghcr.io` raggiungibile dal cluster.
+Prereqs: K8s ≥ 1.25, `kubectl` connected to the cluster, `helm` ≥ 3.8 (for OCI), anonymous pull from `ghcr.io` reachable from the cluster.
 
 ### Step 1 — Installa operator + UI via Helm
 
@@ -19,32 +19,32 @@ helm install dfaas oci://ghcr.io/isired01/charts/dfaas \
   --create-namespace \
   --namespace dfaas-operator-system
 
-# Apri la UI:
+# Open the UI:
 kubectl -n dfaas-ui port-forward svc/dfaas-ui 8082:8082
 open http://localhost:8082
 ```
 
-### Step 2 — Crea i primi Custom Resource
+### Step 2 — Create your first Custom Resources
 
-Esempi pronti in [`config/samples/`](config/samples/):
+Ready-made examples in [`config/samples/`](config/samples/):
 
-- [`dfaas_v1_environment.yaml`](config/samples/dfaas_v1_environment.yaml) — Environment con dfaas-worker + k6-load-generator nodes
-- [`dfaas_v1_loadtest.yaml`](config/samples/dfaas_v1_loadtest.yaml) — LoadTest k6 contro l'Environment sopra
+- [`dfaas_v1_environment.yaml`](config/samples/dfaas_v1_environment.yaml) — Environment with dfaas-worker + k6-load-generator nodes
+- [`dfaas_v1_loadtest.yaml`](config/samples/dfaas_v1_loadtest.yaml) — k6 LoadTest against the Environment above
 
-**Prima di applicare devi configurare gli IP delle VM** (operator NON provvede macchine, le orchestra solo). Edita `spec.nodes[].ipAddress` con gli indirizzi delle VM Ubuntu già accese e raggiungibili in SSH:
+**Before applying, configure the VM IPs** (the operator does NOT provision machines, it only orchestrates them). Edit `spec.nodes[].ipAddress` with the addresses of Ubuntu VMs that are already running and reachable over SSH:
 
 ```yaml
 spec:
   nodes:
     - id: dfaas-worker-1
       role: dfaas-worker
-      ipAddress: 10.0.0.5      # <— sostituisci con IP reale
+      ipAddress: 10.0.0.5      # <— replace with the real IP
       sshUser: ubuntu
       sshPassword: ...
       # ...
     - id: k6-load-generator-1
       role: k6-load-generator
-      ipAddress: 10.0.0.6      # <— sostituisci con IP reale
+      ipAddress: 10.0.0.6      # <— replace with the real IP
       # ...
 ```
 
@@ -52,7 +52,7 @@ Poi:
 
 ```bash
 kubectl apply -f config/samples/dfaas_v1_environment.yaml
-kubectl get environment -w   # attendi phase=Ready
+kubectl get environment -w   # wait for phase=Ready
 kubectl apply -f config/samples/dfaas_v1_loadtest.yaml
 ```
 
@@ -68,10 +68,10 @@ helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 1.0.0 \
 ### Upgrade
 
 ```bash
-# Aggiorna SOLO operator + UI:
+# Upgrade ONLY operator + UI:
 helm upgrade dfaas oci://ghcr.io/isired01/charts/dfaas --version 1.1.0
 
-# Se la nuova release porta CRD modificate, applicale a mano PRIMA del chart upgrade:
+# If the new release ships modified CRDs, apply them manually BEFORE the chart upgrade:
 kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v1.1.0/dfaas.dfaas.io_environments.yaml
 kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v1.1.0/dfaas.dfaas.io_loadtests.yaml
 ```
@@ -81,8 +81,8 @@ kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v1.
 ```bash
 helm uninstall dfaas -n dfaas-operator-system
 
-# CRD restano (e con loro tutti i CR Environment/LoadTest esistenti).
-# Per cancellare tutto (cascade-delete pericoloso):
+# CRDs remain (and with them all existing Environment/LoadTest CRs).
+# To delete everything (dangerous cascade-delete):
 kubectl delete crd environments.dfaas.dfaas.io loadtests.dfaas.dfaas.io
 ```
 
@@ -94,7 +94,7 @@ kubectl delete crd environments.dfaas.dfaas.io loadtests.dfaas.dfaas.io
       | -------------- ||-----------------------------|
 | nodes: dfaas-worker, k6   |        | targetEnvironment: env-xyz  |
 | topology (latency links)  |        | perNodeLoad[]               |
-| openfaas functions        |        | metricsExport.queries (PromQL)|
+| openfaas functions        |        | metricsExport.metrics[] (PromQL)|
 +-------------+-------------+        +--------------+--------------+
               | reconcile                            | reconcile
               v                                      v
@@ -127,11 +127,14 @@ Re-provisioning only runs when `spec.generation` changes. A finalizer (`dfaas.df
 ### `LoadTest`
 ```
 Pending (Conditions[Suspended]=True)   ← Save as Draft (spec.suspended=true)
-   on PATCH spec.suspended=false:
+   on PATCH spec.suspended=false (or scheduled spec.startAt fires):
 Pending → Running → Exporting → Completed
                               ↘ Failed
+   spec.stop=true  OR  kubectl delete (finalizer)  → Aborted   (remote TestRuns deleted)
 ```
-The reconciler watches the target `Environment`: a Pending LoadTest auto-resumes when the env reaches `Ready`. A LoadTest created with `spec.suspended: true` (used by the UI for "Save as Draft") stays at `Pending` with `Conditions[Suspended]=True` until the user PATCHes `spec.suspended: false`; mirrors `batch/v1.Job.spec.suspend`. Run-once: once the LoadTest enters `Running`/`Exporting`/`Completed`/`Failed`, further changes to `spec.suspended` are ignored.
+The reconciler watches the target `Environment`: a Pending LoadTest auto-resumes when the env reaches `Ready`. A LoadTest created with `spec.suspended: true` (used by the UI for "Save as Draft") stays at `Pending` with `Conditions[Suspended]=True` until the user PATCHes `spec.suspended: false`; mirrors `batch/v1.Job.spec.suspend`. `spec.startAt` schedules a future start (the reconciler flips `suspended=false` when the time arrives). Run-once: once the LoadTest enters `Running`/`Exporting`/`Completed`/`Failed`, further changes to `spec.suspended` are ignored.
+
+**Abort & deletion.** PATCH `spec.stop=true` (allowed in `Pending`/`Running`) deletes every remote `TestRun` and transitions to the terminal `Aborted`, keeping the CR as an audit record. A finalizer (`dfaas.dfaas.io/loadtest-finalizer`) runs the same remote cleanup on `kubectl delete`, so no remote run is orphaned on any deletion path.
 
 ## 📡 Phases & Conditions
 

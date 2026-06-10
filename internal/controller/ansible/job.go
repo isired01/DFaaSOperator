@@ -150,12 +150,12 @@ func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole,
 	var inv string
 	switch role {
 	case dfaasv1.RoleDfaasWorker:
-		inv = "[target_Nodess]\n"
+		inv = "[target_nodes]\n"
 
-		firstPeerID, _ := calcolaPeerID(libp2pKeys[nodes[0].NodeID])
+		firstPeerID, _ := derivePeerID(libp2pKeys[nodes[0].NodeID])
 		for i, n := range nodes {
 			privKey := libp2pKeys[n.NodeID]
-			peerID, err := calcolaPeerID(privKey)
+			peerID, err := derivePeerID(privKey)
 			if err != nil {
 				peerID = "error-key"
 			}

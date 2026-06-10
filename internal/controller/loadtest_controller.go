@@ -83,10 +83,10 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err := r.Get(ctx, envKey, &env); err != nil {
 		if apierrors.IsNotFound(err) {
 			// P9: surface link state on EnvironmentLinked before failing.
-			_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
+			logStatusErr(ctx, "stamp EnvironmentLinked=False (not found)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
 				metav1.ConditionFalse, dfaasv1.LTReasonEnvNotFound,
 				fmt.Sprintf("environment %q not found in namespace %s",
-					lt.Spec.TargetEnvironment, lt.Namespace))
+					lt.Spec.TargetEnvironment, lt.Namespace)))
 			return r.failLoadTest(ctx, &lt,
 				fmt.Sprintf("environment %q not found in namespace %s",
 					lt.Spec.TargetEnvironment, lt.Namespace))
@@ -99,17 +99,17 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// reason=EnvDegraded so consumers know to expect missing metrics later.
 	switch env.Status.Phase {
 	case dfaasv1.EnvFailed:
-		_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
+		logStatusErr(ctx, "stamp EnvironmentLinked=False (env failed)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
 			metav1.ConditionFalse, dfaasv1.LTReasonEnvFailed,
-			fmt.Sprintf("environment %q is in phase Failed", env.Name))
+			fmt.Sprintf("environment %q is in phase Failed", env.Name)))
 	case dfaasv1.EnvDegraded:
-		_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
+		logStatusErr(ctx, "stamp EnvironmentLinked=True (env degraded)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
 			metav1.ConditionTrue, dfaasv1.LTReasonEnvDegraded,
-			fmt.Sprintf("environment %q is Degraded — monitoring unavailable, exporter step may fail", env.Name))
+			fmt.Sprintf("environment %q is Degraded — monitoring unavailable, exporter step may fail", env.Name)))
 	default:
-		_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
+		logStatusErr(ctx, "stamp EnvironmentLinked=True (env found)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
 			metav1.ConditionTrue, dfaasv1.LTReasonEnvFound,
-			fmt.Sprintf("environment %q resolved", env.Name))
+			fmt.Sprintf("environment %q resolved", env.Name)))
 	}
 
 	// Abort short-circuit. User PATCHed spec.stop=true.
@@ -132,19 +132,19 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		switch {
 		case time.Now().Before(fireT):
 			// Armed: future startAt.
-			_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondScheduled,
+			logStatusErr(ctx, "stamp Scheduled=True (armed)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondScheduled,
 				metav1.ConditionTrue, dfaasv1.LTReasonScheduledArmed,
-				"armed for "+fireT.UTC().Format(time.RFC3339))
+				"armed for "+fireT.UTC().Format(time.RFC3339)))
 			return ctrl.Result{RequeueAfter: time.Until(fireT)}, nil
 
 		case env.Status.Phase != dfaasv1.EnvReady && env.Status.Phase != dfaasv1.EnvDegraded:
 			// Fire time elapsed but the target Environment is not ready
 			// (Degraded is treated as good-enough to dispatch — only
 			// Failed / still-Provisioning hold the schedule).
-			_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondScheduled,
+			logStatusErr(ctx, "stamp Scheduled=True (delayed, env not ready)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondScheduled,
 				metav1.ConditionTrue, dfaasv1.LTReasonScheduledDelayedEnvNot,
 				fmt.Sprintf("schedule fired at %s; waiting for env %s phase=%s",
-					fireT.UTC().Format(time.RFC3339), env.Name, env.Status.Phase))
+					fireT.UTC().Format(time.RFC3339), env.Name, env.Status.Phase)))
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 
 		default:
@@ -156,9 +156,9 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			if patchErr != nil {
 				return ctrl.Result{}, patchErr
 			}
-			_ = r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondScheduled,
+			logStatusErr(ctx, "stamp Scheduled=True (fired)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondScheduled,
 				metav1.ConditionTrue, dfaasv1.LTReasonScheduledFired,
-				"schedule fired at "+fireT.UTC().Format(time.RFC3339))
+				"schedule fired at "+fireT.UTC().Format(time.RFC3339)))
 			return ctrl.Result{Requeue: true}, nil
 		}
 	}
@@ -233,14 +233,10 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 func (r *LoadTestReconciler) setLoadTestPhase(ctx context.Context,
 	lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase) (ctrl.Result, error) {
 
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.LoadTest{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(lt), latest); err != nil {
-			return err
-		}
+	err := r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
 		latest.Status.Phase = phase
 		stampLTAggregate(latest, phase)
-		return r.Status().Update(ctx, latest)
+		return nil
 	})
 	if err != nil {
 		return ctrl.Result{}, err
@@ -297,30 +293,46 @@ func stampLTAggregate(lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase) {
 func (r *LoadTestReconciler) failLoadTest(ctx context.Context,
 	lt *dfaasv1.LoadTest, message string) (ctrl.Result, error) {
 
-	_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondReady, metav1.ConditionFalse,
-		dfaasv1.LTReasonFailed, message)
+	logStatusErr(ctx, "stamp Ready=False (failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondReady, metav1.ConditionFalse,
+		dfaasv1.LTReasonFailed, message))
 	return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
 }
 
-// setLoadTestCondition sets a Condition on status using the rifetch-then-update pattern.
+// atomicStatusUpdate runs mutate against the freshly-fetched LoadTest under
+// retry.RetryOnConflict and persists it via Status().Update. Shared core
+// behind the status-stamping helpers: re-fetches to absorb informer cache lag,
+// retries on conflict, and returns the final error so callers can decide
+// whether to surface it. Fire-and-forget callers should route the result
+// through logStatusErr rather than discarding it.
+func (r *LoadTestReconciler) atomicStatusUpdate(ctx context.Context,
+	key types.NamespacedName, mutate func(lt *dfaasv1.LoadTest) error) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &dfaasv1.LoadTest{}
+		if err := r.Get(ctx, key, latest); err != nil {
+			return err
+		}
+		if err := mutate(latest); err != nil {
+			return err
+		}
+		return r.Status().Update(ctx, latest)
+	})
+}
+
+// setLoadTestCondition sets a Condition on status using the re-fetch-then-update pattern.
 // Omits LastTransitionTime so meta.SetStatusCondition keeps it stable across
 // reconciles that produce the same (status, reason, message) tuple (P14).
 func (r *LoadTestReconciler) setLoadTestCondition(ctx context.Context,
 	lt *dfaasv1.LoadTest, condType string, status metav1.ConditionStatus,
 	reason, message string) error {
 
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.LoadTest{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(lt), latest); err != nil {
-			return err
-		}
+	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
 		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
 			Type:    condType,
 			Status:  status,
 			Reason:  reason,
 			Message: message,
 		})
-		return r.Status().Update(ctx, latest)
+		return nil
 	})
 }
 

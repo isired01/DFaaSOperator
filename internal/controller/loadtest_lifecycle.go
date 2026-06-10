@@ -109,19 +109,19 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, true, nil
 	}
 	if count >= dispatchRetryBudget {
-		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+		logStatusErr(ctx, "stamp K6Dispatched=False (dispatch failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
 			metav1.ConditionFalse, dfaasv1.LTReasonDispatchFailed,
 			fmt.Sprintf("remote dispatch failed %d consecutive times: %s",
-				count, condMessage(dispatchErr)))
+				count, condMessage(dispatchErr))))
 		res, err := r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
 		return res, true, err
 	}
 	// P13: sub-reason (ScriptMirrorFailed / StaleCleanupFailed / ApplyFailed)
 	// carries the diagnostic detail, retry-budget counter is in the message.
-	_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+	logStatusErr(ctx, "stamp K6Dispatched=False (retrying)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
 		metav1.ConditionFalse, subReason,
 		fmt.Sprintf("attempt %d/%d: %s",
-			count, dispatchRetryBudget, condMessage(dispatchErr)))
+			count, dispatchRetryBudget, condMessage(dispatchErr))))
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, true, nil
 }
 
@@ -129,144 +129,176 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 // k6-load-generator node's k3s cluster, then transitions LoadTest → Running.
 func (r *LoadTestReconciler) startK6(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
 	// P9: first observation — nothing dispatched yet, status is Unknown.
 	// Subsequent calls below upgrade this to False/InFlight or True/
 	// AllDispatched. SetStatusCondition is idempotent on no transition.
 	if len(lt.Status.TestRuns) == 0 {
-		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+		logStatusErr(ctx, "stamp K6Dispatched=Unknown (pending)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
 			metav1.ConditionUnknown, dfaasv1.LTReasonPending,
-			"awaiting first remote TestRun apply")
+			"awaiting first remote TestRun apply"))
 	}
 
-	// Build a lookup from NodeID → kubeconfig Secret name, sourced from
-	// Environment.status.k6Nodes (populated by EnvironmentReconciler).
-	k6Index := map[string]dfaasv1.K6NodeStatus{}
-	for _, n := range env.Status.K6Nodes {
-		k6Index[n.NodeID] = n
-	}
+	k6Index := computeK6NodeIndex(env)
 
 	// Seed refs from existing Status.TestRuns so that a re-entry after a
 	// partial-dispatch error resumes from where it left off. The per-node
 	// guard below skips nodes already represented in this slice.
+	refs, alreadyDispatched := resumePartialDispatch(lt)
+
+	for _, perNode := range lt.Spec.PerNodeLoad {
+		updatedRefs, stop, res, err := r.dispatchTestRunForNode(
+			ctx, lt, env, perNode, k6Index, refs, alreadyDispatched)
+		refs = updatedRefs
+		if stop {
+			return res, err
+		}
+	}
+
+	// All TestRuns dispatched — stamp StartTime + transition to Running.
+	logStatusErr(ctx, "stamp K6Dispatched=True (all dispatched)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+		metav1.ConditionTrue, dfaasv1.LTReasonAllDispatched,
+		fmt.Sprintf("dispatched %d remote TestRun(s)", len(refs))))
+	logStatusErr(ctx, "stamp K6Healthy=Unknown (awaiting observation)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+		metav1.ConditionUnknown, dfaasv1.LTReasonRunning,
+		"k6 TestRuns dispatched, awaiting observation"))
+	now := metav1.Now()
+	if err := r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
+		latest.Status.StartTime = &now
+		latest.Status.TestRuns = refs
+		latest.Status.Phase = dfaasv1.LoadTestRunning
+		stampLTAggregate(latest, dfaasv1.LoadTestRunning)
+		return nil
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// computeK6NodeIndex builds a lookup from NodeID → kubeconfig Secret name,
+// sourced from Environment.status.k6Nodes (populated by EnvironmentReconciler).
+func computeK6NodeIndex(env *dfaasv1.Environment) map[string]dfaasv1.K6NodeStatus {
+	k6Index := map[string]dfaasv1.K6NodeStatus{}
+	for _, n := range env.Status.K6Nodes {
+		k6Index[n.NodeID] = n
+	}
+	return k6Index
+}
+
+// resumePartialDispatch seeds the dispatch state from existing
+// Status.TestRuns so a re-entry after a partial-dispatch error resumes from
+// where it left off. The returned refs slice is a copy of the persisted runs;
+// alreadyDispatched keys each run as "<nodeID>|<name>" so the per-node guard
+// can skip nodes that were already dispatched.
+func resumePartialDispatch(lt *dfaasv1.LoadTest) ([]dfaasv1.TestRunRef, map[string]bool) {
 	refs := make([]dfaasv1.TestRunRef, len(lt.Status.TestRuns))
 	copy(refs, lt.Status.TestRuns)
 	alreadyDispatched := map[string]bool{}
 	for _, ref := range refs {
 		alreadyDispatched[ref.NodeID+"|"+ref.Name] = true
 	}
+	return refs, alreadyDispatched
+}
 
-	for _, perNode := range lt.Spec.PerNodeLoad {
-		k6Node, ok := k6Index[perNode.NodeID]
-		if !ok {
-			return r.failLoadTest(ctx, lt,
-				fmt.Sprintf("nodeID %q in perNodeLoad is not a k6-load-generator on env %q",
-					perNode.NodeID, env.Name))
-		}
-		if k6Node.KubeconfigSecret == "" {
-			return r.failLoadTest(ctx, lt,
-				fmt.Sprintf("k6 node %q has no kubeconfig Secret on env %q",
-					perNode.NodeID, env.Name))
-		}
+// dispatchTestRunForNode dispatches the remote TestRun for a single
+// PerNodeLoad entry. It returns the (possibly extended) refs slice, a stop
+// flag, and the Result/error the caller must return when stop is true. When
+// stop is false the caller continues to the next PerNodeLoad entry. The
+// alreadyDispatched map is mutated in place. Same control flow and error
+// handling as the original inline loop body in startK6.
+func (r *LoadTestReconciler) dispatchTestRunForNode(ctx context.Context,
+	lt *dfaasv1.LoadTest, env *dfaasv1.Environment, perNode dfaasv1.PerNodeLoad,
+	k6Index map[string]dfaasv1.K6NodeStatus, refs []dfaasv1.TestRunRef,
+	alreadyDispatched map[string]bool) (updatedRefs []dfaasv1.TestRunRef, stop bool, res ctrl.Result, err error) {
+	logger := log.FromContext(ctx)
 
-		trName := fmt.Sprintf("%s-%s", lt.Name, sanitize(perNode.NodeID))
-
-		// Per-node guard: if Status.TestRuns already has {NodeID, Name} for
-		// this entry, the remote TestRun is live and we must NOT re-delete
-		// and re-apply it (that would yank a running k6 test off the
-		// worker). Skip straight to the next entry.
-		if alreadyDispatched[perNode.NodeID+"|"+trName] {
-			continue
-		}
-
-		tr := buildRemoteTestRun(trName, lt, perNode)
-		secretRef := types.NamespacedName{Name: k6Node.KubeconfigSecret, Namespace: lt.Namespace}
-		remoteKey := types.NamespacedName{Name: trName, Namespace: "default"}
-
-		// Mirror the script ConfigMap onto the remote k3s. k6-operator resolves
-		// spec.script.configMap in its own cluster, so the CM must exist there.
-		if err := r.mirrorScriptConfigMap(ctx, lt, perNode, secretRef); err != nil {
-			logger.Error(err, "remote script CM mirror failed", "node", perNode.NodeID)
-			res, _, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonScriptMirrorFailed)
-			return res, oerr
-		}
-
-		// Wipe stale TestRun from previous runs so we start with fresh status.
-		if err := r.Dispatcher.DeleteTestRun(ctx, secretRef, remoteKey); err != nil {
-			logger.Error(err, "remote TestRun cleanup failed", "node", perNode.NodeID)
-			res, _, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonStaleCleanupFailed)
-			return res, oerr
-		}
-		if _, err := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey); err == nil {
-			// Delete still propagating on the remote — wait a tick then retry.
-			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
-		}
-
-		if err := r.Dispatcher.ApplyTestRun(ctx, secretRef, tr); err != nil {
-			logger.Error(err, "remote TestRun apply failed", "node", perNode.NodeID)
-			// Persist any partial refs accumulated so far so the next
-			// reconcile resumes from this exact node rather than re-applying
-			// already-running TestRuns.
-			if perr := r.persistTestRuns(ctx, lt, refs); perr != nil {
-				logger.Error(perr, "persist partial TestRuns failed")
-			}
-			res, _, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonApplyFailed)
-			return res, oerr
-		}
-
-		// Apply succeeded — append and persist incrementally so a failure
-		// later in the loop leaves the already-dispatched runs visible to
-		// observeK6 / abortLoadTest / the deletion finalizer.
-		refs = append(refs, dfaasv1.TestRunRef{
-			NodeID:    perNode.NodeID,
-			Name:      trName,
-			Namespace: "default", // remote namespace; TestRun is applied in default on the k6 k3s
-		})
-		alreadyDispatched[perNode.NodeID+"|"+trName] = true
-		if err := r.persistTestRuns(ctx, lt, refs); err != nil {
-			// Failed to persist — back off without losing the dispatch (it's
-			// on the remote already). Next reconcile will re-encounter the
-			// same TestRun and the guard above (if status caught up) or the
-			// delete-then-apply path will reconcile it.
-			logger.Error(err, "persist TestRuns after apply failed")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-		}
-		// Successful dispatcher round-trip — reset the budget counter and
-		// surface partial progress on K6Dispatched (P9).
-		if err := r.resetDispatchAttempts(ctx, lt); err != nil {
-			logger.Error(err, "resetDispatchAttempts failed; non-fatal")
-		}
-		if len(refs) < len(lt.Spec.PerNodeLoad) {
-			_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
-				metav1.ConditionFalse, dfaasv1.LTReasonInFlight,
-				fmt.Sprintf("%d/%d TestRun(s) dispatched",
-					len(refs), len(lt.Spec.PerNodeLoad)))
-		}
+	k6Node, ok := k6Index[perNode.NodeID]
+	if !ok {
+		res, ferr := r.failLoadTest(ctx, lt,
+			fmt.Sprintf("nodeID %q in perNodeLoad is not a k6-load-generator on env %q",
+				perNode.NodeID, env.Name))
+		return refs, true, res, ferr
+	}
+	if k6Node.KubeconfigSecret == "" {
+		res, ferr := r.failLoadTest(ctx, lt,
+			fmt.Sprintf("k6 node %q has no kubeconfig Secret on env %q",
+				perNode.NodeID, env.Name))
+		return refs, true, res, ferr
 	}
 
-	// All TestRuns dispatched — stamp StartTime + transition to Running.
-	_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
-		metav1.ConditionTrue, dfaasv1.LTReasonAllDispatched,
-		fmt.Sprintf("dispatched %d remote TestRun(s)", len(refs)))
-	_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
-		metav1.ConditionUnknown, dfaasv1.LTReasonRunning,
-		"k6 TestRuns dispatched, awaiting observation")
-	now := metav1.Now()
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.LoadTest{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(lt), latest); err != nil {
-			return err
-		}
-		latest.Status.StartTime = &now
-		latest.Status.TestRuns = refs
-		latest.Status.Phase = dfaasv1.LoadTestRunning
-		stampLTAggregate(latest, dfaasv1.LoadTestRunning)
-		return r.Status().Update(ctx, latest)
-	}); err != nil {
-		return ctrl.Result{}, err
+	trName := fmt.Sprintf("%s-%s", lt.Name, sanitize(perNode.NodeID))
+
+	// Per-node guard: if Status.TestRuns already has {NodeID, Name} for
+	// this entry, the remote TestRun is live and we must NOT re-delete
+	// and re-apply it (that would yank a running k6 test off the
+	// worker). Skip straight to the next entry.
+	if alreadyDispatched[perNode.NodeID+"|"+trName] {
+		return refs, false, ctrl.Result{}, nil
 	}
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+
+	tr := buildRemoteTestRun(trName, lt, perNode)
+	secretRef := types.NamespacedName{Name: k6Node.KubeconfigSecret, Namespace: lt.Namespace}
+	remoteKey := types.NamespacedName{Name: trName, Namespace: "default"}
+
+	// Mirror the script ConfigMap onto the remote k3s. k6-operator resolves
+	// spec.script.configMap in its own cluster, so the CM must exist there.
+	if merr := r.mirrorScriptConfigMap(ctx, lt, perNode, secretRef); merr != nil {
+		logger.Error(merr, "remote script CM mirror failed", "node", perNode.NodeID)
+		res, _, oerr := r.onDispatchError(ctx, lt, merr, dfaasv1.LTReasonScriptMirrorFailed)
+		return refs, true, res, oerr
+	}
+
+	// Wipe stale TestRun from previous runs so we start with fresh status.
+	if derr := r.Dispatcher.DeleteTestRun(ctx, secretRef, remoteKey); derr != nil {
+		logger.Error(derr, "remote TestRun cleanup failed", "node", perNode.NodeID)
+		res, _, oerr := r.onDispatchError(ctx, lt, derr, dfaasv1.LTReasonStaleCleanupFailed)
+		return refs, true, res, oerr
+	}
+	if _, gerr := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey); gerr == nil {
+		// Delete still propagating on the remote — wait a tick then retry.
+		return refs, true, ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	if aerr := r.Dispatcher.ApplyTestRun(ctx, secretRef, tr); aerr != nil {
+		logger.Error(aerr, "remote TestRun apply failed", "node", perNode.NodeID)
+		// Persist any partial refs accumulated so far so the next
+		// reconcile resumes from this exact node rather than re-applying
+		// already-running TestRuns.
+		if perr := r.persistTestRuns(ctx, lt, refs); perr != nil {
+			logger.Error(perr, "persist partial TestRuns failed")
+		}
+		res, _, oerr := r.onDispatchError(ctx, lt, aerr, dfaasv1.LTReasonApplyFailed)
+		return refs, true, res, oerr
+	}
+
+	// Apply succeeded — append and persist incrementally so a failure
+	// later in the loop leaves the already-dispatched runs visible to
+	// observeK6 / abortLoadTest / the deletion finalizer.
+	refs = append(refs, dfaasv1.TestRunRef{
+		NodeID:    perNode.NodeID,
+		Name:      trName,
+		Namespace: "default", // remote namespace; TestRun is applied in default on the k6 k3s
+	})
+	alreadyDispatched[perNode.NodeID+"|"+trName] = true
+	if perr := r.persistTestRuns(ctx, lt, refs); perr != nil {
+		// Failed to persist — back off without losing the dispatch (it's
+		// on the remote already). Next reconcile will re-encounter the
+		// same TestRun and the guard above (if status caught up) or the
+		// delete-then-apply path will reconcile it.
+		logger.Error(perr, "persist TestRuns after apply failed")
+		return refs, true, ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	// Successful dispatcher round-trip — reset the budget counter and
+	// surface partial progress on K6Dispatched (P9).
+	if rerr := r.resetDispatchAttempts(ctx, lt); rerr != nil {
+		logger.Error(rerr, "resetDispatchAttempts failed; non-fatal")
+	}
+	if len(refs) < len(lt.Spec.PerNodeLoad) {
+		logStatusErr(ctx, "stamp K6Dispatched=False (in flight)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+			metav1.ConditionFalse, dfaasv1.LTReasonInFlight,
+			fmt.Sprintf("%d/%d TestRun(s) dispatched",
+				len(refs), len(lt.Spec.PerNodeLoad))))
+	}
+	return refs, false, ctrl.Result{}, nil
 }
 
 // persistTestRuns writes the cumulative TestRunRef slice into
@@ -275,13 +307,9 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 // already-dispatched runs visible to observeK6 / abort / deletion paths.
 func (r *LoadTestReconciler) persistTestRuns(ctx context.Context,
 	lt *dfaasv1.LoadTest, refs []dfaasv1.TestRunRef) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.LoadTest{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(lt), latest); err != nil {
-			return err
-		}
+	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
 		latest.Status.TestRuns = refs
-		return r.Status().Update(ctx, latest)
+		return nil
 	})
 }
 
@@ -292,10 +320,7 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	k6Index := map[string]dfaasv1.K6NodeStatus{}
-	for _, n := range env.Status.K6Nodes {
-		k6Index[n.NodeID] = n
-	}
+	k6Index := computeK6NodeIndex(env)
 
 	allDone := true
 	var errorCount, finishedCount int
@@ -335,58 +360,50 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 	}
 
 	// Persist updated phases (best-effort).
-	_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.LoadTest{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(lt), latest); err != nil {
-			return err
-		}
+	logStatusErr(ctx, "persist updated TestRun phases", r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
 		latest.Status.TestRuns = updatedRefs
-		return r.Status().Update(ctx, latest)
-	})
+		return nil
+	}))
 
 	total := len(lt.Status.TestRuns)
 	runningCount := total - finishedCount - errorCount
 
 	// P9: K6Healthy rollup with a per-node count in the message.
 	if !allDone {
-		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+		logStatusErr(ctx, "stamp K6Healthy=Unknown (running)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
 			metav1.ConditionUnknown, dfaasv1.LTReasonRunning,
 			fmt.Sprintf("%d/%d finished, %d error, %d running",
-				finishedCount, total, errorCount, runningCount))
+				finishedCount, total, errorCount, runningCount)))
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	switch {
 	case errorCount == 0:
-		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+		logStatusErr(ctx, "stamp K6Healthy=True (all finished)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
 			metav1.ConditionTrue, dfaasv1.LTReasonAllFinished,
-			fmt.Sprintf("%d/%d TestRun(s) finished cleanly", finishedCount, total))
+			fmt.Sprintf("%d/%d TestRun(s) finished cleanly", finishedCount, total)))
 	case finishedCount == 0:
-		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+		logStatusErr(ctx, "stamp K6Healthy=False (all failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
 			metav1.ConditionFalse, dfaasv1.LTReasonAllFailed,
-			fmt.Sprintf("%d/%d TestRun(s) reported error", errorCount, total))
+			fmt.Sprintf("%d/%d TestRun(s) reported error", errorCount, total)))
 		return r.failLoadTest(ctx, lt,
 			fmt.Sprintf("all %d remote TestRuns reported error stage", errorCount))
 	default:
-		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+		logStatusErr(ctx, "stamp K6Healthy=False (partial failure)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
 			metav1.ConditionFalse, dfaasv1.LTReasonPartialFailure,
 			fmt.Sprintf("%d finished, %d error (of %d)",
-				finishedCount, errorCount, total))
+				finishedCount, errorCount, total)))
 		return r.failLoadTest(ctx, lt,
 			fmt.Sprintf("%d of %d remote TestRuns reported error stage", errorCount, total))
 	}
 
 	// All TestRuns done cleanly → stamp EndTime and move to Exporting.
 	now := metav1.Now()
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.LoadTest{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(lt), latest); err != nil {
-			return err
-		}
+	if err := r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
 		latest.Status.EndTime = &now
 		latest.Status.Phase = dfaasv1.LoadTestExporting
 		stampLTAggregate(latest, dfaasv1.LoadTestExporting)
-		return r.Status().Update(ctx, latest)
+		return nil
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -407,9 +424,9 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 	if apierrors.IsNotFound(err) {
 		logger.Info("creating exporter Job", "job", jobName)
 		if lt.Status.StartTime == nil || lt.Status.EndTime == nil {
-			_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+			logStatusErr(ctx, "stamp MetricsExported=False (missing times)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
 				metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
-				"missing StartTime/EndTime; cannot run exporter")
+				"missing StartTime/EndTime; cannot run exporter"))
 			return r.failLoadTest(ctx, lt, "missing StartTime/EndTime; cannot run exporter")
 		}
 
@@ -418,10 +435,10 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 			mirrored, mirrorErr := r.ensureMirroredS3Secret(ctx, lt, env.Spec.S3ConfigRef.Name)
 			if mirrorErr != nil {
 				if apierrors.IsNotFound(mirrorErr) {
-					_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+					logStatusErr(ctx, "stamp MetricsExported=False (s3 config missing)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
 						metav1.ConditionFalse, dfaasv1.LTReasonS3ConfigMissing,
 						fmt.Sprintf("S3 config %q not found in namespace %s",
-							env.Spec.S3ConfigRef.Name, S3ConfigNamespace))
+							env.Spec.S3ConfigRef.Name, S3ConfigNamespace)))
 					return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
 				}
 				return ctrl.Result{}, mirrorErr
@@ -431,25 +448,21 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 
 		newJob, err := r.createExporterJob(lt, env, lt.Status.StartTime.Time, lt.Status.EndTime.Time, s3SecretName)
 		if err != nil {
-			_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+			logStatusErr(ctx, "stamp MetricsExported=False (build failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
 				metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
-				"build exporter job: "+condMessage(err))
+				"build exporter job: "+condMessage(err)))
 			return r.failLoadTest(ctx, lt, fmt.Sprintf("build exporter job: %v", err))
 		}
 		if err := r.Create(ctx, newJob); err != nil && !apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{}, err
 		}
-		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+		logStatusErr(ctx, "stamp MetricsExported=Unknown (exporter running)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
 			metav1.ConditionUnknown, dfaasv1.LTReasonExporterRunning,
-			"exporter Job created, awaiting completion")
-		_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			latest := &dfaasv1.LoadTest{}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(lt), latest); err != nil {
-				return err
-			}
+			"exporter Job created, awaiting completion"))
+		logStatusErr(ctx, "persist exporter Job name", r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
 			latest.Status.ExporterJob = jobName
-			return r.Status().Update(ctx, latest)
-		})
+			return nil
+		}))
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if err != nil {
@@ -458,15 +471,15 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 
 	if job.Status.Succeeded > 0 {
 		logger.Info("exporter Job succeeded")
-		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+		logStatusErr(ctx, "stamp MetricsExported=True", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
 			metav1.ConditionTrue, dfaasv1.LTReasonExportSucceeded,
-			"metrics exported")
+			"metrics exported"))
 		return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestCompleted)
 	}
 	if job.Status.Failed > 0 {
-		_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+		logStatusErr(ctx, "stamp MetricsExported=False (job failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
 			metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
-			"exporter Job reported Failed")
+			"exporter Job reported Failed"))
 		return r.failLoadTest(ctx, lt, "exporter Job failed")
 	}
 	logger.Info("exporter Job running")
@@ -594,10 +607,7 @@ func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
 	reason, message string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	k6Index := map[string]dfaasv1.K6NodeStatus{}
-	for _, n := range env.Status.K6Nodes {
-		k6Index[n.NodeID] = n
-	}
+	k6Index := computeK6NodeIndex(env)
 
 	type target struct{ nodeID, secretName, trName, trNs string }
 	targets := map[string]target{}
@@ -641,11 +651,11 @@ func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
 
 	// MetricsExported never ran on abort — stamp False/Skipped per P9 so
 	// UI does not show "in flight" forever on the aborted CR.
-	_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+	logStatusErr(ctx, "stamp MetricsExported=False (export skipped)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
 		metav1.ConditionFalse, dfaasv1.LTReasonExportSkipped,
-		"no exporter ran — test was aborted")
-	_ = r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondReady, metav1.ConditionFalse,
-		reason, message)
+		"no exporter ran — test was aborted"))
+	logStatusErr(ctx, "stamp Ready=False (aborted)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondReady, metav1.ConditionFalse,
+		reason, message))
 	return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestAborted)
 }
 
@@ -703,10 +713,7 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 	// Poll: every TestRun in spec ∪ status must report NotFound on the
 	// remote cluster before we drop the finalizer. Mirrors the abort target
 	// set construction so a partial-dispatch ride-along is also covered.
-	k6Index := map[string]dfaasv1.K6NodeStatus{}
-	for _, n := range env.Status.K6Nodes {
-		k6Index[n.NodeID] = n
-	}
+	k6Index := computeK6NodeIndex(&env)
 	type pollTarget struct{ secretName, trName, trNs string }
 	targets := map[string]pollTarget{}
 	for _, ref := range lt.Status.TestRuns {

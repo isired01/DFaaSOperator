@@ -8,8 +8,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// Check ritorna true quando entrambi i pod prometheus e grafana sono in fase
-// Running con ContainerReady=True.
+// Check returns true when both the prometheus and grafana pods are in the
+// Running phase with ContainerReady=True.
 func (m *Manager) Check(ctx context.Context) (bool, error) {
 	podList := &corev1.PodList{}
 	opts := []client.ListOption{
