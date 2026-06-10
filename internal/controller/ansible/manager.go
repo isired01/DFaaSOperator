@@ -5,8 +5,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// Manager esegue le operazioni di provisioning Ansible (Job, ConfigMap,
-// Helm values) per un esperimento dFaaS.
+// Manager runs the Ansible provisioning operations (Job, ConfigMap,
+// Helm values) for a dFaaS environment.
 type Manager struct {
 	client.Client
 	Scheme *runtime.Scheme
