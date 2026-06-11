@@ -31,6 +31,14 @@ const S3ConfigNamespace = "dfaas-s3"
 // traceability across namespaces.
 const S3ConfigLabel = "dfaas.io/s3-config"
 
+// DefaultS3ConfigName is the name of the S3-config Secret pointing at the
+// in-cluster MinIO instance (monitoring/minio). It is the implicit sink used
+// when an Environment carries no explicit spec.s3ConfigRef — metrics CSV and
+// per-VM k6 logs default to MinIO instead of stdout. Created at operator
+// startup by EnsureDefaultS3Config. This name is part of the shared contract
+// with the UI gateway and must match on both sides.
+const DefaultS3ConfigName = "minio-default"
+
 // EnsureS3Namespace idempotently creates the dfaas-s3 namespace that holds
 // the S3-config Secrets registry. Called once at operator startup (before
 // the manager starts) so the gateway can write configs without a chicken-
@@ -39,6 +47,38 @@ func EnsureS3Namespace(ctx context.Context, c client.Client) error {
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: S3ConfigNamespace}}
 	if err := c.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create %s namespace: %w", S3ConfigNamespace, err)
+	}
+	return nil
+}
+
+// EnsureDefaultS3Config idempotently creates the dfaas-s3/minio-default Secret
+// describing the in-cluster MinIO sink (monitoring/minio). The keys match what
+// the exporter consumes (endpoint/region/access_key_id/secret_access_key/
+// force_path_style) and the credentials mirror the monitoring/minio-creds
+// Secret deployed by the monitoring stack. Create-if-not-exists semantics: an
+// AlreadyExists is treated as success so an admin who hand-edits the Secret
+// (e.g. to point at an external S3) is never clobbered on restart.
+//
+// Called once at operator startup, after EnsureS3Namespace, using the same
+// bootstrap client. Requires the dfaas-s3 namespace to already exist.
+func EnsureDefaultS3Config(ctx context.Context, c client.Client) error {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      DefaultS3ConfigName,
+			Namespace: S3ConfigNamespace,
+			Labels:    map[string]string{S3ConfigLabel: "true"},
+		},
+		Type: corev1.SecretTypeOpaque,
+		StringData: map[string]string{
+			"endpoint":          "http://minio.monitoring.svc.cluster.local:9000",
+			"region":            "us-east-1",
+			"access_key_id":     "admin",
+			"secret_access_key": "admin123",
+			"force_path_style":  "true",
+		},
+	}
+	if err := c.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create %s/%s secret: %w", S3ConfigNamespace, DefaultS3ConfigName, err)
 	}
 	return nil
 }

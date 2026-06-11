@@ -470,8 +470,10 @@ func (r *LoadTestReconciler) captureK6Logs(ctx context.Context,
 }
 
 // runExporter creates the in-cluster Job that pulls metrics from Prometheus
-// over [StartTime, EndTime] and uploads to S3 (when env.spec.s3ConfigRef is
-// set) or dumps to stdout.
+// over [StartTime, EndTime] and uploads to S3. The destination defaults to the
+// in-cluster MinIO sink (DefaultS3ConfigName) when env.spec.s3ConfigRef is
+// unset; an explicit ref selects that config instead. Only if the default
+// config itself is missing does the exporter fall back to a stdout dump.
 func (r *LoadTestReconciler) runExporter(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -489,19 +491,37 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 			return r.failLoadTest(ctx, lt, "missing StartTime/EndTime; cannot run exporter")
 		}
 
+		// Always resolve an S3 config name. With no explicit s3ConfigRef the
+		// Environment defaults to the in-cluster MinIO sink (DefaultS3ConfigName)
+		// instead of the legacy stdout dump.
+		configName := DefaultS3ConfigName
+		explicitRef := env.Spec.S3ConfigRef != nil
+		if explicitRef {
+			configName = env.Spec.S3ConfigRef.Name
+		}
 		var s3SecretName string
-		if env.Spec.S3ConfigRef != nil {
-			mirrored, mirrorErr := r.ensureMirroredS3Secret(ctx, lt, env.Spec.S3ConfigRef.Name)
-			if mirrorErr != nil {
-				if apierrors.IsNotFound(mirrorErr) {
-					logStatusErr(ctx, "stamp MetricsExported=False (s3 config missing)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
-						metav1.ConditionFalse, dfaasv1.LTReasonS3ConfigMissing,
-						fmt.Sprintf("S3 config %q not found in namespace %s",
-							env.Spec.S3ConfigRef.Name, S3ConfigNamespace)))
+		mirrored, mirrorErr := r.ensureMirroredS3Secret(ctx, lt, configName)
+		if mirrorErr != nil {
+			if apierrors.IsNotFound(mirrorErr) {
+				// Stamp the S3ConfigMissing condition either way for visibility.
+				logStatusErr(ctx, "stamp MetricsExported=False (s3 config missing)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+					metav1.ConditionFalse, dfaasv1.LTReasonS3ConfigMissing,
+					fmt.Sprintf("S3 config %q not found in namespace %s",
+						configName, S3ConfigNamespace)))
+				if explicitRef {
+					// Explicit ref must exist — a missing one is a hard failure
+					// (unchanged behaviour).
 					return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
 				}
+				// Default sink missing (e.g. MinIO not yet deployed) — degrade
+				// gracefully to the stdout path rather than failing the test.
+				logger.Info("default S3 config not found; falling back to stdout export",
+					"config", configName)
+				s3SecretName = ""
+			} else {
 				return ctrl.Result{}, mirrorErr
 			}
+		} else {
 			s3SecretName = mirrored
 		}
 
