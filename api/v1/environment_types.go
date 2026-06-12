@@ -33,7 +33,7 @@ const (
 const (
 	EnvCondReady               = "Ready"
 	EnvCondVMsReady            = "VMsReady"
-	EnvCondDfaasWorkersReady   = "DfaasWorkersReady"
+	EnvCondDFaaSNodesReady     = "DFaaSNodesReady"
 	EnvCondK6Ready             = "K6Ready"
 	EnvCondInfrastructureReady = "InfrastructureReady"
 	EnvCondMonitoringReady     = "MonitoringReady"

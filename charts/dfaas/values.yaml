@@ -55,9 +55,12 @@ ui:
     host: dfaas.local
     annotations: {}
     tls: []                       # list of {secretName, hosts: []}
-  env:
+  env:                            # free-form key→value, each rendered as a container env var
     PORT: "8082"
     CORS_ORIGINS: ""              # csv; empty = same-origin only
+    # MINIO_ENDPOINT: ""          # override gateway→MinIO dial endpoint; default: auto
+                                  #   (in-cluster → minio.monitoring.svc…:9000, dev → <nodeIP>:30900)
+    # MINIO_PUBLIC_URL: ""        # override the asset URL handed to k6; default: <nodeIP>:30900
 
 # CRDs are installed automatically from charts/dfaas/crds/ on first install.
 # Helm does NOT manage CRDs on upgrade. Manual:

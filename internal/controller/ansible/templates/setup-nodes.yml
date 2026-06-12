@@ -276,6 +276,28 @@
             AGENT_STRATEGY: "{{ balancing_strategy }}"
           forecaster:
             enabled: false
+      register: agent_helm
+
+    # The dfaas-agent chart feeds bootstrap config (AGENT_BOOTSTRAP_NODES_LIST)
+    # via the pod's env; a helm upgrade that changes only that value does NOT
+    # always roll the pod, so a re-provisioned Environment (new topology, or a
+    # VM reused across environments) keeps a STALE bootstrap peer list and the
+    # agent crash-loops (Exit 255) dialing dead peers. Force a rollout whenever
+    # the release actually changed so the agent adopts the current config.
+    - name: "Restart dfaas-agent to apply current bootstrap config"
+      kubernetes.core.k8s:
+        state: patched
+        kind: Deployment
+        name: dfaas-agent
+        namespace: default
+        kubeconfig: "{{ k3s_config }}"
+        definition:
+          spec:
+            template:
+              metadata:
+                annotations:
+                  kubectl.kubernetes.io/restartedAt: "{{ lookup('pipe', 'date -u +%FT%TZ') }}"
+      when: agent_helm is changed
 
     - name: "Fix Prometheus host in Gateway"
       kubernetes.core.k8s:

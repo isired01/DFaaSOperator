@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -37,6 +38,10 @@ type EnvironmentReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+	// Clientset reads management-cluster Pod logs (controller-runtime's client
+	// cannot stream logs). Used best-effort to extract the failing Ansible task
+	// from a retained failed Job pod; nil-safe (unit tests leave it unset).
+	Clientset kubernetes.Interface
 }
 
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=environments,verbs=get;list;watch;create;update;patch;delete
@@ -46,6 +51,7 @@ type EnvironmentReconciler struct {
 //+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=configmaps;services;secrets;serviceaccounts;persistentvolumeclaims;namespaces,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 //+kubebuilder:rbac:groups=apps,resources=deployments;statefulsets;daemonsets;replicasets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch

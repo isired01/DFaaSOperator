@@ -13,7 +13,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -146,7 +148,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 	}
 	logStatusErr(ctx, "stamp VMsReady=True (reachable)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonSSHReachable,
-		"all declared nodes reachable on :22"))
+		"provisioning SSH check passed: all declared nodes reachable on :22"))
 	return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningInfra)
 }
 
@@ -250,7 +252,7 @@ func (r *EnvironmentReconciler) markNodesReachable(ctx context.Context,
 			Type:    dfaasv1.EnvCondNodesReachable,
 			Status:  metav1.ConditionTrue,
 			Reason:  dfaasv1.EnvReasonSSHReachable,
-			Message: "all declared nodes reachable on :22",
+			Message: "live SSH liveness OK: all declared nodes reachable on :22",
 		})
 		now := metav1.Now()
 		latest.Status.LastHealthCheck = &now
@@ -354,7 +356,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 	if vmsFailed || k6Failed {
 		logStatusErr(ctx, "stamp InfrastructureReady=False", r.setEnvCondition(ctx, env, dfaasv1.EnvCondInfrastructureReady,
 			metav1.ConditionFalse, dfaasv1.EnvReasonInfraFailed,
-			"dfaas-worker or k6 provisioning failed; inspect DfaasWorkersReady and K6Ready conditions"))
+			"dfaas-worker or k6 provisioning failed; inspect DFaaSNodesReady and K6Ready conditions"))
 		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
 	}
 	// Both Jobs succeeded and the fan-in has settled. Now — and only now — is
@@ -427,13 +429,13 @@ type ansibleJobSpec struct {
 
 // ensureVMsJob is the non-advancing variant for the dfaas-worker Ansible
 // Job, used by ProvisioningInfra fan-in. Returns done/failed flags and
-// stamps the DfaasWorkersReady Condition; never calls setEnvPhase.
+// stamps the DFaaSNodesReady Condition; never calls setEnvPhase.
 func (r *EnvironmentReconciler) ensureVMsJob(ctx context.Context,
 	env *dfaasv1.Environment, libp2pKeys map[string]string) (done bool, failed bool, err error) {
 	return r.ensureAnsibleJob(ctx, env, ansibleJobSpec{
 		role:          dfaasv1.RoleDfaasWorker,
 		jobSuffix:     "vms",
-		condType:      dfaasv1.EnvCondDfaasWorkersReady,
+		condType:      dfaasv1.EnvCondDFaaSNodesReady,
 		skipReason:    dfaasv1.EnvReasonNoWorkers,
 		skipMessage:   "no dfaas-worker nodes in spec — phase skipped",
 		succeedReason: dfaasv1.EnvReasonVMsProvisioned,
@@ -526,29 +528,145 @@ func (r *EnvironmentReconciler) ensureAnsibleJob(ctx context.Context,
 		return false, false, getErr
 	}
 
-	if job.Status.Succeeded > 0 {
+	// Terminal state is driven by the Job's Complete/Failed Conditions, NOT by
+	// the raw Failed pod count: with BackoffLimit>0 a failed pod is transient
+	// (K8s spawns a retry), so job.Status.Failed counts failed *attempts* while
+	// the Job may still recover. We surface those transient attempts (count +
+	// last failing task) in the Condition message — visible through to Ready.
+	failedCount := job.Status.Failed
+
+	if job.Status.Succeeded > 0 || jobConditionTrue(&job, batchv1.JobComplete) {
+		msg := spec.humanRole + " Ansible Job completed"
+		if failedCount > 0 {
+			msg = fmt.Sprintf("%s after %d failed attempt(s)%s", msg, failedCount,
+				taskSuffix(r.lastFailedTask(ctx, env.Namespace, jobName), " at task: "))
+		}
 		logStatusErr(ctx, "stamp "+spec.condType+"=True (completed)", r.setEnvCondition(ctx, env, spec.condType,
-			metav1.ConditionTrue, spec.succeedReason,
-			spec.humanRole+" Ansible Job completed"))
+			metav1.ConditionTrue, spec.succeedReason, msg))
 		return true, false, nil
 	}
-	if job.Status.Failed > 0 {
+	if jobConditionTrue(&job, batchv1.JobFailed) {
 		patchJobTTL(ctx, r.Client, &job, jobTTLFailureGraceSeconds)
+		msg := fmt.Sprintf("%s Ansible Job failed after %d attempt(s)%s; check logs",
+			spec.humanRole, failedCount, taskSuffix(r.lastFailedTask(ctx, env.Namespace, jobName), " at task: "))
 		logStatusErr(ctx, "stamp "+spec.condType+"=False (job failed)", r.setEnvCondition(ctx, env, spec.condType,
-			metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleFailed,
-			spec.humanRole+" Ansible Job failed; check logs"))
+			metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleFailed, msg))
 		return false, true, nil
 	}
+	// Still running. A failed pod here is mid-backoff, not terminal — keep
+	// waiting, but report the transient retry so the UI shows the hiccup.
 	logger.Info("Ansible Job still running",
 		"role", spec.humanRole,
 		"job", jobName,
 		"active", job.Status.Active,
 		"succeeded", job.Status.Succeeded,
-		"failed", job.Status.Failed)
+		"failed", failedCount)
+	msg := spec.humanRole + " Ansible Job in progress"
+	if failedCount > 0 {
+		msg = fmt.Sprintf("%s (%d failed attempt(s), retrying%s)", msg, failedCount,
+			taskSuffix(r.lastFailedTask(ctx, env.Namespace, jobName), "; last task: "))
+	}
 	logStatusErr(ctx, "stamp "+spec.condType+"=False (in progress)", r.setEnvCondition(ctx, env, spec.condType,
-		metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleRunning,
-		spec.humanRole+" Ansible Job in progress"))
+		metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleRunning, msg))
 	return false, false, nil
+}
+
+// ansibleLogTailLines caps how many trailing log lines we pull from a failed
+// Ansible pod. The failure region (TASK header + "fatal: .. FAILED!" + PLAY
+// RECAP) sits at the very end, so we tail rather than read from the top.
+const ansibleLogTailLines int64 = 400
+
+// jobConditionTrue reports whether the Job carries condType (JobComplete or
+// JobFailed) with status True. With BackoffLimit>0 these Conditions — not the
+// raw Failed pod count — define terminal success/failure.
+func jobConditionTrue(job *batchv1.Job, condType batchv1.JobConditionType) bool {
+	for _, c := range job.Status.Conditions {
+		if c.Type == condType && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// taskSuffix renders " <connector><task>" when task is non-empty, else "". Lets
+// callers fold the (best-effort) failing-task name into a Condition message
+// without branching, degrading cleanly to a count-only message.
+func taskSuffix(task, connector string) string {
+	if task == "" {
+		return ""
+	}
+	return connector + task
+}
+
+var ansibleTaskHeaderRe = regexp.MustCompile(`^TASK \[(.+?)\]`)
+
+// lastFailedTask best-effort extracts the name of the Ansible task that failed
+// most recently in a finished pod of the named Job: it lists the Job's pods,
+// reads the newest Failed pod's log tail, and returns the task named by the
+// last "TASK [..]" line preceding a "fatal: .. FAILED!" marker. Returns "" on
+// any error, no match, or when no clientset is wired (e.g. unit tests) — the
+// caller then degrades to a count-only message.
+func (r *EnvironmentReconciler) lastFailedTask(ctx context.Context, namespace, jobName string) string {
+	if r.Clientset == nil {
+		return ""
+	}
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(namespace),
+		client.MatchingLabels{"job-name": jobName}); err != nil {
+		return ""
+	}
+	var newest *corev1.Pod
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.Status.Phase != corev1.PodFailed {
+			continue
+		}
+		if newest == nil || p.CreationTimestamp.After(newest.CreationTimestamp.Time) {
+			newest = p
+		}
+	}
+	if newest == nil {
+		return ""
+	}
+
+	tail := ansibleLogTailLines
+	req := r.Clientset.CoreV1().Pods(namespace).GetLogs(newest.Name, &corev1.PodLogOptions{
+		Container: "ansible-worker",
+		TailLines: &tail,
+	})
+	stream, err := req.Stream(ctx)
+	if err != nil {
+		return ""
+	}
+	defer stream.Close()
+	data, err := io.ReadAll(stream)
+	if err != nil {
+		return ""
+	}
+	return parseFailedTask(string(data))
+}
+
+// parseFailedTask returns the name in the last "TASK [..]" header that precedes
+// the last "FAILED!"/"fatal:" marker in the Ansible log, or "" if there is no
+// failure marker / task header. A failed play aborts at the offending task, so
+// that header is the failing task.
+func parseFailedTask(logs string) string {
+	lines := strings.Split(logs, "\n")
+	failIdx := -1
+	for i, ln := range lines {
+		if strings.Contains(ln, "FAILED!") || strings.HasPrefix(strings.TrimSpace(ln), "fatal:") {
+			failIdx = i
+		}
+	}
+	if failIdx < 0 {
+		return ""
+	}
+	for i := failIdx; i >= 0; i-- {
+		if m := ansibleTaskHeaderRe.FindStringSubmatch(strings.TrimSpace(lines[i])); m != nil {
+			return strings.TrimSpace(m[1])
+		}
+	}
+	return ""
 }
 
 // ensureMonitoring drives the Helm monitoring stack install. P4: after
@@ -813,7 +931,7 @@ func (r *EnvironmentReconciler) resetTransientConditions(ctx context.Context,
 	for _, condType := range []string{
 		dfaasv1.EnvCondReady,
 		dfaasv1.EnvCondVMsReady,
-		dfaasv1.EnvCondDfaasWorkersReady,
+		dfaasv1.EnvCondDFaaSNodesReady,
 		dfaasv1.EnvCondK6Ready,
 		dfaasv1.EnvCondInfrastructureReady,
 		dfaasv1.EnvCondMonitoringReady,

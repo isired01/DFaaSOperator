@@ -23,6 +23,14 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 )
 
+// libp2pBootstrapPort is the TCP port advertised in the dfaas-agent bootstrap
+// multiaddr (/ip4/<node0 ip>/tcp/<port>/p2p/<peerID>). It MUST match the port
+// the dfaas-agent-chart actually exposes the agent's libp2p listener on at the
+// node host (NodePort / hostPort / hostNetwork) — otherwise non-seed workers
+// fail to dial the seed ("all dials failed / dial backoff"). Single source of
+// truth: re-point here if the chart's libp2p host exposure changes.
+const libp2pBootstrapPort = 31600
+
 // CreateJobForRole builds an Ansible Job + inventory Secret for the subset of
 // nodes in env that match role. jobSuffix becomes part of the Job/Secret/
 // playbook-ConfigMap name so VM and K6 phases run independent Jobs against
@@ -162,7 +170,7 @@ func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole,
 			isBootstrap := i != 0
 			bootstrap := ""
 			if isBootstrap {
-				bootstrap = fmt.Sprintf("/ip4/%s/tcp/31600/p2p/%s", nodes[0].IPAddress, firstPeerID)
+				bootstrap = fmt.Sprintf("/ip4/%s/tcp/%d/p2p/%s", nodes[0].IPAddress, libp2pBootstrapPort, firstPeerID)
 			}
 			fnJSON, _ := json.Marshal(n.Functions)
 			inv += fmt.Sprintf(
