@@ -18,9 +18,9 @@ import (
 	sigsyaml "sigs.k8s.io/yaml"
 )
 
-// minioFieldOwner is the server-side-apply field manager used for the raw
-// MinIO objects, so re-applies are an idempotent merge rather than a clobber.
-const minioFieldOwner = "dfaas-operator"
+// seaweedfsFieldOwner is the server-side-apply field manager used for the raw
+// SeaweedFS objects, so re-applies are an idempotent merge rather than a clobber.
+const seaweedfsFieldOwner = "dfaas-operator"
 
 // Deploy installs or upgrades the two Helm releases of the monitoring stack
 // (Prometheus + Grafana) in the "monitoring" namespace. Idempotent: the first
@@ -63,41 +63,42 @@ func (m *Manager) Deploy(ctx context.Context) error {
 		return fmt.Errorf("helm grafana: %w", err)
 	}
 
-	// 4. MinIO — the in-cluster default S3 sink. Not a Helm chart: decode the
+	// 4. SeaweedFS — the in-cluster default S3 sink. Not a Helm chart: decode the
 	//    embedded multi-doc manifest and server-side-apply each object. The
-	//    Service resolves as minio.monitoring.svc.cluster.local:9000 and is
-	//    referenced by the dfaas-s3/minio-default config Secret. Ports 9000/
-	//    9001 + NodePorts 30900/30901 are chosen to avoid colliding with
-	//    Prometheus (9090/30090) and Grafana (30300).
-	if err := m.deployMinIO(ctx); err != nil {
-		return fmt.Errorf("deploy minio: %w", err)
+	//    Service resolves as seaweedfs.monitoring.svc.cluster.local:8333 and is
+	//    referenced by the dfaas-s3/seaweedfs-default config Secret. The S3 port
+	//    8333 → NodePort 30900 is chosen to avoid colliding with Prometheus
+	//    (9090/30090) and Grafana (30300).
+	if err := m.deploySeaweedFS(ctx); err != nil {
+		return fmt.Errorf("deploy seaweedfs: %w", err)
 	}
 
 	return nil
 }
 
-// deployMinIO decodes the embedded multi-doc minio.yaml and server-side-applies
-// each object with FieldOwner "dfaas-operator". Idempotent: re-runs merge into
-// the existing objects rather than recreating them. The "monitoring" namespace
-// is guaranteed to exist by the caller (Deploy creates it first).
-func (m *Manager) deployMinIO(ctx context.Context) error {
+// deploySeaweedFS decodes the embedded multi-doc seaweedfs.yaml and
+// server-side-applies each object with FieldOwner "dfaas-operator". Idempotent:
+// re-runs merge into the existing objects rather than recreating them. The
+// "monitoring" namespace is guaranteed to exist by the caller (Deploy creates
+// it first).
+func (m *Manager) deploySeaweedFS(ctx context.Context) error {
 	logger := log.FromContext(ctx)
 
-	objs, err := decodeMultiDocYAML(minioYAML)
+	objs, err := decodeMultiDocYAML(seaweedfsYAML)
 	if err != nil {
-		return fmt.Errorf("decode minio manifest: %w", err)
+		return fmt.Errorf("decode seaweedfs manifest: %w", err)
 	}
 
 	for _, obj := range objs {
 		gvk := obj.GroupVersionKind()
-		logger.Info("applying minio object",
+		logger.Info("applying seaweedfs object",
 			"kind", gvk.Kind, "name", obj.GetName(), "namespace", obj.GetNamespace())
 		if err := m.Patch(ctx, obj, client.Apply,
-			client.FieldOwner(minioFieldOwner), client.ForceOwnership); err != nil {
-			return fmt.Errorf("apply minio %s/%s: %w", gvk.Kind, obj.GetName(), err)
+			client.FieldOwner(seaweedfsFieldOwner), client.ForceOwnership); err != nil {
+			return fmt.Errorf("apply seaweedfs %s/%s: %w", gvk.Kind, obj.GetName(), err)
 		}
 	}
-	logger.Info("minio default S3 sink applied", "objects", len(objs))
+	logger.Info("seaweedfs default S3 sink applied", "objects", len(objs))
 	return nil
 }
 

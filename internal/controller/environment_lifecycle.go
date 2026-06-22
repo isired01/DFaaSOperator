@@ -16,7 +16,6 @@ import (
 	"io"
 	"net"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -25,7 +24,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -282,45 +280,23 @@ func (r *EnvironmentReconciler) markNodesUnreachable(ctx context.Context,
 // but on a dedicated annotation so provisioning state is never clobbered.
 func (r *EnvironmentReconciler) bumpHealthMisses(ctx context.Context,
 	env *dfaasv1.Environment) (int, error) {
-	var newVal int
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.Environment{}
-		if gerr := r.Get(ctx, client.ObjectKeyFromObject(env), latest); gerr != nil {
-			return gerr
-		}
-		if latest.Annotations == nil {
-			latest.Annotations = map[string]string{}
-		}
-		storedGen, cur := parseSSHAttempts(latest.Annotations[healthMissesAnnotation])
-		if storedGen != latest.Generation {
-			cur = 0
-		}
-		cur++
-		latest.Annotations[healthMissesAnnotation] = fmt.Sprintf("%d:%d", latest.Generation, cur)
-		newVal = cur
-		return r.Update(ctx, latest)
-	})
-	return newVal, err
+	var n int
+	err := updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
+		func(latest *dfaasv1.Environment) bool {
+			n = bumpGenCounter(latest, healthMissesAnnotation)
+			return true
+		})
+	return n, err
 }
 
 // resetHealthMisses zeroes the health-miss counter for the current generation.
 // No-op when already zero to avoid annotation churn (and a spurious re-enqueue).
 func (r *EnvironmentReconciler) resetHealthMisses(ctx context.Context,
 	env *dfaasv1.Environment) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.Environment{}
-		if gerr := r.Get(ctx, client.ObjectKeyFromObject(env), latest); gerr != nil {
-			return gerr
-		}
-		if _, cur := parseSSHAttempts(latest.Annotations[healthMissesAnnotation]); cur == 0 {
-			return nil
-		}
-		if latest.Annotations == nil {
-			latest.Annotations = map[string]string{}
-		}
-		latest.Annotations[healthMissesAnnotation] = fmt.Sprintf("%d:0", latest.Generation)
-		return r.Update(ctx, latest)
-	})
+	return updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
+		func(latest *dfaasv1.Environment) bool {
+			return resetGenCounter(latest, healthMissesAnnotation)
+		})
 }
 
 // reconcileProvisioningInfra runs the dfaas-worker Ansible Job and the k6
@@ -725,62 +701,23 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 // monitoring Helm install. P4 mirror of LoadTest dispatchAttempts.
 func (r *EnvironmentReconciler) bumpMonitoringAttempts(ctx context.Context,
 	env *dfaasv1.Environment) (int, error) {
-	var newVal int
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.Environment{}
-		if gerr := r.Get(ctx, client.ObjectKeyFromObject(env), latest); gerr != nil {
-			return gerr
-		}
-		if latest.Annotations == nil {
-			latest.Annotations = map[string]string{}
-		}
-		cur := 0
-		if s, ok := latest.Annotations[monitoringAttemptsAnnotation]; ok {
-			if n, perr := strconv.Atoi(s); perr == nil {
-				cur = n
-			}
-		}
-		cur++
-		latest.Annotations[monitoringAttemptsAnnotation] = strconv.Itoa(cur)
-		newVal = cur
-		return r.Update(ctx, latest)
-	})
-	return newVal, err
+	var n int
+	err := updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
+		func(latest *dfaasv1.Environment) bool {
+			n = bumpPlainCounter(latest, monitoringAttemptsAnnotation)
+			return true
+		})
+	return n, err
 }
 
 // resetMonitoringAttempts zeroes the counter annotation on success. No-op
 // when already "0" to avoid churn.
 func (r *EnvironmentReconciler) resetMonitoringAttempts(ctx context.Context,
 	env *dfaasv1.Environment) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.Environment{}
-		if gerr := r.Get(ctx, client.ObjectKeyFromObject(env), latest); gerr != nil {
-			return gerr
-		}
-		if cur, ok := latest.Annotations[monitoringAttemptsAnnotation]; ok && cur == "0" {
-			return nil
-		}
-		if latest.Annotations == nil {
-			latest.Annotations = map[string]string{}
-		}
-		latest.Annotations[monitoringAttemptsAnnotation] = "0"
-		return r.Update(ctx, latest)
-	})
-}
-
-// parseSSHAttempts decodes the "<generation>:<count>" annotation. Returns the
-// stored generation and count; (0, 0) if absent or malformed.
-func parseSSHAttempts(s string) (gen int64, count int) {
-	parts := strings.SplitN(s, ":", 2)
-	if len(parts) != 2 {
-		return 0, 0
-	}
-	g, gerr := strconv.ParseInt(parts[0], 10, 64)
-	c, cerr := strconv.Atoi(parts[1])
-	if gerr != nil || cerr != nil {
-		return 0, 0
-	}
-	return g, c
+	return updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
+		func(latest *dfaasv1.Environment) bool {
+			return resetPlainCounter(latest, monitoringAttemptsAnnotation)
+		})
 }
 
 // bumpSSHAttempts increments the consecutive SSH-unreachable counter,
@@ -788,45 +725,23 @@ func parseSSHAttempts(s string) (gen int64, count int) {
 // (spec edit) restarts the budget at 1. Returns the count for this generation.
 func (r *EnvironmentReconciler) bumpSSHAttempts(ctx context.Context,
 	env *dfaasv1.Environment) (int, error) {
-	var newVal int
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.Environment{}
-		if gerr := r.Get(ctx, client.ObjectKeyFromObject(env), latest); gerr != nil {
-			return gerr
-		}
-		if latest.Annotations == nil {
-			latest.Annotations = map[string]string{}
-		}
-		storedGen, cur := parseSSHAttempts(latest.Annotations[sshAttemptsAnnotation])
-		if storedGen != latest.Generation {
-			cur = 0
-		}
-		cur++
-		latest.Annotations[sshAttemptsAnnotation] = fmt.Sprintf("%d:%d", latest.Generation, cur)
-		newVal = cur
-		return r.Update(ctx, latest)
-	})
-	return newVal, err
+	var n int
+	err := updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
+		func(latest *dfaasv1.Environment) bool {
+			n = bumpGenCounter(latest, sshAttemptsAnnotation)
+			return true
+		})
+	return n, err
 }
 
 // resetSSHAttempts zeroes the counter for the current generation on success.
 // No-op when already absent or zero to avoid churn.
 func (r *EnvironmentReconciler) resetSSHAttempts(ctx context.Context,
 	env *dfaasv1.Environment) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.Environment{}
-		if gerr := r.Get(ctx, client.ObjectKeyFromObject(env), latest); gerr != nil {
-			return gerr
-		}
-		if _, cur := parseSSHAttempts(latest.Annotations[sshAttemptsAnnotation]); cur == 0 {
-			return nil
-		}
-		if latest.Annotations == nil {
-			latest.Annotations = map[string]string{}
-		}
-		latest.Annotations[sshAttemptsAnnotation] = fmt.Sprintf("%d:0", latest.Generation)
-		return r.Update(ctx, latest)
-	})
+	return updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
+		func(latest *dfaasv1.Environment) bool {
+			return resetGenCounter(latest, sshAttemptsAnnotation)
+		})
 }
 
 // patchJobTTL sets Spec.TTLSecondsAfterFinished on a finished Ansible Job
@@ -870,24 +785,14 @@ func (r *EnvironmentReconciler) syncNodeStatus(ctx context.Context, env *dfaasv1
 	})
 }
 
-// atomicStatusUpdate runs mutate against the freshly-fetched Environment under
-// retry.RetryOnConflict and persists it via Status().Update. It is the shared
-// implementation behind the best-effort status-stamping helpers: it re-fetches
-// to absorb informer cache lag, retries on conflict, and returns the final
-// error so callers can decide whether to surface it. Fire-and-forget callers
-// should route the result through logStatusErr rather than discarding it.
+// atomicStatusUpdate runs mutate against the freshly-fetched Environment and
+// persists it via Status().Update. Typed adapter over statusUpdateWithRetry: it
+// re-fetches to absorb informer cache lag, retries on conflict, and returns the
+// final error so callers can decide whether to surface it. Fire-and-forget
+// callers should route the result through logStatusErr rather than discarding it.
 func (r *EnvironmentReconciler) atomicStatusUpdate(ctx context.Context,
 	key client.ObjectKey, mutate func(env *dfaasv1.Environment) error) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.Environment{}
-		if err := r.Get(ctx, key, latest); err != nil {
-			return err
-		}
-		if err := mutate(latest); err != nil {
-			return err
-		}
-		return r.Status().Update(ctx, latest)
-	})
+	return statusUpdateWithRetry(ctx, r.Client, key, &dfaasv1.Environment{}, mutate)
 }
 
 // logStatusErr logs a best-effort operation failure instead of silently

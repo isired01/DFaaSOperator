@@ -112,8 +112,8 @@ func main() {
 		setupLog.Error(err, "unable to ensure S3 config namespace")
 		os.Exit(1)
 	}
-	// Seed the default S3 config Secret pointing at the in-cluster MinIO sink
-	// so Environments with no explicit s3ConfigRef default to MinIO instead of
+	// Seed the default S3 config Secret pointing at the in-cluster SeaweedFS sink
+	// so Environments with no explicit s3ConfigRef default to SeaweedFS instead of
 	// stdout. Create-if-not-exists: never clobbers an admin-edited config.
 	if err := controller.EnsureDefaultS3Config(context.Background(), bootstrapClient); err != nil {
 		setupLog.Error(err, "unable to ensure default S3 config")

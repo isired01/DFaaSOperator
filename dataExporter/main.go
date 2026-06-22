@@ -235,7 +235,7 @@ func dumpToStdout(fileName string) {
 // uploadToS3 uploads csvPath to s3://bucket/key. The function is responsible
 // for HeadBucket → CreateBucket (when missing) → PutObject. Static creds
 // come from S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY; region from S3_REGION;
-// optional custom endpoint from S3_ENDPOINT (e.g. MinIO); path-style
+// optional custom endpoint from S3_ENDPOINT (e.g. SeaweedFS); path-style
 // addressing toggled by S3_FORCE_PATH_STYLE.
 func uploadToS3(ctx context.Context, csvPath, bucket, key string) error {
 	region := os.Getenv("S3_REGION")

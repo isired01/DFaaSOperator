@@ -10,7 +10,7 @@
 //
 // Input  : raw image bytes (jpeg/png/gif) as the POST body. Matches the k6
 //
-//	payload feature, which fetches the asset from MinIO and POSTs the
+//	payload feature, which fetches the asset from SeaweedFS and POSTs the
 //	bytes directly — no base64, no URL indirection.
 //
 // Output : image/jpeg thumbnail (default). With ?meta=1 returns a small JSON

@@ -12,7 +12,7 @@ Why this shape:
 - **of-watchdog http mode** → the handler is a resident process, not
   fork-per-request — behaves well under sustained k6 load.
 - **raw bytes in** → matches the k6 payload feature, which fetches the asset
-  from MinIO and POSTs the bytes directly (no base64, no URL).
+  from SeaweedFS and POSTs the bytes directly (no base64, no URL).
 - **pure Go** (`golang.org/x/image/draw`, stdlib `image/*`) → static binary,
   no OpenCV/CGo, multi-arch, low CPU/memory.
 
@@ -62,13 +62,13 @@ k6 POSTs the bytes, the function returns the grayscale thumbnail.
 
 ## Load-test payload flow (how k6 sends the image)
 
-The image attached to a k6 scenario in the UI is uploaded to the in-cluster MinIO
+The image attached to a k6 scenario in the UI is uploaded to the in-cluster SeaweedFS
 (S3) and the generated k6 script delivers it to this function like so:
 
 1. The script fetches the image **once** in k6 `setup()` (runs a single time per
    test) and base64-encodes it — binary can't survive setup-data serialization.
 2. Each VU base64-decodes it **once** and POSTs the **raw bytes** as the request
-   body. So MinIO is hit one time regardless of VU count — *not* once per VU.
+   body. So SeaweedFS is hit one time regardless of VU count — *not* once per VU.
 3. This function reads the raw body and returns the grayscale thumbnail.
 
 **Use a small image (KB, not multi-MB).** Two independent reasons:
@@ -83,8 +83,8 @@ slipped through — guarded against in current scripts) and `500/504` (node /
 gateway saturated). Keep the arrival rate sane.
 
 Reachability: the asset URL handed to k6 must be reachable **from the k6 VMs**
-(`MINIO_PUBLIC_URL` on the UI gateway; MinIO S3 API port **30900** — not the
-console **30901**); the target URL is the DFaaS node's OpenFaaS entrypoint
+(`SEAWEEDFS_PUBLIC_URL` on the UI gateway; SeaweedFS S3 API port **30900**); the
+target URL is the DFaaS node's OpenFaaS entrypoint
 `http://<dfaas-node-ip>:30080/function/<name>` (HAProxy NodePort).
 
 ## Ready-made test functions (no payload needed)
@@ -92,7 +92,7 @@ console **30901**); the target URL is the DFaaS node's OpenFaaS entrypoint
 Two official OpenFaaS store functions — handy as lightweight smoke tests to
 verify deploy / routing / agent behaviour **before** throwing images at
 `imgproc`. Both are pure-Go classic-watchdog functions, multi-arch
-(amd64/arm64), and take a **plain-text body** (no MinIO asset, no payload
+(amd64/arm64), and take a **plain-text body** (no SeaweedFS asset, no payload
 feature). Images pinned by commit:
 
 | Function | Image | Does |

@@ -11,5 +11,3 @@ type Manager struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
-
-func int32Ptr(i int32) *int32 { return &i }

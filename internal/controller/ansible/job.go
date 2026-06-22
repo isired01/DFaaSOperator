@@ -18,6 +18,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	dfaasv1 "dfaas-operator/api/v1"
@@ -83,7 +84,7 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 			Labels:    labels,
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit:         int32Ptr(3),
+			BackoffLimit:         ptr.To[int32](3),
 			PodReplacementPolicy: &prFailed,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{

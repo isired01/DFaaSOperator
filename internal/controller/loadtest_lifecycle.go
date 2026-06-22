@@ -13,7 +13,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -23,7 +22,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -51,27 +49,13 @@ const dispatchRetryBudget = 15
 // since annotations live in ObjectMeta.
 func (r *LoadTestReconciler) bumpDispatchAttempts(ctx context.Context,
 	lt *dfaasv1.LoadTest) (int, error) {
-	var newVal int
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.LoadTest{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(lt), latest); err != nil {
-			return err
-		}
-		if latest.Annotations == nil {
-			latest.Annotations = map[string]string{}
-		}
-		cur := 0
-		if s, ok := latest.Annotations[dispatchAttemptsAnnotation]; ok {
-			if n, perr := strconv.Atoi(s); perr == nil {
-				cur = n
-			}
-		}
-		cur++
-		latest.Annotations[dispatchAttemptsAnnotation] = strconv.Itoa(cur)
-		newVal = cur
-		return r.Update(ctx, latest)
-	})
-	return newVal, err
+	var n int
+	err := updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(lt), &dfaasv1.LoadTest{},
+		func(latest *dfaasv1.LoadTest) bool {
+			n = bumpPlainCounter(latest, dispatchAttemptsAnnotation)
+			return true
+		})
+	return n, err
 }
 
 // resetDispatchAttempts zeroes the counter annotation. Safe to call when the
@@ -79,20 +63,10 @@ func (r *LoadTestReconciler) bumpDispatchAttempts(ctx context.Context,
 // is already "0", to avoid pointless Updates on every successful dispatch.
 func (r *LoadTestReconciler) resetDispatchAttempts(ctx context.Context,
 	lt *dfaasv1.LoadTest) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.LoadTest{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(lt), latest); err != nil {
-			return err
-		}
-		if cur, ok := latest.Annotations[dispatchAttemptsAnnotation]; ok && cur == "0" {
-			return nil
-		}
-		if latest.Annotations == nil {
-			latest.Annotations = map[string]string{}
-		}
-		latest.Annotations[dispatchAttemptsAnnotation] = "0"
-		return r.Update(ctx, latest)
-	})
+	return updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(lt), &dfaasv1.LoadTest{},
+		func(latest *dfaasv1.LoadTest) bool {
+			return resetPlainCounter(latest, dispatchAttemptsAnnotation)
+		})
 }
 
 // onDispatchError centralises the retry-budget bookkeeping on a dispatcher
@@ -471,7 +445,7 @@ func (r *LoadTestReconciler) captureK6Logs(ctx context.Context,
 
 // runExporter creates the in-cluster Job that pulls metrics from Prometheus
 // over [StartTime, EndTime] and uploads to S3. The destination defaults to the
-// in-cluster MinIO sink (DefaultS3ConfigName) when env.spec.s3ConfigRef is
+// in-cluster SeaweedFS sink (DefaultS3ConfigName) when env.spec.s3ConfigRef is
 // unset; an explicit ref selects that config instead. Only if the default
 // config itself is missing does the exporter fall back to a stdout dump.
 func (r *LoadTestReconciler) runExporter(ctx context.Context,
@@ -492,7 +466,7 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 		}
 
 		// Always resolve an S3 config name. With no explicit s3ConfigRef the
-		// Environment defaults to the in-cluster MinIO sink (DefaultS3ConfigName)
+		// Environment defaults to the in-cluster SeaweedFS sink (DefaultS3ConfigName)
 		// instead of the legacy stdout dump.
 		configName := DefaultS3ConfigName
 		explicitRef := env.Spec.S3ConfigRef != nil
@@ -513,7 +487,7 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 					// (unchanged behaviour).
 					return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
 				}
-				// Default sink missing (e.g. MinIO not yet deployed) — degrade
+				// Default sink missing (e.g. SeaweedFS not yet deployed) — degrade
 				// gracefully to the stdout path rather than failing the test.
 				logger.Info("default S3 config not found; falling back to stdout export",
 					"config", configName)

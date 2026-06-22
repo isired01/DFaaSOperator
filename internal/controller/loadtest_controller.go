@@ -65,9 +65,8 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if !lt.DeletionTimestamp.IsZero() {
 		return r.handleLoadTestDeletion(ctx, &lt)
 	}
-	if !controllerutil.ContainsFinalizer(&lt, loadTestFinalizer) {
-		controllerutil.AddFinalizer(&lt, loadTestFinalizer)
-		return ctrl.Result{}, r.Update(ctx, &lt)
+	if added, err := ensureFinalizer(ctx, r.Client, &lt, loadTestFinalizer); added || err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Terminal phases — no-op.
@@ -298,24 +297,14 @@ func (r *LoadTestReconciler) failLoadTest(ctx context.Context,
 	return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
 }
 
-// atomicStatusUpdate runs mutate against the freshly-fetched LoadTest under
-// retry.RetryOnConflict and persists it via Status().Update. Shared core
-// behind the status-stamping helpers: re-fetches to absorb informer cache lag,
-// retries on conflict, and returns the final error so callers can decide
-// whether to surface it. Fire-and-forget callers should route the result
-// through logStatusErr rather than discarding it.
+// atomicStatusUpdate runs mutate against the freshly-fetched LoadTest and
+// persists it via Status().Update. Typed adapter over statusUpdateWithRetry:
+// re-fetches to absorb informer cache lag, retries on conflict, and returns the
+// final error so callers can decide whether to surface it. Fire-and-forget
+// callers should route the result through logStatusErr rather than discarding it.
 func (r *LoadTestReconciler) atomicStatusUpdate(ctx context.Context,
 	key types.NamespacedName, mutate func(lt *dfaasv1.LoadTest) error) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.LoadTest{}
-		if err := r.Get(ctx, key, latest); err != nil {
-			return err
-		}
-		if err := mutate(latest); err != nil {
-			return err
-		}
-		return r.Status().Update(ctx, latest)
-	})
+	return statusUpdateWithRetry(ctx, r.Client, key, &dfaasv1.LoadTest{}, mutate)
 }
 
 // setLoadTestCondition sets a Condition on status using the re-fetch-then-update pattern.

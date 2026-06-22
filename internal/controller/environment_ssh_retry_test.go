@@ -118,7 +118,7 @@ var _ = Describe("ProvisioningVMs SSH retry budget", func() {
 
 		reset := &dfaasv1.Environment{}
 		Expect(k8sClient.Get(ctx, key, reset)).To(Succeed())
-		gen, count := parseSSHAttempts(reset.Annotations[sshAttemptsAnnotation])
+		gen, count := parseGenCounter(reset.Annotations[sshAttemptsAnnotation])
 		Expect(gen).To(Equal(reset.Generation))
 		Expect(count).To(Equal(1))
 	})

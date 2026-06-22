@@ -18,10 +18,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
@@ -67,9 +65,8 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if !env.DeletionTimestamp.IsZero() {
 		return r.handleEnvDeletion(ctx, &env)
 	}
-	if !controllerutil.ContainsFinalizer(&env, environmentFinalizer) {
-		controllerutil.AddFinalizer(&env, environmentFinalizer)
-		return ctrl.Result{}, r.Update(ctx, &env)
+	if added, err := ensureFinalizer(ctx, r.Client, &env, environmentFinalizer); added || err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if env.Status.Phase == dfaasv1.EnvReady &&
@@ -80,24 +77,12 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.reconcileReadyHealth(ctx, &env)
 	}
 
-	// Generation drift: spec was edited after a successful run. Reset stale
-	// Conditions, delete previous-gen Ansible Jobs (avoid concurrent runs on
-	// the same VMs), and restart the FSM from ProvisioningVMs.
-	if env.Status.ObservedGeneration > 0 && env.Status.ObservedGeneration < env.Generation {
-		if err := r.cleanupStaleGenJobs(ctx, &env); err != nil {
-			logger.Error(err, "stale-gen Job cleanup failed")
-		}
-		if env.Status.Phase == dfaasv1.EnvReady ||
-			env.Status.Phase == dfaasv1.EnvDegraded ||
-			env.Status.Phase == dfaasv1.EnvFailed {
-			logger.Info("generation drift detected — restarting provisioning",
-				"phase", env.Status.Phase,
-				"observed", env.Status.ObservedGeneration, "current", env.Generation)
-			if err := r.resetTransientConditions(ctx, &env); err != nil {
-				logger.Error(err, "reset transient Conditions failed")
-			}
-			return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
-		}
+	// Generation drift: spec was edited after a settled run. Restart the FSM
+	// from ProvisioningVMs (see handleGenerationDrift). Done in one place so the
+	// stale-Job cleanup runs once per drift, not on every reconcile of the
+	// subsequent re-provisioning window.
+	if handled, res, err := r.handleGenerationDrift(ctx, &env); handled || err != nil {
+		return res, err
 	}
 
 	switch env.Status.Phase {
@@ -112,47 +97,70 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	case dfaasv1.EnvReady:
 		// Generation drifted: restart from VMs.
 		return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
-	case dfaasv1.EnvDegraded:
-		// Non-terminal: infra is up but monitoring is broken. Tests are
-		// still permitted. Recovery is via spec edit (drift block above)
-		// or explicit deletion+recreate. Like EnvFailed we do not auto-
-		// retry — that would loop forever against a persistently broken
-		// chart / OCI registry.
+	case dfaasv1.EnvDegraded, dfaasv1.EnvFailed:
+		// Settled but not Ready. Degraded = infra up, monitoring broken (tests
+		// still permitted); Failed = provisioning failed (terminal). Neither
+		// auto-retries — that would loop forever against a persistently broken
+		// chart / OCI registry. Recovery is a spec edit (drift block above)
+		// or delete+recreate.
 		if env.Status.ObservedGeneration == 0 {
-			// Settled without ever stamping (failed before reaching Ready, or
-			// pre-dates the settle-time stamp). Record the current generation
-			// so a later spec edit is seen as drift and re-triggers provisioning.
-			return r.setEnvPhase(ctx, &env, dfaasv1.EnvDegraded)
+			// Settled without ever stamping observedGeneration (failed before
+			// reaching Ready, or pre-dates the settle-time stamp). Record the
+			// current generation so a later spec edit is seen as drift and
+			// re-triggers provisioning.
+			return r.setEnvPhase(ctx, &env, env.Status.Phase)
 		}
-		logger.V(1).Info("environment degraded, awaiting spec edit or recreation")
-		return ctrl.Result{}, nil
-	case dfaasv1.EnvFailed:
-		// Terminal failure. Recovery requires either a spec edit (drift block
-		// restarts the FSM at the top of Reconcile) or delete-and-recreate.
-		if env.Status.ObservedGeneration == 0 {
-			// Settled without ever stamping (failed on first provision, or
-			// pre-dates the settle-time stamp). Record the current generation
-			// so a later spec edit is seen as drift and re-triggers provisioning.
-			return r.setEnvPhase(ctx, &env, dfaasv1.EnvFailed)
-		}
-		logger.V(1).Info("environment failed, awaiting spec edit or recreation")
+		logger.V(1).Info("environment settled, awaiting spec edit or recreation",
+			"phase", env.Status.Phase)
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{}, nil
 }
 
-// setEnvPhase patches status.phase, retrying on conflict. When transitioning
-// into a settled phase (Ready, Failed, or Degraded) it also stamps
-// observedGeneration so future ticks short-circuit and a later spec edit is
-// seen as generation drift. Stamps the top-level EnvCondReady aggregator (P1).
+// handleGenerationDrift detects a spec edit applied after a settled run
+// (observedGeneration older than the current generation) and restarts the FSM:
+// it deletes stale-generation Ansible Jobs, resets the transient Conditions, and
+// moves the phase back to ProvisioningVMs. Returns handled=true when it took over
+// the reconcile — the caller must return res/err immediately.
+//
+// Cleanup runs only on this settled→ProvisioningVMs transition, not on every
+// reconcile of the subsequent re-provisioning window: observedGeneration stays
+// behind until the new run reaches Ready, but once the old-gen Jobs are deleted
+// the fresh Jobs carry the current generation in their name and labels, so a
+// repeated LIST would only churn finding nothing. Drift seen mid-provisioning
+// (a non-settled phase) needs no cleanup — generation-scoped Job names already
+// keep the previous run's Jobs from being mistaken for the current one.
+func (r *EnvironmentReconciler) handleGenerationDrift(ctx context.Context,
+	env *dfaasv1.Environment) (handled bool, res ctrl.Result, err error) {
+	if env.Status.ObservedGeneration == 0 || env.Status.ObservedGeneration >= env.Generation {
+		return false, ctrl.Result{}, nil
+	}
+	if !isSettledPhase(env.Status.Phase) {
+		return false, ctrl.Result{}, nil
+	}
+
+	logger := log.FromContext(ctx)
+	logger.Info("generation drift detected — restarting provisioning",
+		"phase", env.Status.Phase,
+		"observed", env.Status.ObservedGeneration, "current", env.Generation)
+	if cerr := r.cleanupStaleGenJobs(ctx, env); cerr != nil {
+		logger.Error(cerr, "stale-gen Job cleanup failed")
+	}
+	if rerr := r.resetTransientConditions(ctx, env); rerr != nil {
+		logger.Error(rerr, "reset transient Conditions failed")
+	}
+	res, err = r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningVMs)
+	return true, res, err
+}
+
+// setEnvPhase patches status.phase, retrying on conflict via atomicStatusUpdate.
+// When transitioning into a settled phase (Ready, Failed, or Degraded) it also
+// stamps observedGeneration so future ticks short-circuit and a later spec edit
+// is seen as generation drift. Stamps the top-level EnvCondReady aggregator (P1).
 func (r *EnvironmentReconciler) setEnvPhase(ctx context.Context,
 	env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase) (ctrl.Result, error) {
 
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &dfaasv1.Environment{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(env), latest); err != nil {
-			return err
-		}
+	err := r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
 		latest.Status.Phase = phase
 		// Stamp observedGeneration on every *settled* outcome — Ready, Failed,
 		// and Degraded — not just Ready. It records the spec generation the
@@ -162,13 +170,11 @@ func (r *EnvironmentReconciler) setEnvPhase(ctx context.Context,
 		// first provision kept observedGeneration == 0, the drift guard
 		// (`observedGeneration > 0`) skipped it, and editing the spec from the
 		// UI was silently ignored — wedging the Environment in Failed forever.
-		if phase == dfaasv1.EnvReady ||
-			phase == dfaasv1.EnvFailed ||
-			phase == dfaasv1.EnvDegraded {
+		if isSettledPhase(phase) {
 			latest.Status.ObservedGeneration = latest.Generation
 		}
 		stampEnvAggregate(latest, phase)
-		return r.Status().Update(ctx, latest)
+		return nil
 	})
 	return ctrl.Result{}, err
 }

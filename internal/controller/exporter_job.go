@@ -193,7 +193,7 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 			Namespace: lt.Namespace,
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit:         int32Ptr(2),
+			BackoffLimit:         ptr.To[int32](2),
 			PodReplacementPolicy: &prFailed,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
@@ -216,5 +216,3 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 	_ = ctrl.SetControllerReference(lt, job, r.Scheme)
 	return job, nil
 }
-
-func int32Ptr(i int32) *int32 { return &i }

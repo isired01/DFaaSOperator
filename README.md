@@ -213,7 +213,7 @@ The original single `Ready` condition has been split into composable sub-conditi
 - Kubernetes cluster ≥ v1.25 (tested on k3s + standard kubeadm)
 - Go ≥ 1.25 for local development
 - A Helm-compatible cluster (no extra installation needed — the operator drives Helm via the embedded SDK)
-- Optional, for S3 export: an S3-compatible endpoint (AWS S3, MinIO, R2, Wasabi, etc.) and an access-key pair with `s3:HeadBucket`, `s3:CreateBucket`, `s3:PutObject` on the target account
+- Optional, for S3 export: an S3-compatible endpoint (AWS S3, SeaweedFS, R2, Wasabi, etc.) and an access-key pair with `s3:HeadBucket`, `s3:CreateBucket`, `s3:PutObject` on the target account
 
 ## 🏁 Getting Started
 
@@ -248,11 +248,11 @@ The destination is decided on the **Environment**, not the LoadTest: every LoadT
 
 At LoadTest export time the operator mirrors the referenced Secret into the LoadTest namespace with an OwnerRef → LoadTest, so the local copy cascades on LoadTest delete (cross-namespace Secret mounts are not supported by Kubernetes — the mirror is required).
 
-## 🖼️ Image payloads for k6 (in-cluster MinIO + `dfaas-imgproc`)
+## 🖼️ Image payloads for k6 (in-cluster SeaweedFS + `dfaas-imgproc`)
 
-LoadTest scenarios can POST an uploaded image as the request body. The image is stored in the operator-deployed in-cluster MinIO (the `monitoring` namespace, surfaced as the `minio-default` S3 config) and fetched by the generated k6 script **once** per test (in k6 `setup()`, base64-encoded), then each VU POSTs the raw bytes to a function on a DFaaS node. A ready image-processing target — `dfaas-imgproc` (grayscale + thumbnail, of-watchdog http mode, multi-arch) — ships in [imageFunction/](imageFunction/README.md).
+LoadTest scenarios can POST an uploaded image as the request body. The image is stored in the operator-deployed in-cluster SeaweedFS (the `monitoring` namespace, surfaced as the `seaweedfs-default` S3 config) and fetched by the generated k6 script **once** per test (in k6 `setup()`, base64-encoded), then each VU POSTs the raw bytes to a function on a DFaaS node. A ready image-processing target — `dfaas-imgproc` (grayscale + thumbnail, of-watchdog http mode, multi-arch) — ships in [imageFunction/](imageFunction/README.md).
 
-**Use a small image.** It is copied into k6 runner memory and POSTed in full on every request, so a multi-MB payload saturates MinIO and the DFaaS node under load (`unknown format` from failed fetches, `500/504` from a saturated node). The asset URL must be reachable **from the k6 VMs** — set `MINIO_PUBLIC_URL` on the UI gateway to a node IP/port the k6 nodes route to (MinIO S3 API NodePort `30900`, **not** the console `30901`). The function is invoked through the DFaaS node's HAProxy entrypoint `http://<dfaas-node-ip>:30080/function/<name>`.
+**Use a small image.** It is copied into k6 runner memory and POSTed in full on every request, so a multi-MB payload saturates SeaweedFS and the DFaaS node under load (`unknown format` from failed fetches, `500/504` from a saturated node). The asset URL must be reachable **from the k6 VMs** — set `SEAWEEDFS_PUBLIC_URL` on the UI gateway to a node IP/port the k6 nodes route to (SeaweedFS S3 API NodePort `30900`). The function is invoked through the DFaaS node's HAProxy entrypoint `http://<dfaas-node-ip>:30080/function/<name>`.
 
 ## ⚠️ Known limitations / pins
 - **Balancing strategies — partial support.** Supported out of the box: `staticstrategy`, `alllocalstrategy`, `recalcstrategy`. The latter requires `Function.maxRate` (emitted as `dfaas.maxrate` OpenFaaS label). `nodemarginstrategy` and `rlagentstrategy` are not supported.
