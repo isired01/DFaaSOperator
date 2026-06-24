@@ -97,6 +97,10 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	case dfaasv1.EnvReady:
 		// Generation drifted: restart from VMs.
 		return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
+	case dfaasv1.EnvUnreachable:
+		// Non-terminal: nodes stopped answering SSH. Re-probe indefinitely and
+		// auto-recover when they return (→ Ready or → ProvisioningInfra).
+		return r.reconcileUnreachable(ctx, &env)
 	case dfaasv1.EnvDegraded, dfaasv1.EnvFailed:
 		// Settled but not Ready. Degraded = infra up, monitoring broken (tests
 		// still permitted); Failed = provisioning failed (terminal). Neither
@@ -199,6 +203,10 @@ func stampEnvAggregate(env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase)
 		status = metav1.ConditionFalse
 		reason = dfaasv1.EnvReasonFailed
 		message = "provisioning failed; spec edit or delete+recreate required"
+	case dfaasv1.EnvUnreachable:
+		status = metav1.ConditionFalse
+		reason = dfaasv1.EnvReasonSSHUnreachable
+		message = "nodes unreachable via SSH; retrying automatically — see the NodesReachable / VMsReady condition"
 	case "", dfaasv1.EnvIdle:
 		status = metav1.ConditionUnknown
 		reason = dfaasv1.EnvReasonInitializing

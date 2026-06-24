@@ -13,7 +13,7 @@ package v1
 import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 // EnvironmentPhase tracks the infrastructure lifecycle.
-// +kubebuilder:validation:Enum=Idle;ProvisioningVMs;ProvisioningInfra;ProvisioningMonitoring;Ready;Degraded;Failed
+// +kubebuilder:validation:Enum=Idle;ProvisioningVMs;ProvisioningInfra;ProvisioningMonitoring;Ready;Degraded;Failed;Unreachable
 type EnvironmentPhase string
 
 const (
@@ -27,6 +27,14 @@ const (
 	// dataExporter step will surface the monitoring failure later.
 	EnvDegraded EnvironmentPhase = "Degraded"
 	EnvFailed   EnvironmentPhase = "Failed"
+	// EnvUnreachable is a NON-terminal state for an Environment whose nodes
+	// stopped answering SSH (:22) — during provisioning after the fast
+	// sshRetryBudget, or while Ready after healthRetryBudget. Unlike Failed it
+	// auto-recovers: the reconciler re-probes indefinitely and, once the nodes
+	// answer again, returns to Ready (if already provisioned) or resumes
+	// provisioning. Reserved for transient connectivity loss; genuine
+	// provisioning failures (Ansible / job-creation) still go to terminal Failed.
+	EnvUnreachable EnvironmentPhase = "Unreachable"
 )
 
 // Condition Types stamped on Environment.status.conditions (P15).

@@ -13,15 +13,8 @@ package controller
 import (
 	"context"
 	"fmt"
-	"io"
-	"net"
-	"regexp"
-	"strings"
 	"time"
 
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -42,43 +35,6 @@ const monitoringAttemptsAnnotation = "dfaas.dfaas.io/monitoring-attempts"
 // monitoringRetryBudget is the max consecutive Helm install failures
 // tolerated before the Environment is moved to EnvDegraded (P4 + P5).
 const monitoringRetryBudget = 5
-
-// sshProbeTimeout caps each per-host SSH-reachability TCP dial (P6).
-const sshProbeTimeout = 2 * time.Second
-
-// sshAttemptsAnnotation persists the consecutive SSH-unreachable counter,
-// generation-scoped as "<generation>:<count>" so a spec edit restarts the
-// budget fresh.
-const sshAttemptsAnnotation = "dfaas.dfaas.io/ssh-attempts"
-
-// sshRetryBudget is the max consecutive SSH-unreachable rounds tolerated
-// before the Environment is moved to EnvFailed.
-const sshRetryBudget = 3
-
-// healthCheckInterval is the cadence of the Ready-state SSH liveness probe.
-const healthCheckInterval = time.Minute
-
-// healthRetryInterval is the faster cadence used to confirm a suspected miss
-// before giving up.
-const healthRetryInterval = 20 * time.Second
-
-// healthRetryBudget is the max consecutive unreachable health rounds tolerated
-// before a Ready Environment is moved to EnvFailed. A small budget prevents a
-// single dropped packet from flapping a healthy env into Failed.
-const healthRetryBudget = 3
-
-// healthMissesAnnotation persists the consecutive Ready-state unreachable
-// counter, generation-scoped as "<generation>:<count>". Kept separate from
-// sshAttemptsAnnotation so the health loop never clobbers provisioning state.
-const healthMissesAnnotation = "dfaas.dfaas.io/health-misses"
-
-// jobTTLSuccessSeconds is the TTLSecondsAfterFinished applied to a successful
-// Ansible Job so the Job controller cleans it up shortly after completion.
-const jobTTLSuccessSeconds int32 = 600
-
-// jobTTLFailureGraceSeconds is the TTLSecondsAfterFinished applied to a failed
-// Ansible Job (24h), giving an audit window before auto-cleanup.
-const jobTTLFailureGraceSeconds int32 = 86400
 
 // handleEnvDeletion drains per-environment cluster-wide state (Prometheus
 // targets) and removes the finalizer. Per-environment Jobs and ConfigMaps
@@ -129,11 +85,13 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 			logger.Error(bumpErr, "bumpSSHAttempts failed; continuing without budget enforcement")
 		}
 		if count >= sshRetryBudget {
-			logger.Info("VMs not SSH-reachable, giving up", "nodes", unreachable, "attempts", count)
-			logStatusErr(ctx, "stamp VMsReady=False (budget exhausted)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
+			logger.Info("VMs not SSH-reachable after fast-retry budget; entering Unreachable (will keep retrying)",
+				"nodes", unreachable, "attempts", count)
+			logStatusErr(ctx, "stamp VMsReady=False (entering Unreachable)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
 				metav1.ConditionFalse, dfaasv1.EnvReasonSSHUnreachable,
-				fmt.Sprintf("SSH :22 dial failed for %v after %d attempts", unreachable, count)))
-			return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
+				fmt.Sprintf("SSH :22 dial failed for %v after %d fast attempts; retrying every %s",
+					unreachable, count, unreachableRetryInterval)))
+			return r.setEnvPhase(ctx, env, dfaasv1.EnvUnreachable)
 		}
 		logger.Info("VMs not SSH-reachable, retrying", "nodes", unreachable, "attempts", count)
 		logStatusErr(ctx, "stamp VMsReady=False (retrying)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
@@ -148,155 +106,6 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 		metav1.ConditionTrue, dfaasv1.EnvReasonSSHReachable,
 		"provisioning SSH check passed: all declared nodes reachable on :22"))
 	return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningInfra)
-}
-
-// probeSSH returns true if a TCP dial to ip:22 completes within
-// sshProbeTimeout. Cheap reachability check — does NOT verify an SSH
-// banner; that would require a real client + creds.
-func probeSSH(ip string) bool {
-	if ip == "" {
-		return false
-	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "22"), sshProbeTimeout)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
-}
-
-// reconcileReadyHealth runs the periodic SSH (:22) liveness probe while an
-// Environment is Ready. It replaces the old idle short-circuit: a node that
-// dies after provisioning is now noticed within ~3 minutes instead of only
-// when a test fails against it.
-//
-// Cadence is driven entirely by the returned RequeueAfter (60s healthy, 20s
-// while confirming a miss). The reconciler advances its own FSM by
-// re-reconciling on its status writes, so this method is throttled on
-// status.lastHealthCheck: without that guard each health write would
-// re-enqueue immediately and hot-loop. The throttle window shrinks to
-// healthRetryInterval while the NodesReachable condition is False so misses
-// are confirmed faster.
-//
-// After healthRetryBudget consecutive unreachable rounds the Environment is
-// moved to EnvFailed; recovery is manual (spec edit → drift → re-provision),
-// matching the user decision and the existing Failed semantics.
-func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
-	env *dfaasv1.Environment) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	if len(env.Spec.Nodes) == 0 {
-		return ctrl.Result{RequeueAfter: healthCheckInterval}, nil
-	}
-
-	// Throttle against our own status writes.
-	if last := env.Status.LastHealthCheck; last != nil {
-		due := healthCheckInterval
-		if c := meta.FindStatusCondition(env.Status.Conditions, dfaasv1.EnvCondNodesReachable); c != nil &&
-			c.Status == metav1.ConditionFalse {
-			due = healthRetryInterval
-		}
-		if elapsed := time.Since(last.Time); elapsed < due {
-			return ctrl.Result{RequeueAfter: due - elapsed}, nil
-		}
-	}
-
-	var unreachable []string
-	for _, n := range env.Spec.Nodes {
-		if !probeSSH(n.IPAddress) {
-			unreachable = append(unreachable, n.NodeID)
-		}
-	}
-
-	if len(unreachable) == 0 {
-		if rerr := r.resetHealthMisses(ctx, env); rerr != nil {
-			logger.Error(rerr, "resetHealthMisses failed; non-fatal")
-		}
-		if err := r.markNodesReachable(ctx, env); err != nil {
-			logger.Error(err, "stamp NodesReachable=True failed; retrying")
-		}
-		return ctrl.Result{RequeueAfter: healthCheckInterval}, nil
-	}
-
-	count, bumpErr := r.bumpHealthMisses(ctx, env)
-	if bumpErr != nil {
-		logger.Error(bumpErr, "bumpHealthMisses failed; continuing without budget enforcement")
-	}
-	if r.Recorder != nil {
-		r.Recorder.Eventf(env, corev1.EventTypeWarning, dfaasv1.EnvReasonSSHUnreachable,
-			"SSH :22 unreachable for nodes %v (attempt %d/%d)", unreachable, count, healthRetryBudget)
-	}
-	if count >= healthRetryBudget {
-		logger.Info("Ready environment nodes unreachable; transitioning to Failed",
-			"nodes", unreachable, "attempts", count)
-		logStatusErr(ctx, "mark NodesReachable=False (budget exhausted)", r.markNodesUnreachable(ctx, env,
-			fmt.Sprintf("SSH :22 dial failed for %v after %d consecutive health checks", unreachable, count)))
-		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
-	}
-	logger.Info("Ready environment nodes unreachable; will retry",
-		"nodes", unreachable, "attempts", count)
-	logStatusErr(ctx, "mark NodesReachable=False (retrying)", r.markNodesUnreachable(ctx, env,
-		fmt.Sprintf("SSH :22 dial failed for %v (attempt %d/%d)", unreachable, count, healthRetryBudget)))
-	return ctrl.Result{RequeueAfter: healthRetryInterval}, nil
-}
-
-// markNodesReachable stamps NodesReachable=True and refreshes lastHealthCheck
-// in a single status update (one write per healthy round → one re-enqueue,
-// caught by the throttle).
-func (r *EnvironmentReconciler) markNodesReachable(ctx context.Context,
-	env *dfaasv1.Environment) error {
-	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
-		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
-			Type:    dfaasv1.EnvCondNodesReachable,
-			Status:  metav1.ConditionTrue,
-			Reason:  dfaasv1.EnvReasonSSHReachable,
-			Message: "live SSH liveness OK: all declared nodes reachable on :22",
-		})
-		now := metav1.Now()
-		latest.Status.LastHealthCheck = &now
-		return nil
-	})
-}
-
-// markNodesUnreachable stamps NodesReachable=False with msg and refreshes
-// lastHealthCheck in a single status update.
-func (r *EnvironmentReconciler) markNodesUnreachable(ctx context.Context,
-	env *dfaasv1.Environment, msg string) error {
-	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
-		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
-			Type:    dfaasv1.EnvCondNodesReachable,
-			Status:  metav1.ConditionFalse,
-			Reason:  dfaasv1.EnvReasonSSHUnreachable,
-			Message: msg,
-		})
-		now := metav1.Now()
-		latest.Status.LastHealthCheck = &now
-		return nil
-	})
-}
-
-// bumpHealthMisses increments the consecutive Ready-state unreachable counter,
-// generation-scoped (a spec edit restarts the budget). Mirrors bumpSSHAttempts
-// but on a dedicated annotation so provisioning state is never clobbered.
-func (r *EnvironmentReconciler) bumpHealthMisses(ctx context.Context,
-	env *dfaasv1.Environment) (int, error) {
-	var n int
-	err := updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
-		func(latest *dfaasv1.Environment) bool {
-			n = bumpGenCounter(latest, healthMissesAnnotation)
-			return true
-		})
-	return n, err
-}
-
-// resetHealthMisses zeroes the health-miss counter for the current generation.
-// No-op when already zero to avoid annotation churn (and a spurious re-enqueue).
-func (r *EnvironmentReconciler) resetHealthMisses(ctx context.Context,
-	env *dfaasv1.Environment) error {
-	return updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
-		func(latest *dfaasv1.Environment) bool {
-			return resetGenCounter(latest, healthMissesAnnotation)
-		})
 }
 
 // reconcileProvisioningInfra runs the dfaas-worker Ansible Job and the k6
@@ -346,22 +155,6 @@ func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 	return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningMonitoring)
 }
 
-// patchAnsibleJobTTL looks up the role-suffixed Ansible Job for env and sets
-// its post-finish TTL. No-op (logs at V1) if the Job is gone — e.g. a phase
-// that was skipped because the role has no nodes, so no Job was ever created.
-func (r *EnvironmentReconciler) patchAnsibleJobTTL(ctx context.Context,
-	env *dfaasv1.Environment, suffix string, ttlSec int32) {
-	var job batchv1.Job
-	name := ansible.JobNameForRole(env, suffix)
-	if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: env.Namespace}, &job); err != nil {
-		if !apierrors.IsNotFound(err) {
-			log.FromContext(ctx).Error(err, "get Ansible Job for TTL patch", "job", name)
-		}
-		return
-	}
-	patchJobTTL(ctx, r.Client, &job, ttlSec)
-}
-
 // reconcileProvisioningMonitoring installs Prometheus + Grafana via Helm,
 // reconciles per-environment scrape targets, and stamps node status. Runs
 // AFTER ProvisioningInfra so worker /metrics endpoints already exist when
@@ -387,262 +180,6 @@ func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Cont
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	return r.setEnvPhase(ctx, env, dfaasv1.EnvReady)
-}
-
-// ansibleJobSpec bundles the role-specific knobs shared by ensureVMsJob and
-// ensureK6Job so the common ensureAnsibleJob body can stamp the right
-// Condition type, reasons and messages for each provisioning stream.
-type ansibleJobSpec struct {
-	role          dfaasv1.NodeRole // node role this Job targets
-	jobSuffix     string           // suffix passed to ansible.JobNameForRole
-	condType      string           // Condition type stamped on env.status
-	skipReason    string           // reason when the role has no nodes
-	skipMessage   string           // message when the role has no nodes
-	succeedReason string           // reason on Job success
-	humanRole     string           // human-readable role name for log/messages
-	libp2pKeys    map[string]string
-}
-
-// ensureVMsJob is the non-advancing variant for the dfaas-worker Ansible
-// Job, used by ProvisioningInfra fan-in. Returns done/failed flags and
-// stamps the DFaaSNodesReady Condition; never calls setEnvPhase.
-func (r *EnvironmentReconciler) ensureVMsJob(ctx context.Context,
-	env *dfaasv1.Environment, libp2pKeys map[string]string) (done bool, failed bool, err error) {
-	return r.ensureAnsibleJob(ctx, env, ansibleJobSpec{
-		role:          dfaasv1.RoleDfaasWorker,
-		jobSuffix:     "vms",
-		condType:      dfaasv1.EnvCondDFaaSNodesReady,
-		skipReason:    dfaasv1.EnvReasonNoWorkers,
-		skipMessage:   "no dfaas-worker nodes in spec — phase skipped",
-		succeedReason: dfaasv1.EnvReasonVMsProvisioned,
-		humanRole:     "dfaas-worker",
-		libp2pKeys:    libp2pKeys,
-	})
-}
-
-// ensureK6Job is the non-advancing variant used by the parallel
-// ProvisioningInfra fan-in. Returns done/failed flags and stamps the K6Ready
-// Condition; never calls setEnvPhase.
-func (r *EnvironmentReconciler) ensureK6Job(ctx context.Context,
-	env *dfaasv1.Environment) (done bool, failed bool, err error) {
-	return r.ensureAnsibleJob(ctx, env, ansibleJobSpec{
-		role:          dfaasv1.RoleK6LoadGenerator,
-		jobSuffix:     "k6",
-		condType:      dfaasv1.EnvCondK6Ready,
-		skipReason:    dfaasv1.EnvReasonNoK6Nodes,
-		skipMessage:   "no k6-load-generator nodes in spec — phase skipped",
-		succeedReason: dfaasv1.EnvReasonK6Provisioned,
-		humanRole:     "k6",
-		libp2pKeys:    nil,
-	})
-}
-
-// ensureAnsibleJob drives one provisioning stream of the parallel
-// ProvisioningInfra fan-in: it creates the role-filtered Ansible Job on first
-// sight, then reports its terminal state via done/failed flags while stamping
-// the per-stream Condition described by spec. It never calls setEnvPhase, so
-// the caller owns the FSM transition once both streams settle.
-//
-// NB: the success TTL is NOT set here. While the sibling Job may still be
-// running, ProvisioningInfra keeps re-reconciling every 10s; a short TTL would
-// let the Job controller delete this finished Job mid-wait, the next call would
-// hit NotFound and recreate it, re-running the playbook. The success TTL is
-// applied once, after the fan-in settles, in reconcileProvisioningInfra.
-func (r *EnvironmentReconciler) ensureAnsibleJob(ctx context.Context,
-	env *dfaasv1.Environment, spec ansibleJobSpec) (done bool, failed bool, err error) {
-	logger := log.FromContext(ctx)
-
-	if !env.HasNodeWithRole(spec.role) {
-		logger.Info("no nodes for role, skipping Ansible phase", "role", spec.humanRole)
-		logStatusErr(ctx, "stamp "+spec.condType+"=True (skipped)", r.setEnvCondition(ctx, env, spec.condType,
-			metav1.ConditionTrue, spec.skipReason, spec.skipMessage))
-		return true, false, nil
-	}
-
-	jobName := ansible.JobNameForRole(env, spec.jobSuffix)
-	var job batchv1.Job
-	getErr := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: env.Namespace}, &job)
-
-	if apierrors.IsNotFound(getErr) {
-		// P7: before kicking off the Job, the observed state is "we haven't
-		// checked yet" — stamp Unknown/JobPending. Replaced by False/
-		// AnsibleRunning once the Job exists.
-		logStatusErr(ctx, "stamp "+spec.condType+"=Unknown (job pending)", r.setEnvCondition(ctx, env, spec.condType,
-			metav1.ConditionUnknown, dfaasv1.EnvReasonJobPending,
-			spec.humanRole+" Ansible Job not yet created"))
-
-		logger.Info("creating Ansible Job", "role", spec.humanRole, "job", jobName)
-		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
-		newJob, secret, jerr := am.CreateJobForRole(ctx, env, spec.role, spec.jobSuffix, spec.libp2pKeys)
-		if jerr != nil {
-			// P2: surface CreateJobForRole failure.
-			logStatusErr(ctx, "stamp "+spec.condType+"=False (build failed)", r.setEnvCondition(ctx, env, spec.condType,
-				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
-				"build "+spec.humanRole+" Ansible Job: "+condMessage(jerr)))
-			return false, false, jerr
-		}
-		if cerr := r.Create(ctx, secret); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
-			// P2.
-			logStatusErr(ctx, "stamp "+spec.condType+"=False (secret create failed)", r.setEnvCondition(ctx, env, spec.condType,
-				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
-				"create "+spec.humanRole+" inventory Secret: "+condMessage(cerr)))
-			return false, false, cerr
-		}
-		if cerr := r.Create(ctx, newJob); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
-			// P2.
-			logStatusErr(ctx, "stamp "+spec.condType+"=False (job create failed)", r.setEnvCondition(ctx, env, spec.condType,
-				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
-				"create "+spec.humanRole+" Ansible Job: "+condMessage(cerr)))
-			return false, false, cerr
-		}
-		logStatusErr(ctx, "stamp "+spec.condType+"=False (job started)", r.setEnvCondition(ctx, env, spec.condType,
-			metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleRunning,
-			spec.humanRole+" Ansible Job started"))
-		return false, false, nil
-	}
-	if getErr != nil {
-		return false, false, getErr
-	}
-
-	// Terminal state is driven by the Job's Complete/Failed Conditions, NOT by
-	// the raw Failed pod count: with BackoffLimit>0 a failed pod is transient
-	// (K8s spawns a retry), so job.Status.Failed counts failed *attempts* while
-	// the Job may still recover. We surface those transient attempts (count +
-	// last failing task) in the Condition message — visible through to Ready.
-	failedCount := job.Status.Failed
-
-	if job.Status.Succeeded > 0 || jobConditionTrue(&job, batchv1.JobComplete) {
-		msg := spec.humanRole + " Ansible Job completed"
-		if failedCount > 0 {
-			msg = fmt.Sprintf("%s after %d failed attempt(s)%s", msg, failedCount,
-				taskSuffix(r.lastFailedTask(ctx, env.Namespace, jobName), " at task: "))
-		}
-		logStatusErr(ctx, "stamp "+spec.condType+"=True (completed)", r.setEnvCondition(ctx, env, spec.condType,
-			metav1.ConditionTrue, spec.succeedReason, msg))
-		return true, false, nil
-	}
-	if jobConditionTrue(&job, batchv1.JobFailed) {
-		patchJobTTL(ctx, r.Client, &job, jobTTLFailureGraceSeconds)
-		msg := fmt.Sprintf("%s Ansible Job failed after %d attempt(s)%s; check logs",
-			spec.humanRole, failedCount, taskSuffix(r.lastFailedTask(ctx, env.Namespace, jobName), " at task: "))
-		logStatusErr(ctx, "stamp "+spec.condType+"=False (job failed)", r.setEnvCondition(ctx, env, spec.condType,
-			metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleFailed, msg))
-		return false, true, nil
-	}
-	// Still running. A failed pod here is mid-backoff, not terminal — keep
-	// waiting, but report the transient retry so the UI shows the hiccup.
-	logger.Info("Ansible Job still running",
-		"role", spec.humanRole,
-		"job", jobName,
-		"active", job.Status.Active,
-		"succeeded", job.Status.Succeeded,
-		"failed", failedCount)
-	msg := spec.humanRole + " Ansible Job in progress"
-	if failedCount > 0 {
-		msg = fmt.Sprintf("%s (%d failed attempt(s), retrying%s)", msg, failedCount,
-			taskSuffix(r.lastFailedTask(ctx, env.Namespace, jobName), "; last task: "))
-	}
-	logStatusErr(ctx, "stamp "+spec.condType+"=False (in progress)", r.setEnvCondition(ctx, env, spec.condType,
-		metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleRunning, msg))
-	return false, false, nil
-}
-
-// ansibleLogTailLines caps how many trailing log lines we pull from a failed
-// Ansible pod. The failure region (TASK header + "fatal: .. FAILED!" + PLAY
-// RECAP) sits at the very end, so we tail rather than read from the top.
-const ansibleLogTailLines int64 = 400
-
-// jobConditionTrue reports whether the Job carries condType (JobComplete or
-// JobFailed) with status True. With BackoffLimit>0 these Conditions — not the
-// raw Failed pod count — define terminal success/failure.
-func jobConditionTrue(job *batchv1.Job, condType batchv1.JobConditionType) bool {
-	for _, c := range job.Status.Conditions {
-		if c.Type == condType && c.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
-}
-
-// taskSuffix renders " <connector><task>" when task is non-empty, else "". Lets
-// callers fold the (best-effort) failing-task name into a Condition message
-// without branching, degrading cleanly to a count-only message.
-func taskSuffix(task, connector string) string {
-	if task == "" {
-		return ""
-	}
-	return connector + task
-}
-
-var ansibleTaskHeaderRe = regexp.MustCompile(`^TASK \[(.+?)\]`)
-
-// lastFailedTask best-effort extracts the name of the Ansible task that failed
-// most recently in a finished pod of the named Job: it lists the Job's pods,
-// reads the newest Failed pod's log tail, and returns the task named by the
-// last "TASK [..]" line preceding a "fatal: .. FAILED!" marker. Returns "" on
-// any error, no match, or when no clientset is wired (e.g. unit tests) — the
-// caller then degrades to a count-only message.
-func (r *EnvironmentReconciler) lastFailedTask(ctx context.Context, namespace, jobName string) string {
-	if r.Clientset == nil {
-		return ""
-	}
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.InNamespace(namespace),
-		client.MatchingLabels{"job-name": jobName}); err != nil {
-		return ""
-	}
-	var newest *corev1.Pod
-	for i := range pods.Items {
-		p := &pods.Items[i]
-		if p.Status.Phase != corev1.PodFailed {
-			continue
-		}
-		if newest == nil || p.CreationTimestamp.After(newest.CreationTimestamp.Time) {
-			newest = p
-		}
-	}
-	if newest == nil {
-		return ""
-	}
-
-	tail := ansibleLogTailLines
-	req := r.Clientset.CoreV1().Pods(namespace).GetLogs(newest.Name, &corev1.PodLogOptions{
-		Container: "ansible-worker",
-		TailLines: &tail,
-	})
-	stream, err := req.Stream(ctx)
-	if err != nil {
-		return ""
-	}
-	defer stream.Close()
-	data, err := io.ReadAll(stream)
-	if err != nil {
-		return ""
-	}
-	return parseFailedTask(string(data))
-}
-
-// parseFailedTask returns the name in the last "TASK [..]" header that precedes
-// the last "FAILED!"/"fatal:" marker in the Ansible log, or "" if there is no
-// failure marker / task header. A failed play aborts at the offending task, so
-// that header is the failing task.
-func parseFailedTask(logs string) string {
-	lines := strings.Split(logs, "\n")
-	failIdx := -1
-	for i, ln := range lines {
-		if strings.Contains(ln, "FAILED!") || strings.HasPrefix(strings.TrimSpace(ln), "fatal:") {
-			failIdx = i
-		}
-	}
-	if failIdx < 0 {
-		return ""
-	}
-	for i := failIdx; i >= 0; i-- {
-		if m := ansibleTaskHeaderRe.FindStringSubmatch(strings.TrimSpace(lines[i])); m != nil {
-			return strings.TrimSpace(m[1])
-		}
-	}
-	return ""
 }
 
 // ensureMonitoring drives the Helm monitoring stack install. P4: after
@@ -718,47 +255,6 @@ func (r *EnvironmentReconciler) resetMonitoringAttempts(ctx context.Context,
 		func(latest *dfaasv1.Environment) bool {
 			return resetPlainCounter(latest, monitoringAttemptsAnnotation)
 		})
-}
-
-// bumpSSHAttempts increments the consecutive SSH-unreachable counter,
-// generation-scoped: a stored generation different from the current one
-// (spec edit) restarts the budget at 1. Returns the count for this generation.
-func (r *EnvironmentReconciler) bumpSSHAttempts(ctx context.Context,
-	env *dfaasv1.Environment) (int, error) {
-	var n int
-	err := updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
-		func(latest *dfaasv1.Environment) bool {
-			n = bumpGenCounter(latest, sshAttemptsAnnotation)
-			return true
-		})
-	return n, err
-}
-
-// resetSSHAttempts zeroes the counter for the current generation on success.
-// No-op when already absent or zero to avoid churn.
-func (r *EnvironmentReconciler) resetSSHAttempts(ctx context.Context,
-	env *dfaasv1.Environment) error {
-	return updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
-		func(latest *dfaasv1.Environment) bool {
-			return resetGenCounter(latest, sshAttemptsAnnotation)
-		})
-}
-
-// patchJobTTL sets Spec.TTLSecondsAfterFinished on a finished Ansible Job
-// to drive Job-controller auto-cleanup. Used with ttlSec=600 on success and
-// ttlSec=86400 (24h grace) on failure. Idempotent: skips when TTL is
-// already set so re-reconciles do not churn.
-func patchJobTTL(ctx context.Context, c client.Client, job *batchv1.Job, ttlSec int32) {
-	if job.Spec.TTLSecondsAfterFinished != nil {
-		return
-	}
-	patched := job.DeepCopy()
-	ttl := ttlSec
-	patched.Spec.TTLSecondsAfterFinished = &ttl
-	if err := c.Patch(ctx, patched, client.MergeFrom(job)); err != nil {
-		log.FromContext(ctx).Error(err, "patch TTL on Ansible Job",
-			"job", job.Name, "ttlSeconds", ttlSec)
-	}
 }
 
 // syncNodeStatus surfaces k6/dfaas node info into status, for fast lookup by
@@ -845,42 +341,6 @@ func (r *EnvironmentReconciler) resetTransientConditions(ctx context.Context,
 			metav1.ConditionUnknown, dfaasv1.EnvReasonUpdating,
 			"spec edited; re-provisioning — condition will be re-evaluated"); err != nil {
 			return err
-		}
-	}
-	return nil
-}
-
-// cleanupStaleGenJobs deletes Ansible Jobs for env whose generation label
-// does not match env.Generation. Idempotent — no-op if no stale Jobs.
-// Used on generation drift to abort old-gen Ansible runs before starting
-// the new one (avoids two Ansible playbooks racing on the same VMs).
-func (r *EnvironmentReconciler) cleanupStaleGenJobs(ctx context.Context,
-	env *dfaasv1.Environment) error {
-	logger := log.FromContext(ctx)
-
-	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs,
-		client.InNamespace(env.Namespace),
-		client.MatchingLabels{ansible.LabelEnvironment: env.Name},
-	); err != nil {
-		return fmt.Errorf("list jobs: %w", err)
-	}
-
-	currentGen := fmt.Sprintf("%d", env.Generation)
-	propagation := metav1.DeletePropagationBackground
-	for i := range jobs.Items {
-		j := &jobs.Items[i]
-		if j.Labels[ansible.LabelGeneration] == currentGen {
-			continue
-		}
-		logger.Info("deleting stale-gen Ansible Job",
-			"job", j.Name,
-			"staleGen", j.Labels[ansible.LabelGeneration],
-			"currentGen", currentGen)
-		if err := r.Delete(ctx, j, &client.DeleteOptions{
-			PropagationPolicy: &propagation,
-		}); err != nil && !apierrors.IsNotFound(err) {
-			logger.Error(err, "delete stale Job", "job", j.Name)
 		}
 	}
 	return nil

@@ -1,0 +1,202 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	dfaasv1 "dfaas-operator/api/v1"
+)
+
+// abortLoadTest performs the multi-cluster cascading abort: best-effort
+// deletes every remote TestRun for lt across all k6-load-generator nodes
+// listed in env.Status.K6Nodes, then marks the central CR terminal as
+// Aborted with Conditions[Ready]=False reason=UserAborted.
+//
+// Target set = union of:
+//   - lt.Status.TestRuns (authoritative for what was successfully dispatched)
+//   - spec.PerNodeLoad with deterministic names (catches TestRuns that exist
+//     remotely but were never stamped into status — e.g. startK6 errored
+//     mid-loop before reaching the status update).
+//
+// Per-node errors are logged but do NOT abort the loop — every node is
+// attempted on each tick. If any node errored we Requeue after 10s and
+// retry the full set (idempotent via DeleteTestRun's IgnoreNotFound).
+// Once ALL targets dispatch cleanly, phase + Condition are stamped.
+func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
+	lt *dfaasv1.LoadTest, env *dfaasv1.Environment,
+	reason, message string) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	k6Index := computeK6NodeIndex(env)
+
+	type target struct{ nodeID, secretName, trName, trNs string }
+	targets := map[string]target{}
+	for _, ref := range lt.Status.TestRuns {
+		k6Node, ok := k6Index[ref.NodeID]
+		if !ok || k6Node.KubeconfigSecret == "" {
+			continue
+		}
+		targets[ref.NodeID+"|"+ref.Name] = target{
+			nodeID: ref.NodeID, secretName: k6Node.KubeconfigSecret,
+			trName: ref.Name, trNs: ref.Namespace,
+		}
+	}
+	for _, perNode := range lt.Spec.PerNodeLoad {
+		k6Node, ok := k6Index[perNode.NodeID]
+		if !ok || k6Node.KubeconfigSecret == "" {
+			continue
+		}
+		trName := fmt.Sprintf("%s-%s", lt.Name, sanitize(perNode.NodeID))
+		targets[perNode.NodeID+"|"+trName] = target{
+			nodeID: perNode.NodeID, secretName: k6Node.KubeconfigSecret,
+			trName: trName, trNs: "default",
+		}
+	}
+
+	var failed int
+	for _, t := range targets {
+		secretRef := types.NamespacedName{Name: t.secretName, Namespace: lt.Namespace}
+		remoteKey := types.NamespacedName{Name: t.trName, Namespace: t.trNs}
+		if err := r.Dispatcher.DeleteTestRun(ctx, secretRef, remoteKey); err != nil {
+			logger.Error(err, "remote TestRun delete failed",
+				"node", t.nodeID, "testRun", t.trName)
+			failed++
+			continue
+		}
+		logger.Info("remote TestRun aborted", "node", t.nodeID, "testRun", t.trName)
+	}
+	if failed > 0 {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// MetricsExported never ran on abort — stamp False/Skipped per P9 so
+	// UI does not show "in flight" forever on the aborted CR.
+	logStatusErr(ctx, "stamp MetricsExported=False (export skipped)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+		metav1.ConditionFalse, dfaasv1.LTReasonExportSkipped,
+		"no exporter ran — test was aborted"))
+	logStatusErr(ctx, "stamp Ready=False (aborted)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondReady, metav1.ConditionFalse,
+		reason, message))
+	return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestAborted)
+}
+
+// handleLoadTestDeletion is the finalizer flow triggered by a non-zero
+// DeletionTimestamp. It guarantees remote TestRun cleanup before allowing
+// K8s GC to remove the central CR — closes the "kubectl delete loadtest
+// orphans remote runs" gap.
+//
+// Steps:
+//  1. If our finalizer is absent, nothing to do.
+//  2. Fetch the parent Environment. NotFound → remote kubeconfig Secrets
+//     are gone with it, no way to delete remote TestRuns. Just remove the
+//     finalizer and let the CR go.
+//  3. Drive abortLoadTest (reason=UserAborted) to issue DeleteTestRun
+//     against every node in spec ∪ status. abortLoadTest itself transitions
+//     phase to Aborted on the first clean sweep; we don't care about that
+//     terminal state here — we care that DeleteTestRun was issued.
+//  4. Poll: GetTestRun against every entry in spec ∪ status. When all
+//     report NotFound, remove the finalizer and return. Until then,
+//     RequeueAfter 3s.
+func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
+	lt *dfaasv1.LoadTest) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if !controllerutil.ContainsFinalizer(lt, loadTestFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	// Look up the parent Environment (same pattern as Reconcile body).
+	var env dfaasv1.Environment
+	envKey := types.NamespacedName{Name: lt.Spec.TargetEnvironment, Namespace: lt.Namespace}
+	err := r.Get(ctx, envKey, &env)
+	if apierrors.IsNotFound(err) {
+		// Environment already gone — kubeconfig Secrets cascade with it.
+		// Best-effort done; release the CR.
+		logger.Info("environment gone during loadtest deletion — releasing finalizer",
+			"env", lt.Spec.TargetEnvironment)
+		controllerutil.RemoveFinalizer(lt, loadTestFinalizer)
+		return ctrl.Result{}, r.Update(ctx, lt)
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Issue remote DeleteTestRun across the target set. abortLoadTest is
+	// idempotent: DeleteTestRun uses IgnoreNotFound under the hood, and the
+	// helper transitions phase → Aborted as a side effect. We ignore the
+	// returned Result and run our own NotFound poll below.
+	if _, abortErr := r.abortLoadTest(ctx, lt, &env, dfaasv1.LTReasonUserAborted,
+		"LoadTest aborted on user delete"); abortErr != nil {
+		logger.Error(abortErr, "abortLoadTest during deletion failed; will retry")
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	// Poll: every TestRun in spec ∪ status must report NotFound on the
+	// remote cluster before we drop the finalizer. Mirrors the abort target
+	// set construction so a partial-dispatch ride-along is also covered.
+	k6Index := computeK6NodeIndex(&env)
+	type pollTarget struct{ secretName, trName, trNs string }
+	targets := map[string]pollTarget{}
+	for _, ref := range lt.Status.TestRuns {
+		k6Node, ok := k6Index[ref.NodeID]
+		if !ok || k6Node.KubeconfigSecret == "" {
+			continue
+		}
+		targets[ref.NodeID+"|"+ref.Name] = pollTarget{
+			secretName: k6Node.KubeconfigSecret,
+			trName:     ref.Name,
+			trNs:       ref.Namespace,
+		}
+	}
+	for _, perNode := range lt.Spec.PerNodeLoad {
+		k6Node, ok := k6Index[perNode.NodeID]
+		if !ok || k6Node.KubeconfigSecret == "" {
+			continue
+		}
+		trName := fmt.Sprintf("%s-%s", lt.Name, sanitize(perNode.NodeID))
+		targets[perNode.NodeID+"|"+trName] = pollTarget{
+			secretName: k6Node.KubeconfigSecret,
+			trName:     trName,
+			trNs:       "default",
+		}
+	}
+
+	for _, t := range targets {
+		secretRef := types.NamespacedName{Name: t.secretName, Namespace: lt.Namespace}
+		remoteKey := types.NamespacedName{Name: t.trName, Namespace: t.trNs}
+		_, err := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey)
+		if err == nil {
+			// Still present — keep polling.
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			// Transient (kubeconfig parse, network, etc). Keep polling rather
+			// than wedge the CR; the finalizer guarantees we revisit.
+			logger.Error(err, "remote TestRun NotFound-poll errored",
+				"node", t.trName)
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+	}
+
+	// Every target NotFound on its remote — safe to release.
+	logger.Info("all remote TestRuns reclaimed — removing loadtest finalizer")
+	controllerutil.RemoveFinalizer(lt, loadTestFinalizer)
+	return ctrl.Result{}, r.Update(ctx, lt)
+}
