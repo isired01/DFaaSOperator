@@ -57,21 +57,27 @@ state "Environment FSM" as EnvFSM <<EnvRoot>> #A5D6A7 ##[bold]1B5E20 {
 
   state Ready
   Ready : Ready=True/AllSubsystemsReady
+  Ready : NodesReachable=True/SSHReachable (probe periodico)
 
-  state Degraded <<Degraded>>
-  Degraded : Ready=False/Degraded
+  state Unreachable
+  Unreachable : Ready=False/SSHUnreachable
+  Unreachable : NodesReachable=False/SSHUnreachable
 
   state Failed <<Error>>
   Failed : Ready=False/Failed
 
   Idle --> ProvisioningVMs
   ProvisioningVMs --> ProvisioningInfra : SSH OK su tutti host
+  ProvisioningVMs --> Unreachable : SSH KO dopo sshRetryBudget=3
   ProvisioningInfra --> ProvisioningMonitoring : entrambi Ansible Job Succeeded
   ProvisioningInfra --> Failed : Ansible Job Failed (post fan-in)
   ProvisioningMonitoring --> Ready : Helm + Check + syncNodeStatus OK
-  ProvisioningMonitoring --> Degraded : monitoringRetryBudget esaurito
+  ProvisioningMonitoring --> Failed : monitoringRetryBudget=5 esaurito
+  Ready --> Unreachable : SSH KO dopo healthRetryBudget=3
+  Unreachable --> Ready : nodi di nuovo raggiungibili (infra gia' su)
+  Unreachable --> ProvisioningInfra : nodi raggiungibili, infra da rifare
   Ready --> ProvisioningVMs : drift spec.generation
-  Degraded --> ProvisioningVMs : drift spec.generation
+  Unreachable --> ProvisioningVMs : drift spec.generation
   Failed --> ProvisioningVMs : drift spec.generation
 }
 
@@ -86,10 +92,10 @@ state "LoadTest FSM" as LTFSM <<LTRoot>> #CE93D8 ##[bold]4A148C {
   state Pending
   Pending : EnvironmentLinked=True/EnvFound
   Pending : Ready=False/Pending
+  Pending : Queued=False/EnvBusy|QueuedBehind (coda per-Environment)
 
   state Running
   Running : K6Dispatched=True/AllDispatched
-  Running : SpecLocked=True/PostStart
 
   state Exporting
   Exporting : K6Healthy=True/AllFinished
@@ -107,8 +113,8 @@ state "LoadTest FSM" as LTFSM <<LTRoot>> #CE93D8 ##[bold]4A148C {
   Aborted : MetricsExported=False/Skipped
   Aborted : Ready=False/Aborted
 
-  Pending --> Pending : suspended=true (DraftSaved) | startAt>now (ScheduledArmed)
-  Pending --> Running : env Ready|Degraded AND !suspended AND startAt scaduto
+  Pending --> Pending : suspended=true (draft) | startAt>now (Scheduled/ScheduledArmed) | in coda (Queued)
+  Pending --> Running : env Ready|Degraded AND !suspended AND startAt scaduto AND front di coda
   Pending --> LTFailed : env NotFound | env Failed
   Pending --> Aborted : stop=true (abort draft)
   Running --> Exporting : tutti TestRun in finished|stopped

@@ -6,10 +6,15 @@ Chart version      : {{ .Chart.Version }}
 App version        : {{ .Chart.AppVersion }}
 
 IMPORTANT — CRDs are NOT installed by this chart. Apply them once before
-creating any Environment or LoadTest:
+creating any Environment or LoadTest, either from a repo checkout:
 
-  kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v{{ .Chart.AppVersion }}/dfaas.dfaas.io_environments.yaml
-  kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v{{ .Chart.AppVersion }}/dfaas.dfaas.io_loadtests.yaml
+  kubectl apply -f config/crd/bases/dfaas.dfaas.io_environments.yaml
+  kubectl apply -f config/crd/bases/dfaas.dfaas.io_loadtests.yaml
+
+or from the matching release assets (replace <version> with the release you installed):
+
+  kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_environments.yaml
+  kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_loadtests.yaml
 
 {{- if .Values.ui.enabled }}
 

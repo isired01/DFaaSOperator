@@ -8,7 +8,8 @@ spec:
   # s3ConfigRef is optional. When set, every LoadTest targeting this
   # Environment uploads its metrics CSV to the S3 endpoint registered as
   # Secret "dfaas-s3/<name>" (label dfaas.io/s3-config=true). When unset,
-  # the exporter dumps the CSV to its Pod stdout.
+  # the exporter uses the built-in in-cluster SeaweedFS sink
+  # ("seaweedfs-default") — no S3 setup required.
   # s3ConfigRef:
   #   name: example-s3
   nodes:

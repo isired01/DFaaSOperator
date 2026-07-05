@@ -33,7 +33,7 @@ import (
 const monitoringAttemptsAnnotation = "dfaas.dfaas.io/monitoring-attempts"
 
 // monitoringRetryBudget is the max consecutive Helm install failures
-// tolerated before the Environment is moved to EnvDegraded (P4 + P5).
+// tolerated before the Environment is moved to EnvFailed (P4).
 const monitoringRetryBudget = 5
 
 // handleEnvDeletion drains per-environment cluster-wide state (Prometheus
@@ -167,10 +167,12 @@ func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Cont
 		return ctrl.Result{}, err
 	}
 	if failed {
-		// P5: infra is up at this stage (we arrived from ProvisioningInfra
-		// success); monitoring is terminally broken. Drop to Degraded
-		// rather than Failed so LoadTests are still permitted.
-		return r.setEnvPhase(ctx, env, dfaasv1.EnvDegraded)
+		// Monitoring (incl. the SeaweedFS S3 sink) is required: a terminally
+		// broken monitoring stack fails the Environment rather than degrading it,
+		// so the operator surfaces it loudly instead of leaving a half-usable env.
+		// Failed is terminal — no auto-retry; recovery is a spec edit or
+		// delete+recreate (see the EnvFailed case in environment_controller.go).
+		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
 	}
 	if !done {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -184,7 +186,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Cont
 
 // ensureMonitoring drives the Helm monitoring stack install. P4: after
 // monitoringRetryBudget consecutive failures, returns failed=true so the
-// caller transitions the Environment to EnvDegraded. Resets the counter on
+// caller transitions the Environment to EnvFailed. Resets the counter on
 // every successful round-trip.
 func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 	env *dfaasv1.Environment) (done bool, failed bool, err error) {

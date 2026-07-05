@@ -51,6 +51,7 @@ class EnvironmentSpec {
 class EnvironmentStatus {
     + EnvironmentPhase phase
     + int64 observedGeneration
+    + metav1.Time lastHealthCheck
     + List<K6NodeStatus> k6Nodes
     + List<String> dfaasNodes
     + List<metav1.Condition> conditions
@@ -163,6 +164,7 @@ enum EnvironmentPhase {
     ProvisioningInfra
     ProvisioningMonitoring
     Ready
+    Unreachable
     Degraded
     Failed
 }
@@ -213,19 +215,17 @@ enum "EnvConditionType <<Conditions>>" as EnvConditionType {
     K6Ready
     InfrastructureReady
     MonitoringReady
-    DependenciesReady
-    Updating
+    NodesReachable
 }
 
 enum "LTConditionType <<Conditions>>" as LTConditionType {
     Ready
-    Suspended
     EnvironmentLinked
     Scheduled
+    Queued
     K6Dispatched
     K6Healthy
     MetricsExported
-    SpecLocked
 }
 
 ' =====================================================================

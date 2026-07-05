@@ -130,8 +130,8 @@ type EnvironmentSpec struct {
 	// registered in namespace "dfaas-s3" (Secret with label
 	// "dfaas.io/s3-config=true"). When set, LoadTests targeting this
 	// Environment export their metrics CSV to that S3 endpoint under a
-	// bucket derived from the Environment name. When nil, the exporter
-	// falls back to dumping the CSV to its Pod stdout.
+	// bucket derived from the Environment name. When nil, LoadTests export
+	// to the built-in in-cluster SeaweedFS sink ("seaweedfs-default").
 	// +optional
 	S3ConfigRef *S3ConfigRef `json:"s3ConfigRef,omitempty"`
 }

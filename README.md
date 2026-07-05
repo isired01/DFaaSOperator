@@ -4,27 +4,46 @@ Kubebuilder-scaffolded Kubernetes operator (Go 1.25, controller-runtime v0.17.3)
 
 The operator ships as a single Deployment that runs **two controllers** against two CRDs in `dfaas.dfaas.io/v1`:
 
-- **`Environment`** — federation infrastructure. Provisions VMs (dfaas-worker nodes + k6-load-generator nodes) and the operator-cluster monitoring stack. Long-lived: once `Ready`, it stays idle until the spec changes.
+- **`Environment`** — federation infrastructure. Provisions VMs (dfaas-worker nodes + k6-load-generator nodes) and the operator-cluster monitoring stack. Long-lived: once `Ready` it re-reconciles on spec changes, and a periodic SSH liveness probe keeps watching the nodes — if they stop answering it drops to the non-terminal `Unreachable` phase and auto-recovers when they return.
 - **`LoadTest`** — one k6 load test against an `Environment`. Looks up its `targetEnvironment`, waits until it is `Ready`, dispatches one remote k6 `TestRun` per k6-load-generator node, then runs a metrics exporter Job.
 
 ## Install via Helm
 
 Prereqs: K8s ≥ 1.25, `kubectl` connected to the cluster, `helm` ≥ 3.8 (for OCI), anonymous pull from `ghcr.io` reachable from the cluster.
 
-### Step 1 — Installa operator + UI via Helm
+### Step 1 — Install the CRDs
+
+The Helm chart does **not** package the CRDs, so install them once before anything else. From a repo checkout:
+
+```bash
+kubectl apply -f config/crd/bases/dfaas.dfaas.io_environments.yaml
+kubectl apply -f config/crd/bases/dfaas.dfaas.io_loadtests.yaml
+```
+
+Or, for a published release, from the release assets (replace `0.1.0` with the release you are installing):
+
+```bash
+kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v0.1.0/dfaas.dfaas.io_environments.yaml
+kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v0.1.0/dfaas.dfaas.io_loadtests.yaml
+```
+
+### Step 2 — Install operator + UI via Helm
 
 ```bash
 helm install dfaas oci://ghcr.io/isired01/charts/dfaas \
-  --version 1.0.0 \
+  --version 0.1.0 \
   --create-namespace \
   --namespace dfaas-operator-system
+
+# Alternatively, install the chart straight from a repo checkout:
+# helm install dfaas ./charts/dfaas --create-namespace --namespace dfaas-operator-system
 
 # Open the UI:
 kubectl -n dfaas-ui port-forward svc/dfaas-ui 8082:8082
 open http://localhost:8082
 ```
 
-### Step 2 — Create your first Custom Resources
+### Step 3 — Create your first Custom Resources
 
 Ready-made examples in [`config/samples/`](config/samples/):
 
@@ -36,15 +55,19 @@ Ready-made examples in [`config/samples/`](config/samples/):
 ```yaml
 spec:
   nodes:
-    - id: dfaas-worker-1
+    - nodeID: dfaas-worker-1
       role: dfaas-worker
+      capacity: MEDIUM
       ipAddress: 10.0.0.5      # <— replace with the real IP
-      sshUser: ubuntu
-      sshPassword: ...
+      username: ubuntu
+      password: ...
       # ...
-    - id: k6-load-generator-1
+    - nodeID: k6-load-generator-1
       role: k6-load-generator
+      capacity: HIGH
       ipAddress: 10.0.0.6      # <— replace with the real IP
+      username: ubuntu
+      password: ...
       # ...
 ```
 
@@ -59,7 +82,7 @@ kubectl apply -f config/samples/dfaas_v1_loadtest.yaml
 ### Override values
 
 ```bash
-helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 1.0.0 \
+helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 0.1.0 \
   --set operator.replicas=2 \
   --set ui.ingress.enabled=true \
   --set ui.ingress.host=dfaas.mio-cluster.example
@@ -68,12 +91,13 @@ helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 1.0.0 \
 ### Upgrade
 
 ```bash
-# Upgrade ONLY operator + UI:
-helm upgrade dfaas oci://ghcr.io/isired01/charts/dfaas --version 1.1.0
+# Upgrade ONLY operator + UI (replace <version> with the target release):
+helm upgrade dfaas oci://ghcr.io/isired01/charts/dfaas --version <version>
 
-# If the new release ships modified CRDs, apply them manually BEFORE the chart upgrade:
-kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v1.1.0/dfaas.dfaas.io_environments.yaml
-kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v1.1.0/dfaas.dfaas.io_loadtests.yaml
+# The chart never manages CRDs. If the new release ships modified CRDs, apply them
+# manually BEFORE the chart upgrade:
+kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_environments.yaml
+kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_loadtests.yaml
 ```
 
 ### Uninstall
@@ -107,8 +131,9 @@ kubectl delete crd environments.dfaas.dfaas.io loadtests.dfaas.dfaas.io
               v                              +-------+--------+
        Environment.Ready                     | Exporter Job   |
                                              | Prometheus →   |
-                                             | CSV (stdout/   |
-                                             |  S3 bucket)    |
+                                             | CSV → S3 sink  |
+                                             | (SeaweedFS by  |
+                                             |  default)      |
                                              +----------------+
 ```
 
@@ -116,23 +141,27 @@ kubectl delete crd environments.dfaas.dfaas.io loadtests.dfaas.dfaas.io
 
 ### `Environment`
 ```
-"" / Idle / Failed → ProvisioningVMs            → ProvisioningInfra                              → ProvisioningMonitoring → Ready
-                     (no-op placeholder)          ├─ Ansible dfaas-worker Job ─┐                  (Helm install seq)
+"" / Idle / Failed → ProvisioningVMs            → ProvisioningInfra                              → ProvisioningMonitoring → Ready ⇄ Unreachable
+                     (SSH :22 reachability)       ├─ Ansible dfaas-worker Job ─┐                  (Helm install seq)         (periodic SSH probe)
                                                   └─ Ansible k6-load-gen Job  ─┘  parallel; fan-in
 ```
-`ProvisioningVMs` is a no-op placeholder for future VM-lifecycle integration (terraform / cloud-init / Cluster API). `ProvisioningInfra` runs the two Ansible Jobs concurrently and advances only when **both** terminate; if either fails the surviving stream is still allowed to finish, then the phase becomes `Failed` with per-component `DFaaSNodesReady` / `K6Ready` Conditions for granular diagnosis. `ProvisioningMonitoring` is sequential: Helm install Prometheus + Grafana + scrape-target reconcile.
+`ProvisioningVMs` TCP-dials `<ip>:22` on every declared node to confirm SSH reachability (2 s timeout per host); it advances once all answer, and after `sshRetryBudget=3` consecutive unreachable rounds it drops to the non-terminal `Unreachable` phase (not `Failed`). `ProvisioningInfra` runs the two Ansible Jobs concurrently and advances only when **both** terminate; if either fails the surviving stream is still allowed to finish, then the phase becomes `Failed` with per-component `DFaaSNodesReady` / `K6Ready` Conditions for granular diagnosis. `ProvisioningMonitoring` is sequential: Helm install Prometheus + Grafana, then SeaweedFS (raw manifest) + scrape-target reconcile.
 
-Re-provisioning only runs when `spec.generation` changes. A finalizer (`dfaas.dfaas.io/environment-finalizer`) cleans per-environment Prometheus scrape-target entries on delete. Ansible Jobs auto-cleanup with `TTLSecondsAfterFinished=600` on success and `86400` (24h) on failure.
+Once `Ready` the Environment is **not idle**: `reconcileReadyHealth` re-runs the SSH probe every `healthCheckInterval` (60 s), stamps `status.lastHealthCheck` + the `NodesReachable` condition, and after `healthRetryBudget=3` consecutive misses transitions to `Unreachable`. `Unreachable` is non-terminal — the reconciler re-probes every `unreachableRetryInterval` (30 s) indefinitely and auto-recovers to `Ready` (or resumes provisioning) when the nodes answer again.
+
+Re-provisioning only runs when `spec.generation` changes (generation drift resets the six subsystem conditions to `Unknown` with reason `Updating`). A finalizer (`dfaas.dfaas.io/environment-finalizer`) cleans per-environment Prometheus scrape-target entries on delete. Each LoadTest is stamped with an OwnerReference to its target Environment, so **deleting an Environment cascade-deletes all of its LoadTests**. Ansible Jobs are named `<env>-infra-<role>-<uid8>-g<generation>-job` and auto-cleanup with `TTLSecondsAfterFinished=600` on success and `86400` (24h) on failure.
 
 ### `LoadTest`
 ```
-Pending (Conditions[Suspended]=True)   ← Save as Draft (spec.suspended=true)
-   on PATCH spec.suspended=false (or scheduled spec.startAt fires):
+Pending   ← Save as Draft (spec.suspended=true)  |  waiting for env Ready  |  queued behind a sibling
+   on PATCH spec.suspended=false (or scheduled spec.startAt fires) AND the env is free:
 Pending → Running → Exporting → Completed
                               ↘ Failed
    spec.stop=true  OR  kubectl delete (finalizer)  → Aborted   (remote TestRuns deleted)
 ```
-The reconciler watches the target `Environment`: a Pending LoadTest auto-resumes when the env reaches `Ready`. A LoadTest created with `spec.suspended: true` (used by the UI for "Save as Draft") stays at `Pending` with `Conditions[Suspended]=True` until the user PATCHes `spec.suspended: false`; mirrors `batch/v1.Job.spec.suspend`. `spec.startAt` schedules a future start (the reconciler flips `suspended=false` when the time arrives). Run-once: once the LoadTest enters `Running`/`Exporting`/`Completed`/`Failed`, further changes to `spec.suspended` are ignored.
+The reconciler watches the target `Environment`: a Pending LoadTest auto-resumes when the env reaches `Ready`. A LoadTest created with `spec.suspended: true` (used by the UI for "Save as Draft") stays at `Pending` until the user PATCHes `spec.suspended: false`; the draft/waiting distinction is read from `spec.suspended` itself — there is **no** `Suspended` condition. `spec.startAt` schedules a future start, and **requires `spec.suspended: true`**: the reconciler PATCHes `suspended=false` at fire time once the env is `Ready` (a `startAt` on a non-suspended LoadTest is ignored and the test starts immediately). Run-once: once the LoadTest enters `Running`/`Exporting`/`Completed`/`Failed`, further changes to `spec.suspended` are ignored.
+
+**One test per Environment (FIFO queue).** `envOccupancyGate` serializes LoadTests sharing an `Environment`: while one is `Running`/`Exporting`, newly-eligible siblings are held at `Pending` with the `Queued` condition (reasons `EnvBusy` / `QueuedBehind` / `Dispatching`, oldest `creationTimestamp` first, re-checked every 10 s) and dispatched one at a time.
 
 **Abort & deletion.** PATCH `spec.stop=true` (allowed in `Pending`/`Running`) deletes every remote `TestRun` and transitions to the terminal `Aborted`, keeping the CR as an audit record. A finalizer (`dfaas.dfaas.io/loadtest-finalizer`) runs the same remote cleanup on `kubectl delete`, so no remote run is orphaned on any deletion path.
 
@@ -151,32 +180,34 @@ The two signals are kept in sync by `setEnvPhase` / `setLoadTestPhase`, which st
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | *empty* / `Idle`         | First observation; reconciler has not yet acted.                                                                                                                                                              | → `ProvisioningVMs` on next tick.                                                                   |
 | `ProvisioningVMs`        | TCP-dials `<ip>:22` on every declared node to confirm SSH reachability (2 s timeout per host).                                                                                                                | → `ProvisioningInfra` once all reachable; requeue every 10 s otherwise.                             |
-| `ProvisioningInfra`      | Two Ansible Jobs run in parallel: `<env>-infra-vms-job` (dfaas-worker setup) and `<env>-infra-k6-job` (k3s + k6-operator install + kubeconfig push-back).                                                     | → `ProvisioningMonitoring` on both `Succeeded`; → `Failed` if either reports `Failed` after fan-in. |
-| `ProvisioningMonitoring` | Helm-installs Prometheus + Grafana on the management cluster, reconciles per-environment scrape targets, then surfaces `status.k6Nodes[]`.                                                                    | → `Ready` on success; → `Degraded` after `monitoringRetryBudget=5` consecutive Helm failures.       |
-| `Ready`                  | Infrastructure + monitoring are up; `status.observedGeneration` is stamped, future ticks short-circuit.                                                                                                       | → `ProvisioningVMs` on spec edit (generation drift).                                                |
-| `Degraded`               | dfaas + k6 infra are up but the monitoring stack failed terminally. LoadTests are **still permitted** — the exporter step will surface the missing metrics. Recoverable only by spec edit or delete+recreate. | → `ProvisioningVMs` on spec edit.                                                                   |
-| `Failed`                 | Terminal failure in `ProvisioningInfra` (one of the Ansible Jobs reported `Failed`).                                                                                                                          | → `ProvisioningVMs` on spec edit; no automatic retry.                                               |
+| `ProvisioningInfra`      | Two Ansible Jobs run in parallel: `<env>-infra-dfaas-worker-<uid8>-g<gen>-job` (dfaas-worker setup) and `<env>-infra-k6-load-generator-<uid8>-g<gen>-job` (k3s + k6-operator install + kubeconfig push-back). | → `ProvisioningMonitoring` on both `Succeeded`; → `Failed` if either reports `Failed` after fan-in. |
+| `ProvisioningMonitoring` | Helm-installs Prometheus + Grafana on the management cluster, deploys SeaweedFS, reconciles per-environment scrape targets, then surfaces `status.k6Nodes[]`.                                                  | → `Ready` on success; → `Failed` after `monitoringRetryBudget=5` consecutive Helm failures.         |
+| `Ready`                  | Infrastructure + monitoring are up; `status.observedGeneration` is stamped. **Not idle** — a periodic SSH liveness probe runs (see `NodesReachable` below).                                                    | → `ProvisioningVMs` on spec edit (generation drift); → `Unreachable` after `healthRetryBudget=3` failed probe rounds. |
+| `Unreachable`            | **Non-terminal.** Nodes stopped answering SSH (`:22`) — entered from `ProvisioningVMs` (after `sshRetryBudget=3`) or from `Ready` (after `healthRetryBudget=3`). The reconciler re-probes every 30 s indefinitely. | → `Ready` when the nodes answer again and infra is already up; → `ProvisioningInfra` otherwise; → `ProvisioningVMs` on spec edit. Never self-transitions to `Failed`. |
+| `Failed`                 | Terminal failure in `ProvisioningInfra` (an Ansible Job reported `Failed`) or in `ProvisioningMonitoring` (Helm retry budget exhausted).                                                                       | → `ProvisioningVMs` on spec edit; no automatic retry.                                               |
+| `Degraded`               | Reserved phase constant. The reconciler **no longer transitions into it** — terminal monitoring failure now goes to `Failed`. Still recognised downstream (a LoadTest may dispatch against a `Degraded` env).  | (not currently entered)                                                                             |
 
 ### `Environment` conditions
 
 | Type                  | Purpose                                                                                                  | Reasons (status)                                                                                                                                                                                                                  |
 | --------------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Ready`               | Top-level aggregator. Lets consumers run `kubectl wait --for=condition=Ready environment/foo`.           | `AllSubsystemsReady` (True), `Provisioning` (False), `Degraded` (False), `Failed` (False), `Initializing` (Unknown).                                                                                                              |
+| `Ready`               | Top-level aggregator. Lets consumers run `kubectl wait --for=condition=Ready environment/foo`.           | `AllSubsystemsReady` (True), `Provisioning` (False), `SSHUnreachable` (False — set for the `Unreachable` phase), `Failed` (False), `Initializing` (Unknown).                                                                       |
 | `VMsReady`            | SSH reachability probe outcome.                                                                          | `SSHReachable` (True), `SSHUnreachable` (False), `Skipped` (True, when `spec.nodes` is empty).                                                                                                                                    |
 | `DFaaSNodesReady`     | dfaas-worker Ansible Job lifecycle.                                                                      | `NoWorkers` (True), `JobPending` (Unknown — Job not yet created), `AnsibleRunning` (False), `VMsProvisioned` (True), `AnsibleFailed` (False), `JobCreationFailed` (False — `r.Create(Job)` returned a non-`AlreadyExists` error). |
 | `K6Ready`             | k6 Ansible Job lifecycle.                                                                                | Same shape as `DFaaSNodesReady`, swap `VMsProvisioned`→`K6Provisioned` and `NoWorkers`→`NoK6Nodes`.                                                                                                                               |
 | `InfrastructureReady` | Roll-up over the two Ansible Jobs.                                                                       | `InfraReady` (True), `InfraFailed` (False).                                                                                                                                                                                       |
-| `MonitoringReady`     | Helm install status of the monitoring stack.                                                             | `HelmInstalling` (Unknown on first observation, then False), `WaitingPods` (False), `PodsRunning` (True), `HelmFailed` (False — `monitoringRetryBudget` exhausted; phase moves to `Degraded`).                                    |
-| `DependenciesReady`   | Catch-all for cross-cutting failures previously swallowed.                                               | `Libp2pKeyError` (False), `NodeStatusError` (False), `InfraReady` (True, set once libp2p keys exist).                                                                                                                             |
-| `Updating`            | Set on generation drift; cleared when the new run settles. UI consumes this for the "Updating…" overlay. | `SpecChanged` (True), `AllSubsystemsReady` (False, cleared on terminal phase).                                                                                                                                                    |
+| `MonitoringReady`     | Helm install status of the monitoring stack.                                                             | `HelmInstalling` (Unknown on first observation, then False), `WaitingPods` (False), `PodsRunning` (True), `HelmFailed` (False — `monitoringRetryBudget` exhausted; phase moves to `Failed`).                                       |
+| `NodesReachable`      | Outcome of the periodic Ready-state SSH (`:22`) liveness probe; also stamps `status.lastHealthCheck`.    | `SSHReachable` (True), `SSHUnreachable` (False — after `healthRetryBudget=3` misses the phase moves to `Unreachable`).                                                                                                            |
+
+> On generation drift the six subsystem conditions above (`Ready` / `VMsReady` / `DFaaSNodesReady` / `K6Ready` / `InfrastructureReady` / `MonitoringReady`) are reset to `Unknown` with reason `Updating`. `Updating`, `SpecChanged`, `Libp2pKeyError`, and `NodeStatusError` are *reason* constants, not condition types — the UI derives its "Updating…" overlay from `observedGeneration < generation`, not from a dedicated condition.
 
 ### `LoadTest` phases
 
 | Phase               | Meaning                                                                                                                                                                  | Exit transitions                                                                                               |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| *empty* / `Pending` | Awaiting Environment readiness, draft activation, or scheduled fire. `spec.suspended` / `spec.startAt` are still honoured here.                                          | → `Running` once `spec.suspended=false` AND env is `Ready` / `Degraded`.                                       |
+| *empty* / `Pending` | Awaiting Environment readiness, draft activation, scheduled fire, or its turn in the per-Environment queue. `spec.suspended` / `spec.startAt` are still honoured here.   | → `Running` once `spec.suspended=false`, env is `Ready` / `Degraded`, and the queue front is free.             |
 | `Running`           | One remote `TestRun` per `spec.perNodeLoad[]` entry has been server-side-applied to each k6-load-generator's k3s. The reconciler polls every 5 s. Spec is now immutable. | → `Exporting` when every remote `TestRun.status.stage ∈ {finished, stopped}`; → `Failed` on any `stage=error`. |
-| `Exporting`         | The in-cluster `<loadtest>-exporter-job` is pulling metrics from management Prometheus over `[startTime, endTime]` and writing the CSV to stdout / S3.                   | → `Completed` on Job success; → `Failed` on Job failure or missing `S3ConfigRef` Secret.                       |
+| `Exporting`         | The in-cluster `<lt>-exporter-<uid8>-g<generation>-job` pulls metrics from management Prometheus over `[startTime, endTime]` and writes the CSV to the Environment's S3 sink (the in-cluster `seaweedfs-default` sink unless `spec.s3ConfigRef` overrides it). | → `Completed` on Job success; → `Failed` on Job failure or a missing explicit `S3ConfigRef` Secret.            |
 | `Completed`         | Terminal success. `status.endTime` set, `MetricsExported=True/ExportSucceeded`.                                                                                          | none (CR kept as historical record).                                                                           |
 | `Failed`            | Terminal failure. Set from any of: env NotFound, dispatch budget exhausted, k6 `stage=error`, exporter Job `Failed`, S3 config missing.                                  | none.                                                                                                          |
 | `Aborted`           | Terminal abort. Set by `spec.stop=true` or by deletion finalizer. Remote `TestRun`s have been deleted; the CR is kept as an audit trail.                                 | none.                                                                                                          |
@@ -189,12 +220,13 @@ The original single `Ready` condition has been split into composable sub-conditi
 | ------------------- | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Ready`             | Top-level aggregator. `kubectl wait --for=condition=Ready loadtest/foo` resolves at the terminal phase.         | `Pending` (False), `Running` (False), `ExporterRunning` (False), `Completed` (True), `Failed` (False), `Aborted` (False).                                                                                                                                                                                                                      |
 | `EnvironmentLinked` | Outcome of the `targetEnvironment` lookup.                                                                      | `EnvFound` (True), `EnvDegraded` (True, advisory — exporter step may fail), `EnvNotFound` (False), `EnvFailed` (False).                                                                                                                                                                                                                        |
-| `Suspended`         | Mirrors `spec.suspended` (draft latch). Stamped only on the True→False edge to avoid steady-state status churn. | `DraftSaved` (True), `Activated` (False).                                                                                                                                                                                                                                                                                                      |
 | `Scheduled`         | Lifecycle of `spec.startAt` (scheduled start). Only stamped when `spec.startAt` is set.                         | `ScheduledArmed` (True, fire time still in the future), `ScheduledFired` (True, schedule has fired — the reconciler PATCHed `suspended=false`), `ScheduledDelayedEnvNotReady` (True, fire time elapsed but the env is not ready yet).                                                                                                          |
-| `K6Dispatched`      | Remote `TestRun` apply progress.                                                                                | `Pending` (Unknown — nothing applied yet), `InFlight` (False, message carries `N/M`), `AllDispatched` (True), `ScriptMirrorFailed` / `StaleCleanupFailed` / `ApplyFailed` (False — single-attempt sub-causes, retry budget bookkeeping in the message), `DispatchFailed` (False — `dispatchRetryBudget=5` exhausted; phase moves to `Failed`). |
+| `Queued`            | Per-Environment FIFO gate — set while another LoadTest is occupying the target Environment.                     | `EnvBusy` (False — a sibling is `Running`/`Exporting`), `QueuedBehind` (False — an older Pending sibling is ahead), `Dispatching` (True — this LoadTest is the queue front and may start).                                                                                                                                                     |
+| `K6Dispatched`      | Remote `TestRun` apply progress.                                                                                | `Pending` (Unknown — nothing applied yet), `InFlight` (False, message carries `N/M`), `AllDispatched` (True), `ScriptMirrorFailed` / `StaleCleanupFailed` / `ApplyFailed` (False — single-attempt sub-causes, retry budget bookkeeping in the message), `DispatchFailed` (False — `dispatchRetryBudget=15` exhausted; phase moves to `Failed`). |
 | `K6Healthy`         | k6 execution roll-up. Per-node detail still in `status.testRuns[].phase`.                                       | `Running` (Unknown, message `N/M finished, K error, R running`), `AllFinished` (True), `PartialFailure` (False — some `stage=error`, rest finished), `AllFailed` (False).                                                                                                                                                                      |
 | `MetricsExported`   | Exporter Job outcome.                                                                                           | `ExporterRunning` (Unknown), `ExportSucceeded` (True), `JobFailed` (False), `S3ConfigMissing` (False), `Skipped` (False — set on abort, no exporter ran).                                                                                                                                                                                      |
-| `SpecLocked`        | Documents that `spec` mutations are silently ignored once the test starts.                                      | `Pending` (False, spec is editable), `PostStart` (True — set as soon as phase leaves the pre-execution window).                                                                                                                                                                                                                                |
+
+> The draft latch (`spec.suspended`) and the post-start spec lock are **not** surfaced as conditions — there is no `Suspended` or `SpecLocked` condition type. Read the draft state from `spec.suspended` directly; the run-once immutability is enforced in the reconciler. (`DraftSaved` / `Activated` / `PostStart` exist only as reason constants.)
 
 > **Reading conditions.** The constants for both condition `type` and `reason` strings live in [`api/v1/environment_types.go`](api/v1/environment_types.go) and [`api/v1/loadtest_types.go`](api/v1/loadtest_types.go) (`EnvCond*` / `EnvReason*` / `LTCond*` / `LTReason*`). UI consumers should pin to these constants — string-literal matches against the values listed above are stable, but the underlying names may shift as the contract evolves.
 
@@ -206,7 +238,7 @@ The original single `Ready` condition has been split into composable sub-conditi
 | Data exporter (Prometheus → CSV + optional S3 upload) | `dataExporter/`                          | `ghcr.io/isired01/dfaas-exporter:latest` (multi-arch, separate `Dockerfile`) |
 | Ansible playbooks (worker + k6 provisioning)          | `internal/controller/ansible/templates/` | `alpine/ansible:2.18.6` (see note below)                                     |
 | Monitoring stack (Prometheus + Grafana, Helm-managed) | `internal/controller/monitoring/charts/` | vendored `.tgz` chart bundles                                                |
-| Front-end + API gateway (separate repo)               | `https://github.com/isired01/DFaaS_UI`   | —                                                                            |
+| Front-end + API gateway (separate repo)               | `https://github.com/isired01/UI`         | —                                                                            |
 
 ## 🛠️ Requirements
 
@@ -235,18 +267,20 @@ kubectl apply -f config/samples/dfaas_v1_loadtest.yaml
 
 ## 📊 Metrics export
 
-During the `Exporting` phase, the LoadTestReconciler creates `<loadtest>-exporter-job` running the `dfaas-exporter` image. It pulls metrics from the management-cluster Prometheus over `[startTime, endTime]` (entries come from `spec.metricsExport.metrics`) and writes them to a CSV.
+During the `Exporting` phase, the LoadTestReconciler creates `<lt>-exporter-<uid8>-g<generation>-job` running the `dfaas-exporter` image. It pulls metrics from the management-cluster Prometheus over `[startTime, endTime]` (entries come from `spec.metricsExport.metrics`) and writes them to a CSV.
 
-The destination is decided on the **Environment**, not the LoadTest: every LoadTest targeting a given Environment exports to the same place. Set `Environment.spec.s3ConfigRef.name` to point at an S3 server configuration registered as a labeled Secret in the cluster-scoped `dfaas-s3` namespace.
+The destination is decided on the **Environment**, not the LoadTest: every LoadTest targeting a given Environment exports to the same place. Point `Environment.spec.s3ConfigRef.name` at an S3 server configuration registered as a labeled Secret in the cluster-scoped `dfaas-s3` namespace; leave it unset to use the built-in in-cluster SeaweedFS sink.
 
-| Configuration           | Behaviour                                                                                                                                          |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `s3ConfigRef` **unset** | CSV dumped to stdout between `----- BEGIN CSV -----` / `----- END CSV -----` markers. Retrievable with `kubectl logs job/<loadtest>-exporter-job`. |
-| `s3ConfigRef` **set**   | Exporter `HeadBucket` → `CreateBucket` (when missing) → `PutObject` against the registered endpoint. Bucket name is derived from the Environment.  |
+| Configuration           | Behaviour                                                                                                                                                                                                                     |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `s3ConfigRef` **unset** | Exports to the built-in `seaweedfs-default` config (in-cluster SeaweedFS) — **zero S3 setup required**. Only if that default Secret has been deleted does the exporter fall back to a stdout dump between `----- BEGIN CSV -----` / `----- END CSV -----` markers. |
+| `s3ConfigRef` **set**   | Exporter `HeadBucket` → `CreateBucket` (when missing) → `PutObject` against the registered endpoint. Bucket name is derived from the Environment. A **missing** explicitly-referenced Secret fails the LoadTest (loud, since it was asked for).                    |
 
 **Bucket per environment.** The exporter computes the bucket name deterministically from the Environment name + the first 6 hex chars of the Environment UID, yielding a name like `my-env-a1b2c3` that satisfies S3's 3–63 char DNS rule and avoids global-namespace collisions. The bucket is created on the first LoadTest export and reused for every subsequent one in that Environment. Object key per upload: `metrics/<loadtest-name>/<UTC RFC3339-compact>.csv`.
 
-At LoadTest export time the operator mirrors the referenced Secret into the LoadTest namespace with an OwnerRef → LoadTest, so the local copy cascades on LoadTest delete (cross-namespace Secret mounts are not supported by Kubernetes — the mirror is required).
+**Per-VM k6 logs.** Alongside the metrics CSV, the exporter also ships each k6 runner's end-of-test summary to the same S3 sink under `k6/<loadtest>/<nodeID>-<UTC>.log` (captured per k6-load-generator node during `Exporting`); with no S3 sink these are dumped between per-node stdout markers instead.
+
+At LoadTest export time the operator mirrors the referenced Secret into the LoadTest namespace (cross-namespace Secret mounts are not supported by Kubernetes — the mirror is required). The mirror carries **no OwnerRef**: it is a shared, reusable artifact that any LoadTest against any Environment may consume, so it is not cascade-deleted with a single LoadTest. Orphans are labelled `dfaas.io/s3-config=true` for later cleanup.
 
 ## 🖼️ Image payloads for k6 (in-cluster SeaweedFS + `dfaas-imgproc`)
 

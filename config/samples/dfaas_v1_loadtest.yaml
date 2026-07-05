@@ -5,10 +5,11 @@ metadata:
   namespace: default
 spec:
   targetEnvironment: env-sample
-  # suspended: true   # Save-as-Draft: holds phase=Pending + stamps
-                      # Conditions[Suspended]=True, no k6 dispatch.
-                      # PATCH to false to activate. UI sets this on
-                      # create; default false for plain `kubectl apply`.
+  # suspended: true   # Save-as-Draft: holds phase=Pending (read the draft
+                      # state from spec.suspended — there is no Suspended
+                      # condition), no k6 dispatch. PATCH to false to
+                      # activate. UI sets this on create; default false for
+                      # plain `kubectl apply`. Required if you set startAt.
   # stop: true        # Abort: PATCH spec.stop=true to delete every remote
                       # TestRun across k6 nodes and transition the CR to
                       # the terminal "Aborted" phase (CR persists as
@@ -33,9 +34,9 @@ spec:
         query: rate(node_cpu_seconds_total[1m])
         comment: "CPU usage rate per node (PromQL expression)"
     # CSV destination is decided on the Environment (spec.s3ConfigRef).
-    # When the Environment has no s3ConfigRef, the exporter dumps the CSV
-    # to stdout between markers "----- BEGIN CSV -----" / "----- END CSV -----"
-    # (retrievable via `kubectl logs job/<loadtest>-exporter-job`).
+    # When the Environment has no s3ConfigRef, the exporter writes to the
+    # built-in in-cluster SeaweedFS sink ("seaweedfs-default"); it only
+    # falls back to a stdout dump if that default Secret has been deleted.
 ---
 apiVersion: v1
 kind: ConfigMap

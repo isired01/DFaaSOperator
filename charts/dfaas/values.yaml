@@ -62,9 +62,9 @@ ui:
                                   #   (in-cluster → seaweedfs.monitoring.svc…:8333, dev → <nodeIP>:30900)
     # SEAWEEDFS_PUBLIC_URL: ""    # override the asset URL handed to k6; default: <nodeIP>:30900
 
-# CRDs are installed automatically from charts/dfaas/crds/ on first install.
-# Helm does NOT manage CRDs on upgrade. Manual:
-#   kubectl apply -f https://raw.githubusercontent.com/.../charts/dfaas/crds/<file>.yaml
+# CRDs are NOT installed by this chart. Apply them once before creating any
+# Environment or LoadTest (see NOTES.txt / README), either from a repo checkout
+# (kubectl apply -f config/crd/bases/) or from the matching release assets.
 crds:
   keep: true                      # informational
 

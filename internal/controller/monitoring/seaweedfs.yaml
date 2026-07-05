@@ -45,6 +45,23 @@ metadata:
     app: seaweedfs
 spec:
   replicas: 1
+  # RollingUpdate with maxSurge:0 — NOT Recreate. The single ReadWriteOnce PVC +
+  # SeaweedFS's master/leveldb lock on -dir=/data mean two pods cannot share the
+  # data dir, so the default RollingUpdate (which surges a new pod before killing
+  # the old) deadlocks the new pod on the volume/lock. maxSurge:0 forbids the
+  # surge → the old pod is terminated *before* the new one starts (Recreate-like
+  # behaviour for a single replica), so there's never volume/lock contention.
+  # Why express it this way instead of `type: Recreate`: switching an existing
+  # Deployment's strategy.type to Recreate via server-side-apply fails with
+  # "spec.strategy.rollingUpdate: Forbidden ... when type is 'Recreate'" because
+  # the leftover rollingUpdate block isn't cleared. Keeping type RollingUpdate lets
+  # the operator's SSA merge cleanly over any pre-existing Deployment (fresh or
+  # upgrade). ponytail: single replica, brief downtime per redeploy is fine.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: seaweedfs
@@ -58,7 +75,9 @@ spec:
           image: chrislusf/seaweedfs:4.34
           # All-in-one: master + volume + filer + S3 gateway in one process.
           # -dir=/data persists master/volume/filer metadata + object data on the
-          # PVC. -s3 enables the S3 gateway on 8333 (the only port we expose);
+          # PVC. -s3 enables the S3 gateway on 8333 (NodePort 30900); the filer's
+          # built-in web UI on 8888 is also exposed (NodePort 30901) so operators
+          # can browse stored objects without `kubectl port-forward`.
           # -s3.config points at the mounted identity config (admin/admin123).
           args:
             - server
@@ -70,6 +89,11 @@ spec:
             # S3 API.
             - containerPort: 8333
               name: s3
+            # Filer web UI (file browser). ponytail: no auth on this UI — same
+            # lab-grade trust as the admin/admin123 S3 creds; gate at the network
+            # if the cluster is exposed.
+            - containerPort: 8888
+              name: filer-ui
           readinessProbe:
             tcpSocket:
               port: 8333
@@ -122,3 +146,10 @@ spec:
       port: 8333
       targetPort: 8333
       nodePort: 30900
+    # Filer web UI: browse stored objects at http://<nodeIP>:30901 after install,
+    # no port-forward needed. 30901 chosen to avoid Prometheus (30090) + Grafana
+    # (30300) and to mirror the old MinIO-console slot.
+    - name: filer-ui
+      port: 8888
+      targetPort: 8888
+      nodePort: 30901
