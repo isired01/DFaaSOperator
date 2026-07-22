@@ -65,8 +65,17 @@ func (m *Manager) ReconcileTargets(ctx context.Context, env *dfaasv1.Environment
 			ObjectMeta: metav1.ObjectMeta{Name: "prometheus-targets", Namespace: "monitoring"},
 			Data:       map[string]string{},
 		}
-		if err := m.Create(ctx, cm); err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("create prometheus-targets configmap: %w", err)
+		if err := m.Create(ctx, cm); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return fmt.Errorf("create prometheus-targets configmap: %w", err)
+			}
+			// Lost the create race with another environment's reconcile. Re-Get
+			// the real object so we merge our file into its current Data (and
+			// pick up its resourceVersion) rather than blind-overwriting it with
+			// a fresh CM that holds only this environment's entry.
+			if err := m.Get(ctx, cmKey, cm); err != nil {
+				return fmt.Errorf("re-get prometheus-targets after create race: %w", err)
+			}
 		}
 	}
 

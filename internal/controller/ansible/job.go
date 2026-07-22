@@ -32,6 +32,14 @@ import (
 // truth: re-point here if the chart's libp2p host exposure changes.
 const libp2pBootstrapPort = 31600
 
+// ansibleJobDeadlineSeconds caps a single Ansible run's wall-clock time. Without
+// it a playbook that hangs (SSH blackhole after the :22 probe, a stuck
+// `curl | sh` install) never fails its pod, so BackoffLimit never trips and the
+// Environment FSM waits on Job completion indefinitely. 30 min is generous for a
+// full k3s + Helm + OpenFaaS install.
+// ponytail: fixed ceiling; lift it if provisioning legitimately runs longer.
+const ansibleJobDeadlineSeconds int64 = 1800
+
 // CreateJobForRole builds an Ansible Job + inventory Secret for the subset of
 // nodes in env that match role. jobSuffix becomes part of the Job/Secret/
 // playbook-ConfigMap name so VM and K6 phases run independent Jobs against
@@ -62,7 +70,10 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 	playbookFile := playbookFileForRole(role)
 	playbookCMName := playbookConfigMapName(env, role)
 
-	inventory := buildInventory(env, role, nodes, libp2pKeys)
+	inventory, err := buildInventory(env, role, nodes, libp2pKeys)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build inventory: %w", err)
+	}
 	labels := jobLabels(env, role)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -84,8 +95,9 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 			Labels:    labels,
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit:         ptr.To[int32](3),
-			PodReplacementPolicy: &prFailed,
+			BackoffLimit:          ptr.To[int32](3),
+			ActiveDeadlineSeconds: ptr.To[int64](ansibleJobDeadlineSeconds),
+			PodReplacementPolicy:  &prFailed,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					ServiceAccountName: saName,
@@ -155,18 +167,27 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 // reconcile, optionally pre-applied for BYO peer identity). Authoritative
 // source: there is no spec field for the key.
 func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole,
-	nodes []dfaasv1.EnvironmentNode, libp2pKeys map[string]string) string {
+	nodes []dfaasv1.EnvironmentNode, libp2pKeys map[string]string) (string, error) {
 	var inv string
 	switch role {
 	case dfaasv1.RoleDfaasWorker:
 		inv = "[target_nodes]\n"
 
-		firstPeerID, _ := derivePeerID(libp2pKeys[nodes[0].NodeID])
+		// The seed (nodes[0]) peer ID is baked into every other worker's
+		// bootstrap multiaddr, so a malformed seed key would poison the whole
+		// mesh. Fail loudly here instead of emitting an empty peer ID that only
+		// surfaces as an opaque agent dial-backoff crash-loop later.
+		firstPeerID, err := derivePeerID(libp2pKeys[nodes[0].NodeID])
+		if err != nil {
+			return "", fmt.Errorf("derive libp2p peer ID for seed node %q (check its entry in Secret %q): %w",
+				nodes[0].NodeID, env.Name+"-libp2p-keys", err)
+		}
 		for i, n := range nodes {
 			privKey := libp2pKeys[n.NodeID]
 			peerID, err := derivePeerID(privKey)
 			if err != nil {
-				peerID = "error-key"
+				return "", fmt.Errorf("derive libp2p peer ID for node %q (check its entry in Secret %q): %w",
+					n.NodeID, env.Name+"-libp2p-keys", err)
 			}
 			isBootstrap := i != 0
 			bootstrap := ""
@@ -191,7 +212,7 @@ func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole,
 			)
 		}
 	}
-	return inv
+	return inv, nil
 }
 
 func playbookFileForRole(role dfaasv1.NodeRole) string {

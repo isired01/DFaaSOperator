@@ -1,6 +1,15 @@
 #!/bin/bash
 
-# Configurazione nodi
+# EXAMPLE / local-dev helper — NOT part of the operator runtime.
+# Recreates a few Multipass VMs (on macOS) as the author's local test bed,
+# provisioned from dfaas-config.yaml. It is machine-specific: edit NODES/IPS,
+# the Ubuntu image tag, and CPU/RAM/disk for your host, and note that
+# `multipass launch` here has no --network flag, so the IPS below are only used
+# for known_hosts cleanup — assign/read the real VM IPs yourself and put them in
+# the Environment CR's spec.nodes[].ipAddress. See "Target VM baseline" in the
+# README for the SSH/user assumptions the operator makes about these VMs.
+
+# Configurazione nodi (adatta a IP/nomi della tua rete)
 NODES=("nodoA" "nodoB" "nodoC")
 IPS=("192.168.252.4" "192.168.252.5" "192.168.252.6")
 

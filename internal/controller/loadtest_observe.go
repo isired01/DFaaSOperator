@@ -118,6 +118,12 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 	// block the phase transition.
 	r.captureK6Logs(ctx, lt, env)
 
+	// The GO signal (syncStart) served its purpose once every runner has
+	// finished — best-effort hygiene, stale objects are harmless.
+	if lt.Spec.SyncStart {
+		logStatusErr(ctx, "delete GO signal (test finished)", deleteGoSignal(ctx, lt))
+	}
+
 	// All TestRuns done cleanly → stamp EndTime and move to Exporting.
 	now := metav1.Now()
 	if err := r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
@@ -275,14 +281,19 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 		return ctrl.Result{}, err
 	}
 
-	if job.Status.Succeeded > 0 {
+	if job.Status.Succeeded > 0 || jobConditionTrue(&job, batchv1.JobComplete) {
 		logger.Info("exporter Job succeeded")
 		logStatusErr(ctx, "stamp MetricsExported=True", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
 			metav1.ConditionTrue, dfaasv1.LTReasonExportSucceeded,
 			"metrics exported"))
 		return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestCompleted)
 	}
-	if job.Status.Failed > 0 {
+	// Decide terminal failure from the JobFailed condition, not the raw
+	// Status.Failed counter: that counter tracks failed *attempts*, and the Job
+	// has a non-zero BackoffLimit, so a single transient pod failure would
+	// otherwise fail the LoadTest while Kubernetes is still spawning a retry pod
+	// that may yet succeed (same backoff-aware pattern as the Ansible Jobs).
+	if jobConditionTrue(&job, batchv1.JobFailed) {
 		logStatusErr(ctx, "stamp MetricsExported=False (job failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
 			metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
 			"exporter Job reported Failed"))

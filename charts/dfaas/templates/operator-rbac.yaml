@@ -33,6 +33,15 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Cluster-wide events: the controllers emit warning Events on Environments in
+  # any namespace (e.g. SSH-unreachable health warnings). The leader-election
+  # Role below only grants events in the operator's own namespace.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
   - apiGroups: ["apps"]
     resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]

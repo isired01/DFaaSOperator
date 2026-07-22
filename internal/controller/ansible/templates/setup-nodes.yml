@@ -10,6 +10,24 @@
     openfaas_url: "http://127.0.0.1:31112"
     k3s_config: "/etc/rancher/k3s/k3s.yaml"
 
+    # --- Version pins (reproducibility) ---
+    # Each defaults to empty = current behavior (install the latest available).
+    # Set a value to pin that artifact so two provisioning runs build the
+    # identical software stack — recommended for reproducible thesis experiments.
+    # These are the single place to pin; edit the operator image / re-provision
+    # (spec edit → generation drift) to apply changes.
+    # ponytail: latest-by-default keeps existing behavior; pin per your validated versions.
+    k3s_version: ""               # e.g. "v1.30.4+k3s1"; empty = latest stable channel
+    helm_version: ""              # e.g. "v3.15.4"; empty = latest (get-helm-3)
+    haproxy_chart_version: ""     # haproxytech/haproxy; empty = latest
+    prometheus_chart_version: ""  # prometheus-community/prometheus; empty = latest
+    openfaas_chart_version: ""    # openfaas/openfaas; empty = latest
+    # dfaas-agent: the chart is pinned below (chart_version); the workload image
+    # tag is the moving part. Pin it to a release tag or digest instead of the
+    # mutable :dev for reproducible agent behavior.
+    dfaas_agent_image: "ghcr.io/isired01/dfaas-agent:dev"
+    dfaas_agent_image_pull_policy: "Always"
+
   tasks:
     - name: Disable APT automatic upgrades
       ansible.builtin.copy:
@@ -67,7 +85,10 @@
 
     - name: Install K3S (only if missing)
       ansible.builtin.shell:
-        cmd: curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --disable servicelb" sh -
+        cmd: >-
+          curl -sfL https://get.k3s.io |
+          {{ ('INSTALL_K3S_VERSION=' ~ k3s_version) if k3s_version else '' }}
+          INSTALL_K3S_EXEC="--disable traefik --disable servicelb" sh -
       when: not k3s_bin.stat.exists
 
     - name: Ensure K3s service is started and enabled
@@ -92,7 +113,9 @@
 
     - name: Install Helm
       ansible.builtin.shell:
-        cmd: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        cmd: >-
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 |
+          {{ ('DESIRED_VERSION=' ~ helm_version) if helm_version else '' }} bash
       when: not helm_bin.stat.exists
 
     - name: Add Helm Repos
@@ -134,6 +157,7 @@
       kubernetes.core.helm:
         name: "{{ item.name }}"
         chart_ref: "{{ item.chart }}"
+        chart_version: "{{ item.version | default(omit, true) }}"
         release_namespace: "{{ item.ns }}"
         create_namespace: true
         wait: true
@@ -141,9 +165,9 @@
         values_files:
           - "/opt/dfaas/helm-values/{{ item.name }}.yaml"
       loop:
-        - { name: "haproxy", chart: "haproxytech/haproxy", ns: "haproxy-controller" }
-        - { name: "prometheus", chart: "prometheus-community/prometheus", ns: "monitoring" }
-        - { name: "openfaas", chart: "openfaas/openfaas", ns: "openfaas" }
+        - { name: "haproxy", chart: "haproxytech/haproxy", ns: "haproxy-controller", version: "{{ haproxy_chart_version }}" }
+        - { name: "prometheus", chart: "prometheus-community/prometheus", ns: "monitoring", version: "{{ prometheus_chart_version }}" }
+        - { name: "openfaas", chart: "openfaas/openfaas", ns: "openfaas", version: "{{ openfaas_chart_version }}" }
       register: helm_install_result
       retries: 5
       delay: 15
@@ -263,8 +287,8 @@
         kubeconfig: "{{ k3s_config }}"
         wait: false
         values:
-          image: "ghcr.io/isired01/dfaas-agent:dev"
-          imagePullPolicy: "Always"
+          image: "{{ dfaas_agent_image }}"
+          imagePullPolicy: "{{ dfaas_agent_image_pull_policy }}"
           privateKey: |
             -----BEGIN PRIVATE KEY-----
             {{ node_priv_key }}

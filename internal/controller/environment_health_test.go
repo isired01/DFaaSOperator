@@ -60,7 +60,7 @@ var _ = Describe("Ready-state SSH health check", func() {
 		_ = k8sClient.Delete(ctx, env)
 	})
 
-	It("stamps NodesReachable=False, records lastHealthCheck, and fails after the budget", func() {
+	It("stamps NodesReachable=False, records lastHealthCheck, and enters Unreachable after the budget", func() {
 		// Passing the same stale in-memory env (LastHealthCheck nil) each round
 		// keeps the time-throttle disabled, so each call performs a real probe.
 		for i := 1; i < healthRetryBudget; i++ {
@@ -70,7 +70,7 @@ var _ = Describe("Ready-state SSH health check", func() {
 
 			fresh := &dfaasv1.Environment{}
 			Expect(k8sClient.Get(ctx, key, fresh)).To(Succeed())
-			Expect(fresh.Status.Phase).NotTo(Equal(dfaasv1.EnvFailed))
+			Expect(fresh.Status.Phase).NotTo(Equal(dfaasv1.EnvUnreachable))
 			Expect(fresh.Status.LastHealthCheck).NotTo(BeNil())
 
 			cond := meta.FindStatusCondition(fresh.Status.Conditions, dfaasv1.EnvCondNodesReachable)
@@ -79,13 +79,14 @@ var _ = Describe("Ready-state SSH health check", func() {
 			Expect(cond.Reason).To(Equal(dfaasv1.EnvReasonSSHUnreachable))
 		}
 
-		// The budget-th unreachable round transitions the env to Failed.
+		// The budget-th unreachable round moves the env to the non-terminal
+		// Unreachable phase (auto-recovering), not terminal Failed.
 		_, err := reconciler.reconcileReadyHealth(ctx, env)
 		Expect(err).NotTo(HaveOccurred())
 
 		failed := &dfaasv1.Environment{}
 		Expect(k8sClient.Get(ctx, key, failed)).To(Succeed())
-		Expect(failed.Status.Phase).To(Equal(dfaasv1.EnvFailed))
+		Expect(failed.Status.Phase).To(Equal(dfaasv1.EnvUnreachable))
 		cond := meta.FindStatusCondition(failed.Status.Conditions, dfaasv1.EnvCondNodesReachable)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))

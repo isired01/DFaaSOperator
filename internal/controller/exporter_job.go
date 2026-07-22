@@ -193,8 +193,12 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 			Namespace: lt.Namespace,
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit:         ptr.To[int32](2),
-			PodReplacementPolicy: &prFailed,
+			BackoffLimit: ptr.To[int32](2),
+			// Cap runtime so a hung Prometheus query or S3 upload can't wedge the
+			// LoadTest in Exporting forever (BackoffLimit never trips on a hang).
+			// ponytail: fixed 10-min ceiling; raise it if exports legitimately run longer.
+			ActiveDeadlineSeconds: ptr.To[int64](600),
+			PodReplacementPolicy:  &prFailed,
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{

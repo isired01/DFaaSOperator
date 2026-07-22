@@ -29,6 +29,14 @@ spec:
           env:
             - name: DFAAS_EXPORTER_IMAGE
               value: {{ include "dfaas.exporter.image" . }}
+            # Fallback base for the VM-facing GO-signal URL of synchronized
+            # LoadTest starts (http://<HOST_IP>:30901, SeaweedFS filer
+            # NodePort). Override via operator.extraEnv DFAAS_SYNC_PUBLIC_URL
+            # when k6 VMs reach the management node on a different address.
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             {{- with .Values.operator.extraEnv }}
             {{ toYaml . | nindent 12 }}
             {{- end }}

@@ -101,6 +101,14 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 // k6-load-generator node's k3s cluster, then transitions LoadTest → Running.
 func (r *LoadTestReconciler) startK6(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
+	// Synchronized start needs a VM-facing GO URL before anything is
+	// dispatched — fail loudly instead of parking every runner on a barrier
+	// nobody can open (e.g. `make run` without DFAAS_SYNC_PUBLIC_URL).
+	if lt.Spec.SyncStart && syncGoURL(lt) == "" {
+		return r.failLoadTest(ctx, lt,
+			"synchronized start: cannot resolve the VM-facing GO URL — set DFAAS_SYNC_PUBLIC_URL (or run in-cluster with HOST_IP injected)")
+	}
+
 	// P9: first observation — nothing dispatched yet, status is Unknown.
 	// Subsequent calls below upgrade this to False/InFlight or True/
 	// AllDispatched. SetStatusCondition is idempotent on no transition.
@@ -126,10 +134,26 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 		}
 	}
 
-	// All TestRuns dispatched — stamp StartTime + transition to Running.
+	// All TestRuns dispatched.
 	logStatusErr(ctx, "stamp K6Dispatched=True (all dispatched)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
 		metav1.ConditionTrue, dfaasv1.LTReasonAllDispatched,
 		fmt.Sprintf("dispatched %d remote TestRun(s)", len(refs))))
+
+	// Synchronized start: hold Running until every runner is parked on the
+	// script barrier, then publish the GO signal (loadtest_sync.go).
+	if lt.Spec.SyncStart {
+		lt.Status.TestRuns = refs
+		return r.awaitSyncBarrier(ctx, lt, env)
+	}
+	return r.finishDispatch(ctx, lt, refs)
+}
+
+// finishDispatch stamps StartTime + transitions to Running once traffic is
+// (about to be) flowing: immediately after dispatch for plain tests, after
+// the GO signal for syncStart tests — so StartTime tracks actual traffic
+// start and the exporter's PROM window stays faithful.
+func (r *LoadTestReconciler) finishDispatch(ctx context.Context,
+	lt *dfaasv1.LoadTest, refs []dfaasv1.TestRunRef) (ctrl.Result, error) {
 	logStatusErr(ctx, "stamp K6Healthy=Unknown (awaiting observation)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
 		metav1.ConditionUnknown, dfaasv1.LTReasonRunning,
 		"k6 TestRuns dispatched, awaiting observation"))
@@ -346,7 +370,7 @@ func buildRemoteTestRun(name string, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNo
 		"dfaas.io/loadtest-name": lt.Name,
 		"dfaas.io/node-id":       perNode.NodeID,
 	})
-	_ = unstructured.SetNestedMap(tr.Object, map[string]interface{}{
+	spec := map[string]interface{}{
 		"parallelism": int64(1),
 		"script": map[string]interface{}{
 			"configMap": map[string]interface{}{
@@ -357,7 +381,18 @@ func buildRemoteTestRun(name string, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNo
 		// VUs and duration are commonly set inside the script, but we surface
 		// them as annotations so the operator can carry them across to the
 		// remote cluster if a TestRun-level field is needed in the future.
-	}, "spec")
+	}
+	if lt.Spec.SyncStart {
+		// The generated script's setup() blocks polling this URL until the
+		// reconciler publishes the GO signal (see loadtest_sync.go). Scripts
+		// without the barrier simply ignore the env var.
+		spec["runner"] = map[string]interface{}{
+			"env": []interface{}{
+				map[string]interface{}{"name": "DFAAS_SYNC_URL", "value": syncGoURL(lt)},
+			},
+		}
+	}
+	_ = unstructured.SetNestedMap(tr.Object, spec, "spec")
 	tr.SetAnnotations(map[string]string{
 		"dfaas.io/vus":      fmt.Sprintf("%d", perNode.VUs),
 		"dfaas.io/duration": perNode.Duration,

@@ -153,4 +153,39 @@ var _ = Describe("Environment occupancy gate (FIFO queue)", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(proceed).To(BeTrue())
 	})
+
+	// Regression for the partial-dispatch race: a sibling still at Pending but
+	// already holding remote TestRuns (startK6 flips to Running only after the
+	// last node) must count as occupying, and must itself keep the env even
+	// against an older newly-activated sibling — otherwise two TestRun sets run
+	// concurrently on one Environment.
+	It("holds a newcomer behind a Pending sibling that already dispatched TestRuns", func() {
+		// Older waiter with NO dispatched runs (created first → oldest).
+		older := create("aaa-older", dfaasv1.LoadTestPending)
+		// Younger occupant that is still Pending but has persisted a TestRun.
+		occupant := create("zzz-occupant", dfaasv1.LoadTestPending)
+		occupant.Status.TestRuns = []dfaasv1.TestRunRef{{
+			NodeID: "generator", Name: "zzz-occupant-generator", Namespace: "default",
+		}}
+		Expect(k8sClient.Status().Update(ctx, occupant)).To(Succeed())
+
+		// The occupant proceeds unconditionally (rule 0) even though `older`
+		// predates it — deferring would strand its live remote run.
+		proceed, _, err := reconciler.envOccupancyGate(ctx, occupant)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(proceed).To(BeTrue())
+
+		// The older, un-dispatched sibling is held: the env is occupied by the
+		// Pending-but-dispatched test, not free for a second concurrent run.
+		proceed, res, err := reconciler.envOccupancyGate(ctx, older)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(proceed).To(BeFalse())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+
+		fresh := &dfaasv1.LoadTest{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(older), fresh)).To(Succeed())
+		cond := meta.FindStatusCondition(fresh.Status.Conditions, dfaasv1.LTCondQueued)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal(dfaasv1.LTReasonEnvBusy))
+	})
 })

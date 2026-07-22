@@ -8,8 +8,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// Check returns true when both the prometheus and grafana pods are in the
-// Running phase with ContainerReady=True.
+// Check returns true when the prometheus server, grafana, and the SeaweedFS
+// sink pods are all in the Running phase with PodReady=True.
 func (m *Manager) Check(ctx context.Context) (bool, error) {
 	podList := &corev1.PodList{}
 	opts := []client.ListOption{
@@ -22,6 +22,7 @@ func (m *Manager) Check(ctx context.Context) (bool, error) {
 
 	promReady := false
 	grafanaReady := false
+	seaweedReady := false
 
 	for _, pod := range podList.Items {
 		isReady := false
@@ -33,16 +34,24 @@ func (m *Manager) Check(ctx context.Context) (bool, error) {
 				}
 			}
 		}
+		if !isReady {
+			continue
+		}
 
-		if isReady {
-			if strings.Contains(pod.Name, "prometheus") {
-				promReady = true
-			}
-			if strings.Contains(pod.Name, "grafana") {
-				grafanaReady = true
-			}
+		// Require BOTH "prometheus" and "server" so the fast-starting sidecars
+		// (prometheus-node-exporter / -alertmanager / -pushgateway /
+		// -kube-state-metrics) don't satisfy readiness before the server pod is up.
+		name := pod.Name
+		if strings.Contains(name, "prometheus") && strings.Contains(name, "server") {
+			promReady = true
+		}
+		if strings.Contains(name, "grafana") {
+			grafanaReady = true
+		}
+		if strings.Contains(name, "seaweedfs") {
+			seaweedReady = true
 		}
 	}
 
-	return promReady && grafanaReady, nil
+	return promReady && grafanaReady && seaweedReady, nil
 }

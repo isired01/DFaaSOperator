@@ -355,10 +355,13 @@ func (r *LoadTestReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // occupant reaches a terminal phase, the next tick lets the front test through.
 //
 // Queue model:
-//   - "Busy"   = a sibling LoadTest on the same env in phase Running OR Exporting
-//     (the whole execution lifecycle until terminal).
-//   - "Waiting" = siblings (incl. self) with phase ∈ {"", Pending}, not suspended,
-//     and whose schedule has already fired (startAt nil or in the past).
+//   - "Occupant" = self, once it has persisted remote TestRuns (rule 0): it
+//     holds the env until terminal and bypasses the gate so a partial dispatch
+//     is never handed off mid-flight.
+//   - "Busy"   = a sibling LoadTest on the same env in phase Running OR Exporting,
+//     OR still "" / Pending but already holding remote TestRuns (partial dispatch).
+//   - "Waiting" = siblings (incl. self) with phase ∈ {"", Pending}, no TestRuns yet,
+//     not suspended, and whose schedule has already fired (startAt nil or past).
 //   - "Front"   = the waiting sibling with the oldest creationTimestamp
 //     (tie-break: lexicographic name). Starvation is bounded by creation order.
 func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
@@ -383,14 +386,37 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 		return false, ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	// 1. Busy check: any *other* sibling on the same env mid-execution.
+	// 0. If this test has already dispatched remote TestRuns, it is the
+	// de-facto occupant of the Environment: a partial-dispatch reconcile can
+	// leave it at Pending (startK6 flips to Running only after the last node)
+	// with live remote runs. Proceed unconditionally so startK6 resumes /
+	// observeK6 takes over — never defer to a sibling here, which would strand
+	// these runs AND let a second TestRun set dispatch concurrently on the same
+	// Environment (the single-active-test invariant this gate exists to hold).
+	if len(lt.Status.TestRuns) > 0 {
+		if cerr := r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondQueued,
+			metav1.ConditionFalse, dfaasv1.LTReasonDispatching,
+			"resuming in-flight dispatch — environment held by this test"); cerr != nil {
+			return false, ctrl.Result{}, cerr
+		}
+		return true, ctrl.Result{}, nil
+	}
+
+	// 1. Busy check: any *other* sibling mid-execution on the same env. A
+	// sibling counts as occupying not only in Running/Exporting but also when
+	// it is still "" / Pending yet has already persisted remote TestRuns — the
+	// partial-dispatch window handled by rule 0 above, invisible to a naive
+	// phase-only check.
 	for i := range list.Items {
 		sib := &list.Items[i]
 		if sib.Name == lt.Name || sib.Spec.TargetEnvironment != lt.Spec.TargetEnvironment {
 			continue
 		}
-		if sib.Status.Phase == dfaasv1.LoadTestRunning ||
-			sib.Status.Phase == dfaasv1.LoadTestExporting {
+		occupying := sib.Status.Phase == dfaasv1.LoadTestRunning ||
+			sib.Status.Phase == dfaasv1.LoadTestExporting ||
+			((sib.Status.Phase == "" || sib.Status.Phase == dfaasv1.LoadTestPending) &&
+				len(sib.Status.TestRuns) > 0)
+		if occupying {
 			return hold(dfaasv1.LTReasonEnvBusy,
 				fmt.Sprintf("waiting: environment %q occupied by load test %q",
 					lt.Spec.TargetEnvironment, sib.Name))

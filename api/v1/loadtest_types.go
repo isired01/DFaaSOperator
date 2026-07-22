@@ -37,6 +37,10 @@ const (
 	LTCondK6Dispatched      = "K6Dispatched"
 	LTCondK6Healthy         = "K6Healthy"
 	LTCondMetricsExported   = "MetricsExported"
+	// LTCondSyncReady tracks the synchronized-start barrier (spec.syncStart):
+	// False/AwaitingRunners while waiting for every TestRun to reach stage
+	// "started", True/GoPublished once the GO signal is published.
+	LTCondSyncReady = "SyncReady"
 )
 
 // Condition Reasons stamped on LoadTest.status.conditions (P15).
@@ -67,6 +71,9 @@ const (
 	LTReasonAborted                = "Aborted"
 	LTReasonScriptMirrorFailed     = "ScriptMirrorFailed"
 	LTReasonStaleCleanupFailed     = "StaleCleanupFailed"
+	LTReasonAwaitingRunners        = "AwaitingRunners"
+	LTReasonGoPublished            = "GoPublished"
+	LTReasonSyncTimeout            = "SyncTimeout"
 	LTReasonApplyFailed            = "ApplyFailed"
 	LTReasonPostStart              = "PostStart"
 	LTReasonEnvNotFound            = "EnvNotFound"
@@ -209,6 +216,18 @@ type LoadTestSpec struct {
 	// +kubebuilder:default=false
 	// +optional
 	Stop bool `json:"stop,omitempty"`
+
+	// SyncStart, when true, synchronizes traffic start across all generators:
+	// each remote runner's script blocks in setup() polling a GO-signal URL
+	// (injected as the DFAAS_SYNC_URL runner env var), and the reconciler
+	// publishes the signal on the in-cluster SeaweedFS filer only once every
+	// TestRun reports stage "started". Residual skew ≈ the script's poll
+	// interval (~250ms). Requires the k6 VMs to reach the management node on
+	// the filer NodePort (30901). If any runner fails to start within the
+	// sync wait budget the whole test is aborted and marked Failed.
+	// +kubebuilder:default=false
+	// +optional
+	SyncStart bool `json:"syncStart,omitempty"`
 }
 
 // TestRunRef records one remote TestRun dispatched on a k6 machine's k3s.

@@ -64,8 +64,8 @@ var _ = Describe("ProvisioningVMs SSH retry budget", func() {
 		_ = k8sClient.Delete(ctx, env)
 	})
 
-	It("moves to Failed after sshRetryBudget consecutive unreachable rounds", func() {
-		// First sshRetryBudget-1 rounds requeue, staying out of Failed.
+	It("moves to Unreachable after sshRetryBudget consecutive unreachable rounds", func() {
+		// First sshRetryBudget-1 rounds requeue, staying out of Unreachable.
 		for i := 1; i < sshRetryBudget; i++ {
 			res, err := reconciler.reconcileProvisioningVMs(ctx, env)
 			Expect(err).NotTo(HaveOccurred())
@@ -73,16 +73,17 @@ var _ = Describe("ProvisioningVMs SSH retry budget", func() {
 
 			fresh := &dfaasv1.Environment{}
 			Expect(k8sClient.Get(ctx, key, fresh)).To(Succeed())
-			Expect(fresh.Status.Phase).NotTo(Equal(dfaasv1.EnvFailed))
+			Expect(fresh.Status.Phase).NotTo(Equal(dfaasv1.EnvUnreachable))
 		}
 
-		// The sshRetryBudget-th round gives up → Failed.
+		// The sshRetryBudget-th round gives up on fast retries → non-terminal
+		// Unreachable (auto-recovering), not terminal Failed.
 		_, err := reconciler.reconcileProvisioningVMs(ctx, env)
 		Expect(err).NotTo(HaveOccurred())
 
 		failed := &dfaasv1.Environment{}
 		Expect(k8sClient.Get(ctx, key, failed)).To(Succeed())
-		Expect(failed.Status.Phase).To(Equal(dfaasv1.EnvFailed))
+		Expect(failed.Status.Phase).To(Equal(dfaasv1.EnvUnreachable))
 
 		cond := meta.FindStatusCondition(failed.Status.Conditions, dfaasv1.EnvCondVMsReady)
 		Expect(cond).NotTo(BeNil())
@@ -91,14 +92,14 @@ var _ = Describe("ProvisioningVMs SSH retry budget", func() {
 	})
 
 	It("restarts the budget fresh on a new generation", func() {
-		// Burn the whole budget on the current generation → Failed.
+		// Burn the whole budget on the current generation → Unreachable.
 		for i := 0; i < sshRetryBudget; i++ {
 			_, err := reconciler.reconcileProvisioningVMs(ctx, env)
 			Expect(err).NotTo(HaveOccurred())
 		}
 		failed := &dfaasv1.Environment{}
 		Expect(k8sClient.Get(ctx, key, failed)).To(Succeed())
-		Expect(failed.Status.Phase).To(Equal(dfaasv1.EnvFailed))
+		Expect(failed.Status.Phase).To(Equal(dfaasv1.EnvUnreachable))
 
 		// Edit the spec → metadata.generation bumps. The counter is
 		// generation-scoped, so the first post-edit round must requeue

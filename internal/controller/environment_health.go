@@ -35,7 +35,8 @@ const sshProbeTimeout = 2 * time.Second
 const sshAttemptsAnnotation = "dfaas.dfaas.io/ssh-attempts"
 
 // sshRetryBudget is the max consecutive SSH-unreachable rounds tolerated
-// before the Environment is moved to EnvFailed.
+// during provisioning before the Environment enters the non-terminal
+// EnvUnreachable phase (which re-probes indefinitely and auto-recovers).
 const sshRetryBudget = 3
 
 // healthCheckInterval is the cadence of the Ready-state SSH liveness probe.
@@ -46,8 +47,8 @@ const healthCheckInterval = time.Minute
 const healthRetryInterval = 20 * time.Second
 
 // healthRetryBudget is the max consecutive unreachable health rounds tolerated
-// before a Ready Environment is moved to EnvFailed. A small budget prevents a
-// single dropped packet from flapping a healthy env into Failed.
+// before a Ready Environment enters the non-terminal EnvUnreachable phase. A
+// small budget prevents a single dropped packet from flapping a healthy env.
 const healthRetryBudget = 3
 
 // healthMissesAnnotation persists the consecutive Ready-state unreachable
@@ -88,8 +89,9 @@ func probeSSH(ip string) bool {
 // are confirmed faster.
 //
 // After healthRetryBudget consecutive unreachable rounds the Environment is
-// moved to EnvFailed; recovery is manual (spec edit → drift → re-provision),
-// matching the user decision and the existing Failed semantics.
+// moved to the non-terminal EnvUnreachable phase, which re-probes indefinitely
+// and auto-recovers to Ready (or resumes provisioning) once the nodes answer
+// again — no manual intervention needed for transient connectivity loss.
 func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)

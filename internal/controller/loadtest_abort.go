@@ -43,6 +43,34 @@ import (
 func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment,
 	reason, message string) (ctrl.Result, error) {
+
+	if failed := r.teardownRemoteTestRuns(ctx, lt, env); failed > 0 {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// The GO signal (syncStart) is moot once the test is aborted — hygiene.
+	if lt.Spec.SyncStart {
+		logStatusErr(ctx, "delete GO signal (abort)", deleteGoSignal(ctx, lt))
+	}
+
+	// MetricsExported never ran on abort — stamp False/Skipped per P9 so
+	// UI does not show "in flight" forever on the aborted CR.
+	logStatusErr(ctx, "stamp MetricsExported=False (export skipped)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+		metav1.ConditionFalse, dfaasv1.LTReasonExportSkipped,
+		"no exporter ran — test was aborted"))
+	logStatusErr(ctx, "stamp Ready=False (aborted)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondReady, metav1.ConditionFalse,
+		reason, message))
+	return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestAborted)
+}
+
+// teardownRemoteTestRuns issues DeleteTestRun for every remote TestRun of lt
+// (union of status.testRuns and deterministic names from spec.perNodeLoad —
+// catches partial-dispatch races) and returns how many deletes failed.
+// Per-node errors are logged but do not stop the sweep; callers requeue and
+// retry the full set while failed > 0 (idempotent via IgnoreNotFound).
+// Shared by the abort path and the syncStart barrier failure path.
+func (r *LoadTestReconciler) teardownRemoteTestRuns(ctx context.Context,
+	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (failed int) {
 	logger := log.FromContext(ctx)
 
 	k6Index := computeK6NodeIndex(env)
@@ -71,7 +99,6 @@ func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
 		}
 	}
 
-	var failed int
 	for _, t := range targets {
 		secretRef := types.NamespacedName{Name: t.secretName, Namespace: lt.Namespace}
 		remoteKey := types.NamespacedName{Name: t.trName, Namespace: t.trNs}
@@ -83,18 +110,7 @@ func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
 		}
 		logger.Info("remote TestRun aborted", "node", t.nodeID, "testRun", t.trName)
 	}
-	if failed > 0 {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	// MetricsExported never ran on abort — stamp False/Skipped per P9 so
-	// UI does not show "in flight" forever on the aborted CR.
-	logStatusErr(ctx, "stamp MetricsExported=False (export skipped)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
-		metav1.ConditionFalse, dfaasv1.LTReasonExportSkipped,
-		"no exporter ran — test was aborted"))
-	logStatusErr(ctx, "stamp Ready=False (aborted)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondReady, metav1.ConditionFalse,
-		reason, message))
-	return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestAborted)
+	return failed
 }
 
 // handleLoadTestDeletion is the finalizer flow triggered by a non-zero
@@ -196,6 +212,9 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 	}
 
 	// Every target NotFound on its remote — safe to release.
+	if lt.Spec.SyncStart {
+		logStatusErr(ctx, "delete GO signal (loadtest deletion)", deleteGoSignal(ctx, lt))
+	}
 	logger.Info("all remote TestRuns reclaimed — removing loadtest finalizer")
 	controllerutil.RemoveFinalizer(lt, loadTestFinalizer)
 	return ctrl.Result{}, r.Update(ctx, lt)

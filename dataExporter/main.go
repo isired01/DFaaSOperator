@@ -96,21 +96,25 @@ func main() {
 	queryRange := v1.Range{Start: start, End: end, Step: step}
 
 	fmt.Printf("starting metrics export for experiment: %s\n", expName)
+	var attempted, errored, rowsWritten int
 	for _, m := range metrics {
 		if m.Query == "" {
 			fmt.Printf("skipping entry %q: empty query\n", m.MetricName)
 			continue
 		}
+		attempted++
 
 		result, _, err := promAPI.QueryRange(ctx, m.Query, queryRange)
 		if err != nil {
 			fmt.Printf("query error %s (%s): %v\n", m.MetricName, m.Query, err)
+			errored++
 			continue
 		}
 
 		matrix, ok := result.(model.Matrix)
 		if !ok {
 			fmt.Printf("query %s: non-Matrix result (type=%T), skipping\n", m.MetricName, result)
+			errored++
 			continue
 		}
 
@@ -132,8 +136,21 @@ func main() {
 					pair.Value.String(),
 					allLabels,
 				})
+				rowsWritten++
 			}
 		}
+	}
+	if attempted > 0 && errored > 0 {
+		fmt.Printf("metrics export: %d/%d queries failed\n", errored, attempted)
+	}
+	// Fail loudly when the export captured nothing: a header-only CSV that
+	// uploads fine still lets the LoadTest report Completed with no data
+	// (Prometheus unreachable, all queries wrong, or the samples were lost to a
+	// restart). Exit non-zero so the exporter Job — and thus the LoadTest —
+	// fails instead of silently "succeeding" with an empty result.
+	if attempted > 0 && rowsWritten == 0 {
+		log.Fatalf("metrics export produced 0 data points across %d queries (%d errored); "+
+			"refusing to report success with an empty CSV — check Prometheus reachability and the queries", attempted, errored)
 	}
 
 	// Close writer + file before reading / uploading.

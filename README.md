@@ -293,3 +293,14 @@ LoadTest scenarios can POST an uploaded image as the request body. The image is 
 
 > [!IMPORTANT]
 > Target VMs must be reachable via SSH from the cluster network and the credentials in `Environment.spec.nodes[].password` must be valid before applying the manifest. The operator does **not** distribute SSH keys for SSH login.
+
+## 🖥️ Target VM baseline
+
+The operator orchestrates pre-existing VMs; it does not create them. Each declared node must be a Linux host (tested on Ubuntu) that, before you apply the `Environment`:
+
+- runs an **SSH server reachable on `:22`** from the operator cluster, with **password authentication enabled** (the operator authenticates with `spec.nodes[].username` / `password` — it does not distribute keys);
+- has the login user set up for **passwordless `sudo`** (provisioning installs k3s / Helm / packages as root);
+- has **Python 3** available (required by the Ansible playbooks);
+- has a correct clock (NTP) — `apt` rejects `Release` files dated in the future.
+
+The [`cloud-init/`](cloud-init/) directory contains an **example** local-dev setup (Multipass on macOS): [`dfaas-config.yaml`](cloud-init/dfaas-config.yaml) is a reference cloud-init that provisions exactly this baseline (a sudo user with password auth), and [`reset-script.sh`](cloud-init/reset-script.sh) recreates the author's test VMs. Both are machine-specific examples — adapt the hostnames, IPs, image tag, and credentials to your environment; they are not consumed by the operator.
