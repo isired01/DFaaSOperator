@@ -382,16 +382,20 @@ func buildRemoteTestRun(name string, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNo
 		// them as annotations so the operator can carry them across to the
 		// remote cluster if a TestRun-level field is needed in the future.
 	}
+	// The generated script's handleSummary() PUTs its end-of-test summary
+	// JSON here (see loadtest_sync.go). Always injected: empty value (public
+	// base unresolvable) or scripts without handleSummary just skip it.
+	runnerEnv := []interface{}{
+		map[string]interface{}{"name": "DFAAS_SUMMARY_URL", "value": summaryURL(lt, perNode.NodeID)},
+	}
 	if lt.Spec.SyncStart {
 		// The generated script's setup() blocks polling this URL until the
 		// reconciler publishes the GO signal (see loadtest_sync.go). Scripts
 		// without the barrier simply ignore the env var.
-		spec["runner"] = map[string]interface{}{
-			"env": []interface{}{
-				map[string]interface{}{"name": "DFAAS_SYNC_URL", "value": syncGoURL(lt)},
-			},
-		}
+		runnerEnv = append(runnerEnv,
+			map[string]interface{}{"name": "DFAAS_SYNC_URL", "value": syncGoURL(lt)})
 	}
+	spec["runner"] = map[string]interface{}{"env": runnerEnv}
 	_ = unstructured.SetNestedMap(tr.Object, spec, "spec")
 	tr.SetAnnotations(map[string]string{
 		"dfaas.io/vus":      fmt.Sprintf("%d", perNode.VUs),

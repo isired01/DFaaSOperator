@@ -10,8 +10,7 @@
 # README for the SSH/user assumptions the operator makes about these VMs.
 
 # Configurazione nodi (adatta a IP/nomi della tua rete)
-NODES=("nodoA" "nodoB" "nodoC")
-IPS=("192.168.252.4" "192.168.252.5" "192.168.252.6")
+NODES=("nodoA" "nodoB" "nodoC" "nodoD")
 
 # Risorse VM (modifica in base alla tua RAM totale)
 CPUS="2"
@@ -22,7 +21,6 @@ echo "--- Inizio Reset Nodi Multipass ---"
 
 for i in "${!NODES[@]}"; do
     NAME=${NODES[$i]}
-    IP=${IPS[$i]}
 
     echo "[*] Eliminazione $NAME..."
     multipass delete $NAME --purge 2>/dev/null
@@ -35,10 +33,6 @@ for i in "${!NODES[@]}"; do
 
     echo "[V] $NAME creato."
 done
-
-echo "--- Setup IP Statici (Opzionale) ---"
-echo "Nota: Se Multipass non assegna l'IP corretto al boot,"
-echo "dovrai lanciare un comando per configurare netplan dentro le VM."
 
 # Pulizia Known Hosts sul tuo Mac per evitare errori SSH
 for IP in "${IPS[@]}"; do

@@ -82,7 +82,15 @@ const (
 
 // EnvironmentNode declares one machine in the federation.
 type EnvironmentNode struct {
+	// NodeID must be DNS-1123 compatible (lowercase): it is embedded in
+	// Kubernetes object names (kubeconfig Secret <env>-<nodeID>-kubeconfig,
+	// remote TestRuns, k6-log ConfigMaps) — an uppercase ID makes the k6
+	// Ansible Job's Secret push fail with a censored 422.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MaxLength=63
+	// Pattern (not CEL XValidation): CEL cost estimation on unbounded
+	// node arrays blows the schema budget; the OpenAPI pattern is free.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	NodeID string `json:"nodeID"`
 
 	// +kubebuilder:validation:Required

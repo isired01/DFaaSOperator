@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +35,210 @@ type MetricEntry struct {
 	MetricName string `json:"metricName"`
 	Query      string `json:"query"`
 	Comment    string `json:"comment,omitempty"`
+}
+
+// summarySource mirrors the operator's k6SummarySource: one filer URL per k6
+// node, JSON-encoded into K6_SUMMARY_SOURCES. URLs are composed operator-side
+// (they embed the operator's sanitize(nodeID)) — never rebuild them here.
+type summarySource struct {
+	NodeID string `json:"nodeId"`
+	URL    string `json:"url"`
+}
+
+// k6SummaryMetric is one entry of handleSummary's data.metrics: type is one
+// of counter|gauge|rate|trend, values holds the type-dependent stats
+// (count/rate, value/min/max, rate/passes/fails, avg/min/med/max/p(90)/p(95)).
+type k6SummaryMetric struct {
+	Type   string             `json:"type"`
+	Values map[string]float64 `json:"values"`
+}
+
+// k6Summary is the subset of the handleSummary JSON the exporter consumes.
+type k6Summary struct {
+	Metrics map[string]k6SummaryMetric `json:"metrics"`
+}
+
+// summaryAllNodes is the ID_Nodo value of the cross-node aggregate rows.
+const summaryAllNodes = "__all__"
+
+// fetchSummaries GETs each node's summary JSON from the filer (10s timeout
+// each). Per-node fetch or parse failures warn and skip — the Prometheus
+// metrics are still valuable, so this path is never fatal. Returns parsed
+// summaries and the raw bytes (for the verbatim S3 upload), both keyed by
+// nodeID.
+func fetchSummaries(ctx context.Context, sources []summarySource) (map[string]k6Summary, map[string][]byte) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	parsed := make(map[string]k6Summary)
+	raw := make(map[string][]byte)
+	for _, src := range sources {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, src.URL, nil)
+		if err != nil {
+			fmt.Printf("k6 summary for node %s: build request: %v\n", src.NodeID, err)
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("k6 summary for node %s: fetch %s: %v\n", src.NodeID, src.URL, err)
+			continue
+		}
+		body, rerr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("k6 summary for node %s: %s returned %s\n", src.NodeID, src.URL, resp.Status)
+			continue
+		}
+		if rerr != nil {
+			fmt.Printf("k6 summary for node %s: read body: %v\n", src.NodeID, rerr)
+			continue
+		}
+		var s k6Summary
+		if err := json.Unmarshal(body, &s); err != nil {
+			fmt.Printf("k6 summary for node %s: parse error: %v\n", src.NodeID, err)
+			continue
+		}
+		if len(s.Metrics) == 0 {
+			// Shape drift guard (pre-v0.34 k6 lacks the values nesting).
+			snippet := body
+			if len(snippet) > 200 {
+				snippet = snippet[:200]
+			}
+			fmt.Printf("k6 summary for node %s: no metrics parsed; first bytes: %s\n", src.NodeID, snippet)
+			continue
+		}
+		parsed[src.NodeID] = s
+		raw[src.NodeID] = body
+	}
+	return parsed, raw
+}
+
+// normalizeStat makes k6 stat names CSV/analysis friendly: p(95) → p95.
+func normalizeStat(stat string) string {
+	return strings.NewReplacer("(", "", ")", "").Replace(stat)
+}
+
+// summaryRow builds one CSV row in the existing 8-column layout. Query is the
+// fixed marker "handleSummary" so k6 rows are trivially filterable.
+func summaryRow(endTime, nodeID, metric, stat string, v float64) []string {
+	return []string{
+		endTime, nodeID, "k6",
+		metric + "_" + normalizeStat(stat),
+		"handleSummary", "",
+		strconv.FormatFloat(v, 'g', -1, 64), "",
+	}
+}
+
+// flattenSummaryRows converts one node's summary into CSV rows, every metric
+// and every stat, deterministically ordered.
+func flattenSummaryRows(nodeID, endTime string, s k6Summary) [][]string {
+	var rows [][]string
+	for _, metric := range sortedKeys(s.Metrics) {
+		vals := s.Metrics[metric].Values
+		stats := make([]string, 0, len(vals))
+		for st := range vals {
+			stats = append(stats, st)
+		}
+		sort.Strings(stats)
+		for _, st := range stats {
+			rows = append(rows, summaryRow(endTime, nodeID, metric, st, vals[st]))
+		}
+	}
+	return rows
+}
+
+// aggregateSummaryRows computes the __all__ rows across nodes. Only
+// mathematically valid cross-node aggregations are emitted:
+//   - counter: count = sum (per-second rate omitted — windows may differ)
+//   - rate:    passes/fails = sum, rate recomputed as passes/(passes+fails)
+//   - gauge/trend: min = min-of-min, max = max-of-max
+//
+// avg/med/value and all percentiles are deliberately omitted: averaging
+// per-node percentiles is statistically invalid.
+func aggregateSummaryRows(endTime string, byNode map[string]k6Summary) [][]string {
+	if len(byNode) == 0 {
+		return nil
+	}
+	// metric name → per-node entries (deterministic node order).
+	type acc struct {
+		typ  string
+		vals []map[string]float64
+	}
+	metrics := make(map[string]*acc)
+	for _, nodeID := range sortedKeys(byNode) {
+		for name, m := range byNode[nodeID].Metrics {
+			a := metrics[name]
+			if a == nil {
+				a = &acc{typ: m.Type}
+				metrics[name] = a
+			}
+			a.vals = append(a.vals, m.Values)
+		}
+	}
+
+	sum := func(vals []map[string]float64, stat string) (float64, bool) {
+		total, seen := 0.0, false
+		for _, v := range vals {
+			if x, ok := v[stat]; ok {
+				total += x
+				seen = true
+			}
+		}
+		return total, seen
+	}
+	extreme := func(vals []map[string]float64, stat string, wantMax bool) (float64, bool) {
+		best, seen := 0.0, false
+		for _, v := range vals {
+			x, ok := v[stat]
+			if !ok {
+				continue
+			}
+			if !seen || (wantMax && x > best) || (!wantMax && x < best) {
+				best = x
+			}
+			seen = true
+		}
+		return best, seen
+	}
+
+	var rows [][]string
+	for _, name := range sortedKeys(metrics) {
+		a := metrics[name]
+		switch a.typ {
+		case "counter":
+			if v, ok := sum(a.vals, "count"); ok {
+				rows = append(rows, summaryRow(endTime, summaryAllNodes, name, "count", v))
+			}
+		case "rate":
+			passes, okP := sum(a.vals, "passes")
+			fails, okF := sum(a.vals, "fails")
+			if okP {
+				rows = append(rows, summaryRow(endTime, summaryAllNodes, name, "passes", passes))
+			}
+			if okF {
+				rows = append(rows, summaryRow(endTime, summaryAllNodes, name, "fails", fails))
+			}
+			if okP && okF && passes+fails > 0 {
+				rows = append(rows, summaryRow(endTime, summaryAllNodes, name, "rate", passes/(passes+fails)))
+			}
+		case "gauge", "trend":
+			if v, ok := extreme(a.vals, "min", false); ok {
+				rows = append(rows, summaryRow(endTime, summaryAllNodes, name, "min", v))
+			}
+			if v, ok := extreme(a.vals, "max", true); ok {
+				rows = append(rows, summaryRow(endTime, summaryAllNodes, name, "max", v))
+			}
+		}
+	}
+	return rows
+}
+
+// sortedKeys returns the map's keys in sorted order (deterministic CSV).
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func main() {
@@ -153,6 +360,35 @@ func main() {
 			"refusing to report success with an empty CSV — check Prometheus reachability and the queries", attempted, errored)
 	}
 
+	// 5b. k6 end-of-test summaries: fetch each node's handleSummary JSON from
+	// the SeaweedFS filer and flatten every metric into the same CSV, plus an
+	// __all__ aggregate row set. Unset env var (scripts generated before the
+	// feature, or no k6 nodes) → skip entirely. Never fatal: the Prometheus
+	// rows above are still valuable on partial or total summary loss.
+	var summaryRaw map[string][]byte
+	if src := os.Getenv("K6_SUMMARY_SOURCES"); src != "" {
+		var sources []summarySource
+		if err := json.Unmarshal([]byte(src), &sources); err != nil {
+			fmt.Printf("K6_SUMMARY_SOURCES parse error: %v\n", err)
+		} else {
+			byNode, raw := fetchSummaries(ctx, sources)
+			summaryRaw = raw
+			summaryRows := 0
+			for _, nodeID := range sortedKeys(byNode) {
+				for _, row := range flattenSummaryRows(nodeID, endStr, byNode[nodeID]) {
+					_ = writer.Write(row)
+					summaryRows++
+				}
+			}
+			for _, row := range aggregateSummaryRows(endStr, byNode) {
+				_ = writer.Write(row)
+				summaryRows++
+			}
+			fmt.Printf("k6 summaries: %d/%d nodes fetched, %d CSV rows\n",
+				len(byNode), len(sources), summaryRows)
+		}
+	}
+
 	// Close writer + file before reading / uploading.
 	writer.Flush()
 	if err := writer.Error(); err != nil {
@@ -179,7 +415,7 @@ func main() {
 		dumpToStdout(fileName)
 	} else {
 		key := objectKeyFor(loadtestName)
-		if err := uploadToS3(ctx, fileName, bucket, key); err != nil {
+		if err := uploadToS3(ctx, fileName, bucket, key, "text/csv"); err != nil {
 			log.Fatalf("S3 upload: %v", err)
 		}
 	}
@@ -189,6 +425,33 @@ func main() {
 	// way as metrics — S3 when configured, else stdout. A missing/empty dir
 	// (no k6 logs) is tolerated without error.
 	exportK6Logs(ctx, s3Enabled, bucket, loadtestName)
+
+	// 8. Raw per-node handleSummary JSONs, verbatim: the official k6
+	// aggregates survive next to the flattened CSV rows.
+	exportK6Summaries(ctx, s3Enabled, bucket, loadtestName, summaryRaw)
+}
+
+// exportK6Summaries ships each node's raw summary JSON: to S3 (sibling of the
+// k6 logs) when enabled, otherwise to stdout between per-node markers.
+// Per-node failures warn and continue, matching exportK6Logs.
+func exportK6Summaries(ctx context.Context, s3Enabled bool, bucket, loadtestName string, raw map[string][]byte) {
+	for _, nodeID := range sortedKeys(raw) {
+		if !s3Enabled {
+			fmt.Printf("----- BEGIN K6 SUMMARY %s -----\n", nodeID)
+			fmt.Println(string(raw[nodeID]))
+			fmt.Printf("----- END K6 SUMMARY %s -----\n", nodeID)
+			continue
+		}
+		path := fmt.Sprintf("tmp/export/%s-summary.json", nodeID)
+		if err := os.WriteFile(path, raw[nodeID], 0o644); err != nil {
+			fmt.Printf("k6 summary for node %s: write temp file: %v\n", nodeID, err)
+			continue
+		}
+		key := k6SummaryKeyFor(loadtestName, nodeID)
+		if err := uploadToS3(ctx, path, bucket, key, "application/json"); err != nil {
+			fmt.Printf("k6 summary S3 upload for node %s failed: %v\n", nodeID, err)
+		}
+	}
 }
 
 // exportK6Logs reads each "<nodeID>.log" file under K6_LOG_DIR and ships it:
@@ -217,7 +480,7 @@ func exportK6Logs(ctx context.Context, s3Enabled bool, bucket, loadtestName stri
 
 		if s3Enabled {
 			key := k6ObjectKeyFor(loadtestName, nodeID)
-			if err := uploadToS3(ctx, fullPath, bucket, key); err != nil {
+			if err := uploadToS3(ctx, fullPath, bucket, key, "text/plain"); err != nil {
 				fmt.Printf("k6 log S3 upload for node %s failed: %v\n", nodeID, err)
 			}
 			continue
@@ -249,12 +512,13 @@ func dumpToStdout(fileName string) {
 	fmt.Println("----- END CSV -----")
 }
 
-// uploadToS3 uploads csvPath to s3://bucket/key. The function is responsible
-// for HeadBucket → CreateBucket (when missing) → PutObject. Static creds
-// come from S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY; region from S3_REGION;
-// optional custom endpoint from S3_ENDPOINT (e.g. SeaweedFS); path-style
-// addressing toggled by S3_FORCE_PATH_STYLE.
-func uploadToS3(ctx context.Context, csvPath, bucket, key string) error {
+// uploadToS3 uploads the file at path to s3://bucket/key with the given
+// Content-Type. The function is responsible for HeadBucket → CreateBucket
+// (when missing) → PutObject. Static creds come from S3_ACCESS_KEY_ID /
+// S3_SECRET_ACCESS_KEY; region from S3_REGION; optional custom endpoint from
+// S3_ENDPOINT (e.g. SeaweedFS); path-style addressing toggled by
+// S3_FORCE_PATH_STYLE.
+func uploadToS3(ctx context.Context, path, bucket, key, contentType string) error {
 	region := os.Getenv("S3_REGION")
 	endpoint := os.Getenv("S3_ENDPOINT")
 	accessKey := os.Getenv("S3_ACCESS_KEY_ID")
@@ -312,9 +576,9 @@ func uploadToS3(ctx context.Context, csvPath, bucket, key string) error {
 	}
 
 	// 2. PutObject.
-	f, err := os.Open(csvPath)
+	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("open csv: %w", err)
+		return fmt.Errorf("open file: %w", err)
 	}
 	defer f.Close()
 
@@ -323,7 +587,7 @@ func uploadToS3(ctx context.Context, csvPath, bucket, key string) error {
 		Bucket:      aws.String(bucket),
 		Key:         aws.String(key),
 		Body:        f,
-		ContentType: aws.String("text/csv"),
+		ContentType: aws.String(contentType),
 	})
 	if err != nil {
 		return fmt.Errorf("put object: %w", err)
@@ -449,6 +713,16 @@ func objectKeyFor(loadtestName string) string {
 // prefix to the metrics CSVs so per-test artifacts group together.
 func k6ObjectKeyFor(loadtestName, nodeID string) string {
 	return fmt.Sprintf("k6/%s/%s-%s.log",
+		loadtestName,
+		nodeID,
+		time.Now().UTC().Format("20060102T150405Z"))
+}
+
+// k6SummaryKeyFor builds the S3 object key for one node's raw handleSummary
+// JSON: k6/<loadtestName>/<nodeID>-summary-<UTC RFC3339-compact>.json —
+// sibling of the k6ObjectKeyFor log keys.
+func k6SummaryKeyFor(loadtestName, nodeID string) string {
+	return fmt.Sprintf("k6/%s/%s-summary-%s.json",
 		loadtestName,
 		nodeID,
 		time.Now().UTC().Format("20060102T150405Z"))

@@ -60,6 +60,15 @@ type k6LogConfigMapRef struct {
 // the exporter Pod. The dataExporter binary reads it via K6_LOG_DIR.
 const k6LogMountPath = "/var/run/k6logs"
 
+// k6SummarySource pairs a k6-load-generator nodeID with the in-cluster filer
+// URL its handleSummary JSON was uploaded to. JSON-encoded into the exporter
+// Job's K6_SUMMARY_SOURCES env var — the operator composes full URLs so the
+// exporter never re-implements sanitize() (drift would 404 every fetch).
+type k6SummarySource struct {
+	NodeID string `json:"nodeId"`
+	URL    string `json:"url"`
+}
+
 // createExporterJob builds the in-cluster Job that runs the dfaas-exporter
 // image to pull metrics from Prometheus over [startTime, endTime] and either
 // upload a CSV to S3 (bucket-per-environment, auto-created on first run) or
@@ -101,6 +110,21 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 		{Name: "END_TIME", Value: endTime.UTC().Format(time.RFC3339)},
 		{Name: "STEP", Value: step},
 		{Name: "EXP_NAME", Value: lt.Name},
+	}
+
+	// k6 end-of-test summaries: one filer URL per node, fetched by the
+	// exporter and flattened into the CSV. In the base block (not the S3 one)
+	// because the summaries exist on the filer regardless of S3 wiring.
+	if len(k6Logs) > 0 {
+		sources := make([]k6SummarySource, 0, len(k6Logs))
+		for _, l := range k6Logs {
+			sources = append(sources, k6SummarySource{NodeID: l.NodeID, URL: summaryFilerURL(lt, l.NodeID)})
+		}
+		sourcesJSON, err := json.Marshal(sources)
+		if err != nil {
+			return nil, fmt.Errorf("encode k6 summary sources: %w", err)
+		}
+		envVars = append(envVars, corev1.EnvVar{Name: "K6_SUMMARY_SOURCES", Value: string(sourcesJSON)})
 	}
 
 	// S3 wiring: when an S3 config Secret was mirrored into this namespace,

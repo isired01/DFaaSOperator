@@ -19,6 +19,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -52,6 +53,9 @@ func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
 	if lt.Spec.SyncStart {
 		logStatusErr(ctx, "delete GO signal (abort)", deleteGoSignal(ctx, lt))
 	}
+	// Any k6 summaries already uploaded will never be consumed — sweep them.
+	// Unconditional: DFAAS_SUMMARY_URL is injected regardless of syncStart.
+	logStatusErr(ctx, "delete k6 summaries (abort)", deleteSummaryObjects(ctx, lt))
 
 	// MetricsExported never ran on abort — stamp False/Skipped per P9 so
 	// UI does not show "in flight" forever on the aborted CR.
@@ -147,8 +151,7 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 		// Best-effort done; release the CR.
 		logger.Info("environment gone during loadtest deletion — releasing finalizer",
 			"env", lt.Spec.TargetEnvironment)
-		controllerutil.RemoveFinalizer(lt, loadTestFinalizer)
-		return ctrl.Result{}, r.Update(ctx, lt)
+		return ctrl.Result{}, r.removeLTFinalizer(ctx, lt)
 	}
 	if err != nil {
 		return ctrl.Result{}, err
@@ -158,10 +161,18 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 	// idempotent: DeleteTestRun uses IgnoreNotFound under the hood, and the
 	// helper transitions phase → Aborted as a side effect. We ignore the
 	// returned Result and run our own NotFound poll below.
-	if _, abortErr := r.abortLoadTest(ctx, lt, &env, dfaasv1.LTReasonUserAborted,
-		"LoadTest aborted on user delete"); abortErr != nil {
-		logger.Error(abortErr, "abortLoadTest during deletion failed; will retry")
-		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	//
+	// Skip once phase is already Aborted: abortLoadTest reaches that phase
+	// only after a clean teardown pass, and re-running it every poll cycle
+	// re-stamps Ready (UserAborted → Aborted flip-flop) — each pass bumped
+	// resourceVersion after our Get, so the finalizer Update below hit a
+	// guaranteed 409 and deletion livelocked.
+	if lt.Status.Phase != dfaasv1.LoadTestAborted {
+		if _, abortErr := r.abortLoadTest(ctx, lt, &env, dfaasv1.LTReasonUserAborted,
+			"LoadTest aborted on user delete"); abortErr != nil {
+			logger.Error(abortErr, "abortLoadTest during deletion failed; will retry")
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
 	}
 
 	// Poll: every TestRun in spec ∪ status must report NotFound on the
@@ -215,7 +226,20 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 	if lt.Spec.SyncStart {
 		logStatusErr(ctx, "delete GO signal (loadtest deletion)", deleteGoSignal(ctx, lt))
 	}
+	// Finalizer path is the catch-all sweep for k6 summaries: covers every
+	// exit that skipped cleanup (crash, Failed before the exporter ran, …).
+	logStatusErr(ctx, "delete k6 summaries (loadtest deletion)", deleteSummaryObjects(ctx, lt))
 	logger.Info("all remote TestRuns reclaimed — removing loadtest finalizer")
-	controllerutil.RemoveFinalizer(lt, loadTestFinalizer)
-	return ctrl.Result{}, r.Update(ctx, lt)
+	return ctrl.Result{}, r.removeLTFinalizer(ctx, lt)
+}
+
+// removeLTFinalizer drops the loadtest finalizer with the re-fetch-then-update
+// pattern: the deletion path writes status (phase/conditions) between the
+// reconcile's Get and this Update, so a plain r.Update on the stale object
+// 409s deterministically. RemoveFinalizer's bool doubles as the write flag.
+func (r *LoadTestReconciler) removeLTFinalizer(ctx context.Context, lt *dfaasv1.LoadTest) error {
+	return updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(lt), &dfaasv1.LoadTest{},
+		func(latest *dfaasv1.LoadTest) bool {
+			return controllerutil.RemoveFinalizer(latest, loadTestFinalizer)
+		})
 }

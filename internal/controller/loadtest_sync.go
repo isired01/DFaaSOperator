@@ -62,10 +62,81 @@ const syncFilerNodePort = "30901"
 // syncRequestTimeout caps each filer HTTP call.
 const syncRequestTimeout = 10 * time.Second
 
+// operatorFilerBase is the filer endpoint the OPERATOR ITSELF dials (GO
+// signal publish/delete, summary cleanup). In-cluster the Service DNS works;
+// with `make run` outside the cluster it does not resolve, so DFAAS_FILER_URL
+// overrides it (e.g. http://<node-ip>:30901 — the filer NodePort). Distinct
+// from syncFilerBase uses that end up inside in-cluster consumers (the
+// exporter Job), which must keep the internal DNS endpoint.
+func operatorFilerBase() string {
+	if v := strings.TrimRight(os.Getenv("DFAAS_FILER_URL"), "/"); v != "" {
+		return v
+	}
+	return syncFilerBase
+}
+
 // syncGoPath is the filer path of the GO object for one LoadTest. Lives
 // outside /buckets so it never shows up as an S3 bucket.
 func syncGoPath(lt *dfaasv1.LoadTest) string {
 	return fmt.Sprintf("/dfaas-sync/%s/%s.go", lt.Namespace, lt.Name)
+}
+
+// k6 end-of-test summaries — same authless filer channel as the GO signal.
+// Each runner's handleSummary() PUTs its summary JSON to DFAAS_SUMMARY_URL
+// (VM-facing NodePort); the dataExporter Job GETs them back via the
+// in-cluster DNS endpoint and flattens them into the metrics CSV.
+
+// summaryDirPath is the per-LoadTest filer directory holding one summary
+// object per k6 node. Outside /buckets, like the GO object.
+func summaryDirPath(lt *dfaasv1.LoadTest) string {
+	return fmt.Sprintf("/dfaas-k6-summary/%s/%s", lt.Namespace, lt.Name)
+}
+
+// summaryPath is the filer path of one node's summary object.
+func summaryPath(lt *dfaasv1.LoadTest, nodeID string) string {
+	return fmt.Sprintf("%s/%s.json", summaryDirPath(lt), sanitize(nodeID))
+}
+
+// summaryURL is the VM-facing URL injected into the runner as
+// DFAAS_SUMMARY_URL. Empty when the public base is unresolvable — the
+// generated script then skips the upload (a missing summary only degrades
+// data richness, unlike the sync barrier which must fail loudly).
+func summaryURL(lt *dfaasv1.LoadTest, nodeID string) string {
+	base := syncPublicBase()
+	if base == "" {
+		return ""
+	}
+	return base + summaryPath(lt, nodeID)
+}
+
+// summaryFilerURL is the in-cluster URL the exporter Job fetches one node's
+// summary from. Composed operator-side so the exporter never has to
+// re-implement sanitize() (drift there would 404 every fetch).
+func summaryFilerURL(lt *dfaasv1.LoadTest, nodeID string) string {
+	return syncFilerBase + summaryPath(lt, nodeID)
+}
+
+// deleteSummaryObjects best-effort removes the whole per-LoadTest summary
+// directory (one recursive filer DELETE instead of N per-node ones — also
+// sweeps files from nodes later removed from the spec). Called once the
+// exporter has consumed the summaries, and from the abort/deletion paths.
+func deleteSummaryObjects(ctx context.Context, lt *dfaasv1.LoadTest) error {
+	ctx, cancel := context.WithTimeout(ctx, syncRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
+		operatorFilerBase()+summaryDirPath(lt)+"/?recursive=true", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("delete k6 summaries: filer returned %s", resp.Status)
+	}
+	return nil
 }
 
 // syncPublicBase resolves the base URL the k6 VMs poll the GO object from:
@@ -100,7 +171,7 @@ func publishGoSignal(ctx context.Context, lt *dfaasv1.LoadTest) error {
 	ctx, cancel := context.WithTimeout(ctx, syncRequestTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
-		syncFilerBase+syncGoPath(lt), strings.NewReader("go"))
+		operatorFilerBase()+syncGoPath(lt), strings.NewReader("go"))
 	if err != nil {
 		return err
 	}
@@ -122,7 +193,7 @@ func deleteGoSignal(ctx context.Context, lt *dfaasv1.LoadTest) error {
 	ctx, cancel := context.WithTimeout(ctx, syncRequestTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
-		syncFilerBase+syncGoPath(lt), nil)
+		operatorFilerBase()+syncGoPath(lt), nil)
 	if err != nil {
 		return err
 	}

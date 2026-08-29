@@ -132,8 +132,14 @@ spec:
                         "5m").
                       type: string
                     nodeID:
-                      description: NodeID must match a k6-load-generator node in the
-                        target Environment.
+                      description: |-
+                        NodeID must match a k6-load-generator node in the target Environment.
+                        Same DNS-1123 constraint as EnvironmentNode.NodeID (embedded in remote
+                        TestRun / ConfigMap names).
+                        Pattern (not CEL XValidation): CEL cost estimation on unbounded
+                        node arrays blows the schema budget; the OpenAPI pattern is free.
+                      maxLength: 63
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                       type: string
                     scriptConfigMap:
                       description: |-
@@ -190,6 +196,18 @@ spec:
                   machine immutable post-start.
 
                   Pattern mirrors batch/v1.Job.spec.suspend.
+                type: boolean
+              syncStart:
+                default: false
+                description: |-
+                  SyncStart, when true, synchronizes traffic start across all generators:
+                  each remote runner's script blocks in setup() polling a GO-signal URL
+                  (injected as the DFAAS_SYNC_URL runner env var), and the reconciler
+                  publishes the signal on the in-cluster SeaweedFS filer only once every
+                  TestRun reports stage "started". Residual skew ≈ the script's poll
+                  interval (~250ms). Requires the k6 VMs to reach the management node on
+                  the filer NodePort (30901). If any runner fails to start within the
+                  sync wait budget the whole test is aborted and marked Failed.
                 type: boolean
               targetEnvironment:
                 description: Name of an Environment in the same namespace.

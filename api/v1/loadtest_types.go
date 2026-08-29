@@ -91,7 +91,13 @@ const (
 // k3s cluster.
 type PerNodeLoad struct {
 	// NodeID must match a k6-load-generator node in the target Environment.
+	// Same DNS-1123 constraint as EnvironmentNode.NodeID (embedded in remote
+	// TestRun / ConfigMap names).
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MaxLength=63
+	// Pattern (not CEL XValidation): CEL cost estimation on unbounded
+	// node arrays blows the schema budget; the OpenAPI pattern is free.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	NodeID string `json:"nodeID"`
 
 	// k6 virtual-users for this machine.
