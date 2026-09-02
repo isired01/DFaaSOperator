@@ -43,6 +43,13 @@ type LoadTestReconciler struct {
 	client.Client
 	Scheme     *runtime.Scheme
 	Dispatcher *k6dispatch.Dispatcher
+	// APIReader reads straight from the API server, bypassing the informer
+	// cache. Used for the single decisive List in envOccupancyGate: the
+	// single-active-test-per-Environment invariant is decided from that List
+	// while sibling TestRuns are persisted through direct Status().Update
+	// calls, so a lagging cache can show two tests an empty Environment.
+	// Nil-safe: falls back to the cached client when unset (unit tests).
+	APIReader client.Reader
 }
 
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=loadtests,verbs=get;list;watch;create;update;patch;delete
@@ -228,13 +235,24 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 }
 
 // setLoadTestPhase patches status.phase, retrying on conflict. Also stamps
-// the LTCondReady aggregator (P9).
+// the LTCondReady aggregator (P9) with the generic per-phase text.
 func (r *LoadTestReconciler) setLoadTestPhase(ctx context.Context,
 	lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase) (ctrl.Result, error) {
+	return r.setLoadTestPhaseDetail(ctx, lt, phase, "", "")
+}
+
+// setLoadTestPhaseDetail is setLoadTestPhase with an explicit reason/message
+// for the Ready aggregator. Callers that already computed a specific
+// diagnostic ("all 3 remote TestRuns reported error stage") must go through
+// here: meta.SetStatusCondition overwrites Reason and Message wholesale, so a
+// condition stamped before the phase transition is otherwise replaced by the
+// generic text one instant later. The UI renders both verbatim.
+func (r *LoadTestReconciler) setLoadTestPhaseDetail(ctx context.Context,
+	lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase, reason, message string) (ctrl.Result, error) {
 
 	err := r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
 		latest.Status.Phase = phase
-		stampLTAggregate(latest, phase)
+		stampLTAggregate(latest, phase, reason, message)
 		return nil
 	})
 	if err != nil {
@@ -244,8 +262,9 @@ func (r *LoadTestReconciler) setLoadTestPhase(ctx context.Context,
 }
 
 // stampLTAggregate writes the LTCondReady aggregator (P9) onto the in-memory
-// LoadTest. Pure function; caller persists via Status().Update.
-func stampLTAggregate(lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase) {
+// LoadTest. Pure function; caller persists via Status().Update. A non-empty
+// reasonOverride / msgOverride replaces the generic per-phase value.
+func stampLTAggregate(lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase, reasonOverride, msgOverride string) {
 	var ready metav1.ConditionStatus
 	var reason, message string
 	switch phase {
@@ -278,6 +297,12 @@ func stampLTAggregate(lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase) {
 		reason = dfaasv1.LTReasonPending
 		message = "awaiting first reconcile"
 	}
+	if reasonOverride != "" {
+		reason = reasonOverride
+	}
+	if msgOverride != "" {
+		message = msgOverride
+	}
 	meta.SetStatusCondition(&lt.Status.Conditions, metav1.Condition{
 		Type:    dfaasv1.LTCondReady,
 		Status:  ready,
@@ -286,15 +311,15 @@ func stampLTAggregate(lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase) {
 	})
 }
 
-// failLoadTest stamps Failed phase + a generic failure message on the Ready
-// aggregator. Callers wanting a richer reason should stamp a sub-condition
-// before calling failLoadTest (the aggregator overwrites only Ready).
+// failLoadTest moves the LoadTest to Failed, carrying the caller's specific
+// message onto the Ready aggregator. Callers wanting a richer reason should
+// stamp a sub-condition before calling failLoadTest (the aggregator overwrites
+// only Ready).
 func (r *LoadTestReconciler) failLoadTest(ctx context.Context,
 	lt *dfaasv1.LoadTest, message string) (ctrl.Result, error) {
 
-	logStatusErr(ctx, "stamp Ready=False (failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondReady, metav1.ConditionFalse,
-		dfaasv1.LTReasonFailed, message))
-	return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
+	return r.setLoadTestPhaseDetail(ctx, lt, dfaasv1.LoadTestFailed,
+		dfaasv1.LTReasonFailed, message)
 }
 
 // atomicStatusUpdate runs mutate against the freshly-fetched LoadTest and
@@ -368,7 +393,7 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 	lt *dfaasv1.LoadTest) (proceed bool, res ctrl.Result, err error) {
 
 	var list dfaasv1.LoadTestList
-	if err := r.List(ctx, &list, client.InNamespace(lt.Namespace)); err != nil {
+	if err := r.occupancyReader().List(ctx, &list, client.InNamespace(lt.Namespace)); err != nil {
 		return false, ctrl.Result{}, err
 	}
 
@@ -458,6 +483,15 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 		return false, ctrl.Result{}, cerr
 	}
 	return true, ctrl.Result{}, nil
+}
+
+// occupancyReader returns the reader backing the occupancy List: the
+// cache-bypassing APIReader when wired, otherwise the cached client.
+func (r *LoadTestReconciler) occupancyReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // loadTestBefore orders two LoadTests by creationTimestamp, tie-broken by name.

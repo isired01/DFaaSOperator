@@ -45,6 +45,16 @@ const defaultThumbSize = 128
 // upload limit) so a hostile payload cannot exhaust memory.
 const maxBodyBytes = 32 << 20
 
+// maxImagePixels caps the pixel count (width x height) declared in the image
+// header. maxBodyBytes only bounds the *compressed* body, so a few-KB PNG or
+// GIF can declare enormous dimensions and make image.Decode allocate gigabytes
+// — a decompression bomb that OOM-kills the pod mid-load-test, where it just
+// looks like an ordinary load-induced failure. 16.7 MPx (e.g. 4096x4096) keeps
+// the decode buffer around 64 MB, twice the compressed-body cap, and is far
+// above any realistic load-test asset (which should be small anyway: it is
+// POSTed in full on every request).
+const maxImagePixels = 1 << 24
+
 func main() {
 	port := getenv("UPSTREAM_PORT", "8082")
 
@@ -74,6 +84,20 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// Decompression-bomb guard: read only the header first and reject an
+	// oversized image before image.Decode allocates its pixel buffer. A header
+	// that does not parse falls through to image.Decode below, which fails with
+	// the same error plus the richer diagnostic.
+	if cfg, _, cerr := image.DecodeConfig(bytes.NewReader(body)); cerr == nil {
+		if px := int64(cfg.Width) * int64(cfg.Height); px > maxImagePixels {
+			log.Printf("rejected oversized image: %dx%d = %d pixels (cap %d), bodyLen=%d",
+				cfg.Width, cfg.Height, px, maxImagePixels, len(body))
+			http.Error(w, fmt.Sprintf("image too large: %dx%d exceeds the %d-pixel cap",
+				cfg.Width, cfg.Height, maxImagePixels), http.StatusRequestEntityTooLarge)
+			return
+		}
 	}
 
 	src, format, err := image.Decode(bytes.NewReader(body))

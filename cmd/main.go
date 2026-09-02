@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -47,6 +48,11 @@ var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
 )
+
+// s3BootstrapTimeout caps the pre-manager S3 bootstrap (namespace + default
+// config Secret). Both calls run against a direct client, before the cache is
+// up, so nothing else would ever interrupt them.
+const s3BootstrapTimeout = 30 * time.Second
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -108,14 +114,19 @@ func main() {
 		setupLog.Error(err, "unable to build bootstrap client")
 		os.Exit(1)
 	}
-	if err := controller.EnsureS3Namespace(context.Background(), bootstrapClient); err != nil {
+	// Bounded: an unreachable API server would otherwise hang startup forever
+	// on a deadline-less context, with no crash and therefore no restart. Fail
+	// fast like every other startup error here and let the Pod restart.
+	bootstrapCtx, cancelBootstrap := context.WithTimeout(context.Background(), s3BootstrapTimeout)
+	defer cancelBootstrap()
+	if err := controller.EnsureS3Namespace(bootstrapCtx, bootstrapClient); err != nil {
 		setupLog.Error(err, "unable to ensure S3 config namespace")
 		os.Exit(1)
 	}
 	// Seed the default S3 config Secret pointing at the in-cluster SeaweedFS sink
 	// so Environments with no explicit s3ConfigRef default to SeaweedFS instead of
 	// stdout. Create-if-not-exists: never clobbers an admin-edited config.
-	if err := controller.EnsureDefaultS3Config(context.Background(), bootstrapClient); err != nil {
+	if err := controller.EnsureDefaultS3Config(bootstrapCtx, bootstrapClient); err != nil {
 		setupLog.Error(err, "unable to ensure default S3 config")
 		os.Exit(1)
 	}
@@ -151,6 +162,8 @@ func main() {
 		Scheme:    mgr.GetScheme(),
 		Recorder:  mgr.GetEventRecorderFor("environment-controller"),
 		Clientset: clientset,
+		// Uncached: the health-probe throttle must not read its own stale write.
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Environment")
 		os.Exit(1)
@@ -159,6 +172,9 @@ func main() {
 		Client:     mgr.GetClient(),
 		Scheme:     mgr.GetScheme(),
 		Dispatcher: &k6dispatch.Dispatcher{Local: mgr.GetClient()},
+		// Cache-bypassing reader for the single-active-test-per-Environment
+		// gate, which must not decide from a stale informer snapshot.
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "LoadTest")
 		os.Exit(1)

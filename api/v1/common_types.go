@@ -50,12 +50,15 @@ type Function struct {
 	Image string `json:"image"`
 
 	// +kubebuilder:default=5
+	// +kubebuilder:validation:Minimum=1
 	ExecTimeout int `json:"execTimeout"`
 
 	// +kubebuilder:default=400
+	// +kubebuilder:validation:Minimum=1
 	MaxInflight int `json:"maxInflight"`
 
 	// +kubebuilder:default=6000
+	// +kubebuilder:validation:Minimum=1
 	TimeoutMs int `json:"timeoutMs"`
 
 	// MaxRate is the per-function request rate cap (req/s) consumed by
@@ -68,6 +71,11 @@ type Function struct {
 }
 
 // Topology declares inter-node network shaping (latency injection).
+//
+// NOT IMPLEMENTED: the field is schema-only. Nothing in the operator or in the
+// Ansible playbooks reads it, so a declared link's latencyMs is never applied
+// to any node. It is kept so existing manifests still validate; treat it as
+// documentation of intent, not as a working feature.
 type Topology struct {
 	// +optional
 	Links []Link `json:"links,omitempty"`

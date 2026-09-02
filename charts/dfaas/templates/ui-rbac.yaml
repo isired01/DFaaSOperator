@@ -28,6 +28,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log", "events"]
     verbs: ["get", "list", "watch"]
+  # Node addresses back the asset-upload public URL (SeaweedFS S3 NodePort 30900).
+  # Without this the gateway cannot auto-detect a node IP and every upload fails;
+  # SEAWEEDFS_PUBLIC_URL (ui.env) then becomes mandatory rather than an override.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "list", "watch"]

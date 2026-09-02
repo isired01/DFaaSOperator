@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -153,8 +154,12 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 		},
 	}
 
-	_ = ctrl.SetControllerReference(env, secret, m.Scheme)
-	_ = ctrl.SetControllerReference(env, job, m.Scheme)
+	if err := ctrl.SetControllerReference(env, secret, m.Scheme); err != nil {
+		return nil, nil, fmt.Errorf("set controller ref on inventory secret: %w", err)
+	}
+	if err := ctrl.SetControllerReference(env, job, m.Scheme); err != nil {
+		return nil, nil, fmt.Errorf("set controller ref on ansible job: %w", err)
+	}
 	return job, secret, nil
 }
 
@@ -242,13 +247,41 @@ func shortUID(env *dfaasv1.Environment) string {
 	return uid
 }
 
+// MaxJobNameLen is the Kubernetes label-value limit, which is what actually
+// bounds a Job name: with no explicit selector the Job controller copies the
+// Job's name verbatim into the auto-generated `job-name` /
+// `batch.kubernetes.io/job-name` pod-template labels. Object names may run to
+// 253 characters, but a Job named longer than this is rejected at CREATE with
+//
+//	spec.template.labels: Invalid value: "<name>": must be no more than 63 bytes
+//
+// and the reconciler then retries forever. Observed in the wild on an exporter
+// Job for a 41-character LoadTest name.
+const MaxJobNameLen = 63
+
+// BoundedJobName joins prefix+suffix, truncating the PREFIX (the caller-chosen
+// resource name) so the result fits MaxJobNameLen. The suffix carries the UID
+// and generation that make the name unique, so it is preserved intact — two
+// long names sharing a prefix stay distinct. Any trailing '-' left by the cut
+// is trimmed so the result remains a valid DNS-1123 name.
+func BoundedJobName(prefix, suffix string) string {
+	if len(prefix)+len(suffix) <= MaxJobNameLen {
+		return prefix + suffix
+	}
+	keep := MaxJobNameLen - len(suffix)
+	if keep < 0 {
+		keep = 0
+	}
+	return strings.TrimRight(prefix[:keep], "-") + suffix
+}
+
 // JobNameForRole returns the deterministic Ansible Job name. Includes
 // `env.UID[:8]` to scope across delete+recreate of the same env.Name, and
 // `env.Generation` so a spec edit gets a fresh Job rather than reusing the
 // previous run's status.
 func JobNameForRole(env *dfaasv1.Environment, jobSuffix string) string {
-	return fmt.Sprintf("%s-infra-%s-%s-g%d-job",
-		env.Name, jobSuffix, shortUID(env), env.Generation)
+	return BoundedJobName(env.Name, fmt.Sprintf("-infra-%s-%s-g%d-job",
+		jobSuffix, shortUID(env), env.Generation))
 }
 
 // InventorySecretName mirrors JobNameForRole for the per-Job inventory Secret.

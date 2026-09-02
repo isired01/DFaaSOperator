@@ -24,6 +24,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/ansible"
 )
 
 // exporterImage resolves the dataExporter image at Job-build time. The Helm
@@ -40,12 +41,19 @@ func exporterImage() string {
 // `lt.UID[:8]` and `lt.Generation`, so re-running a LoadTest after a spec
 // edit (or a delete + recreate with the same name) never recovers a stale
 // Job from the previous incarnation.
+//
+// The LoadTest name is truncated when needed to keep the Job name inside the
+// 63-byte label-value cap (see ansible.BoundedJobName): the Job controller
+// copies this name into the pod-template `job-name` label, so an over-long
+// name is rejected at CREATE and the export then retries forever. A
+// UI-generated name like "lt-bari-20260901-152930-saturation-e76fcb"
+// (41 chars) already overflows it.
 func ExporterJobName(lt *dfaasv1.LoadTest) string {
 	uid := string(lt.UID)
 	if len(uid) > 8 {
 		uid = uid[:8]
 	}
-	return fmt.Sprintf("%s-exporter-%s-g%d-job", lt.Name, uid, lt.Generation)
+	return ansible.BoundedJobName(lt.Name, fmt.Sprintf("-exporter-%s-g%d-job", uid, lt.Generation))
 }
 
 // k6LogConfigMapRef pairs a k6-load-generator nodeID with the ConfigMap that
@@ -241,6 +249,8 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 			},
 		},
 	}
-	_ = ctrl.SetControllerReference(lt, job, r.Scheme)
+	if err := ctrl.SetControllerReference(lt, job, r.Scheme); err != nil {
+		return nil, fmt.Errorf("set controller ref on exporter job: %w", err)
+	}
 	return job, nil
 }

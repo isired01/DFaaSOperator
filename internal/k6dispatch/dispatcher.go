@@ -87,8 +87,8 @@ func (d *Dispatcher) remoteClient(ctx context.Context, secretRef types.Namespace
 }
 
 // ApplyTestRun creates or updates a TestRun on the remote cluster. The caller
-// is responsible for setting GVK + ObjectMeta + Spec on tr; this helper only
-// dispatches.
+// provides ObjectMeta + Spec on tr; the GVK is (re-)stamped here, so callers
+// need not set it themselves.
 func (d *Dispatcher) ApplyTestRun(ctx context.Context, secretRef types.NamespacedName,
 	tr *unstructured.Unstructured) error {
 

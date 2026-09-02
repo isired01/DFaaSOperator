@@ -113,14 +113,21 @@ spec:
                     type: array
                   step:
                     default: 15s
-                    description: Step for QueryRange (Go duration string).
+                    description: |-
+                      Step for QueryRange, as a Go duration string (e.g. "15s", "1m").
+                      Same admission-time guard as PerNodeLoad.Duration: an unparsable step
+                      would otherwise only surface inside the exporter Job.
+                    pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
                     type: string
                 required:
                 - metrics
                 type: object
               perNodeLoad:
-                description: One entry per k6-load-generator node the test should
-                  hit.
+                description: |-
+                  One entry per k6-load-generator node the test should hit. Keyed by
+                  nodeID: the API server rejects duplicates at admission (listType=map),
+                  which would otherwise produce two entries competing over the same remote
+                  TestRun name.
                 items:
                   description: |-
                     PerNodeLoad is the FE-supplied per-k6-machine load. The reconciler creates
@@ -128,8 +135,12 @@ spec:
                     k3s cluster.
                   properties:
                     duration:
-                      description: k6 test duration (Go duration string, e.g. "30s",
-                        "5m").
+                      description: |-
+                        k6 test duration as a Go duration string, e.g. "30s", "5m", "1h30m".
+                        The pattern is the admission-time guard: a human-readable value such as
+                        "5 minutes" used to pass validation and only fail inside the remote k6
+                        runner, after the whole dispatch had already happened.
+                      pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
                       type: string
                     nodeID:
                       description: |-
@@ -166,6 +177,9 @@ spec:
                   type: object
                 minItems: 1
                 type: array
+                x-kubernetes-list-map-keys:
+                - nodeID
+                x-kubernetes-list-type: map
               startAt:
                 description: |-
                   StartAt schedules the LoadTest to start at this wall-clock instant.
@@ -188,12 +202,13 @@ spec:
                 default: false
                 description: |-
                   Suspended marks the LoadTest as a "Save as Draft": when true, the
-                  reconciler keeps phase=Pending, stamps Conditions[Suspended]=True,
-                  and does NOT dispatch any k6 TestRun. PATCHing to false activates
-                  the test (the Suspended Condition flips to False, phase advances to
-                  Running). Once execution begins (phase=Running or beyond), changes
-                  to this field are ignored — the run-once guard makes the state
-                  machine immutable post-start.
+                  reconciler keeps phase=Pending and does NOT dispatch any k6 TestRun.
+                  PATCHing to false activates the test (phase advances to Running).
+                  Once execution begins (phase=Running or beyond), changes to this field
+                  are ignored — the run-once guard makes the state machine immutable
+                  post-start. No Condition mirrors this field: consumers must read
+                  spec.suspended itself to tell a draft apart from a test waiting on its
+                  Environment.
 
                   Pattern mirrors batch/v1.Job.spec.suspend.
                 type: boolean

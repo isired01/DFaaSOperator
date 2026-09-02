@@ -39,6 +39,14 @@ const monitoringRetryBudget = 5
 // handleEnvDeletion drains per-environment cluster-wide state (Prometheus
 // targets) and removes the finalizer. Per-environment Jobs and ConfigMaps
 // carry ControllerReferences and are garbage-collected automatically.
+//
+// The finalizer is dropped only once CleanupTargets succeeds: it is the single
+// piece of state that does NOT cascade (the prometheus-targets ConfigMap is
+// shared across environments and owned by none), so releasing the CR on a
+// failed cleanup would leave this environment's scrape file behind forever,
+// with Prometheus retrying dead targets. A failed cleanup is returned so the
+// deletion is retried with backoff — same guarantee the LoadTest finalizer
+// gives for remote TestRuns.
 func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -47,7 +55,10 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 		logger.Info("environment deletion: cleaning up Prometheus targets")
 
 		mm := &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
-		logStatusErr(ctx, "cleanup Prometheus targets", mm.CleanupTargets(ctx, env))
+		if err := mm.CleanupTargets(ctx, env); err != nil {
+			logger.Error(err, "cleanup Prometheus targets failed; keeping the finalizer and retrying")
+			return ctrl.Result{}, fmt.Errorf("cleanup Prometheus targets: %w", err)
+		}
 
 		controllerutil.RemoveFinalizer(env, environmentFinalizer)
 		if err := r.Update(ctx, env); err != nil {
@@ -221,7 +232,17 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 	if rerr := r.resetMonitoringAttempts(ctx, env); rerr != nil {
 		logger.Error(rerr, "resetMonitoringAttempts failed; non-fatal")
 	}
-	ready, _ := mm.Check(ctx)
+	ready, checkErr := mm.Check(ctx)
+	if checkErr != nil {
+		// "Could not evaluate" is not "not ready yet": a refused Pod List (RBAC
+		// regression, API server down) would otherwise be indistinguishable from
+		// a slow rollout and the Environment would sit in ProvisioningMonitoring
+		// with a reassuring "pods not Ready yet" message.
+		logStatusErr(ctx, "stamp MonitoringReady=Unknown (check failed)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
+			metav1.ConditionUnknown, dfaasv1.EnvReasonCheckFailed,
+			"monitoring readiness could not be evaluated: "+condMessage(checkErr)))
+		return false, false, nil
+	}
 	if !ready {
 		logStatusErr(ctx, "stamp MonitoringReady=False (waiting pods)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
 			metav1.ConditionFalse, dfaasv1.EnvReasonWaitingPods,

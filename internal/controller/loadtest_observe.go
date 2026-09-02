@@ -29,6 +29,17 @@ import (
 	"dfaas-operator/internal/k6dispatch"
 )
 
+// exportCooldown is how long the reconciler waits, after k6 finishes, before
+// creating the exporter Job. It matches the management Prometheus federation
+// interval (the prometheus chart's default global.scrape_interval, 1m): the
+// mgmt instance pulls worker metrics through /federate rather than scraping
+// them directly, so the last samples of a run land up to one interval after
+// the run ends. Waiting one full period guarantees at least one federation
+// pull covering EndTime. The query window itself is unchanged — see the call
+// site in runExporter. Raise this if global.scrape_interval is ever raised in
+// internal/controller/monitoring/values/prometheus-values.yaml.
+const exportCooldown = time.Minute
+
 // observeK6 polls every remote TestRun. When all have reached a terminal
 // stage (finished/stopped) it transitions to Exporting; on any error it
 // fails the LoadTest.
@@ -44,10 +55,9 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 	copy(updatedRefs, lt.Status.TestRuns)
 
 	for i, ref := range lt.Status.TestRuns {
-		k6Node, ok := k6Index[ref.NodeID]
-		if !ok || k6Node.KubeconfigSecret == "" {
-			return r.failLoadTest(ctx, lt,
-				fmt.Sprintf("k6 node %q no longer present on env", ref.NodeID))
+		k6Node, nerr := resolveK6Node(k6Index, ref.NodeID)
+		if nerr != nil {
+			return r.failLoadTest(ctx, lt, nerr.Error())
 		}
 		secretRef := types.NamespacedName{Name: k6Node.KubeconfigSecret, Namespace: lt.Namespace}
 		remoteKey := types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}
@@ -55,7 +65,7 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 		tr, err := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey)
 		if err != nil {
 			logger.Error(err, "remote TestRun fetch failed", "node", ref.NodeID, "name", ref.Name)
-			res, _, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonApplyFailed)
+			res, _, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonFetchFailed)
 			return res, oerr
 		}
 		// Successful dispatcher round-trip — reset the budget counter.
@@ -129,7 +139,7 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 	if err := r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
 		latest.Status.EndTime = &now
 		latest.Status.Phase = dfaasv1.LoadTestExporting
-		stampLTAggregate(latest, dfaasv1.LoadTestExporting)
+		stampLTAggregate(latest, dfaasv1.LoadTestExporting, "", "")
 		return nil
 	}); err != nil {
 		return ctrl.Result{}, err
@@ -154,9 +164,10 @@ func (r *LoadTestReconciler) captureK6Logs(ctx context.Context,
 
 	k6Index := computeK6NodeIndex(env)
 	for _, ref := range lt.Status.TestRuns {
-		k6Node, ok := k6Index[ref.NodeID]
-		if !ok || k6Node.KubeconfigSecret == "" {
-			logger.Info("skipping k6 log capture: node has no kubeconfig secret", "node", ref.NodeID)
+		k6Node, nerr := resolveK6Node(k6Index, ref.NodeID)
+		if nerr != nil {
+			// Best-effort path: nothing to read from a node we cannot reach.
+			logger.Error(nerr, "skipping k6 log capture", "node", ref.NodeID)
 			continue
 		}
 
@@ -205,13 +216,37 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 	err := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: lt.Namespace}, &job)
 
 	if apierrors.IsNotFound(err) {
-		logger.Info("creating exporter Job", "job", jobName)
 		if lt.Status.StartTime == nil || lt.Status.EndTime == nil {
 			logStatusErr(ctx, "stamp MetricsExported=False (missing times)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
 				metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
 				"missing StartTime/EndTime; cannot run exporter"))
 			return r.failLoadTest(ctx, lt, "missing StartTime/EndTime; cannot run exporter")
 		}
+
+		// Cool-down before querying. The management Prometheus does not scrape
+		// the workers directly — it federates from each worker's own Prometheus
+		// on the chart-default 1m interval, so at the instant k6 stops, the tail
+		// of the run may not have been pulled across yet. Exporting immediately
+		// truncates the CSV by up to one federation period, and by a different
+		// amount on every run (it depends where EndTime lands in the cycle),
+		// which makes the tails of two otherwise-identical runs incomparable.
+		//
+		// The query window is NOT extended: END_TIME stays at the k6 finish, so
+		// the CSV still covers exactly the load test — the wait only lets the
+		// samples for that window arrive. Keyed off the persisted Status.EndTime,
+		// so an operator restart mid-cool-down resumes with the correct deadline
+		// rather than starting the minute again.
+		if waited := time.Since(lt.Status.EndTime.Time); waited < exportCooldown {
+			remaining := exportCooldown - waited
+			logStatusErr(ctx, "stamp MetricsExported=Unknown (cooldown)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+				metav1.ConditionUnknown, dfaasv1.LTReasonExportCooldown,
+				fmt.Sprintf("cooling down %s before export so Prometheus federates the end of the run (%s left)",
+					exportCooldown, remaining.Truncate(time.Second))))
+			logger.Info("export cool-down in progress", "remaining", remaining.Truncate(time.Second))
+			return ctrl.Result{RequeueAfter: remaining}, nil
+		}
+
+		logger.Info("creating exporter Job", "job", jobName)
 
 		// Always resolve an S3 config name. With no explicit s3ConfigRef the
 		// Environment defaults to the in-cluster SeaweedFS sink (DefaultS3ConfigName)
@@ -225,15 +260,16 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 		mirrored, mirrorErr := r.ensureMirroredS3Secret(ctx, lt, configName)
 		if mirrorErr != nil {
 			if apierrors.IsNotFound(mirrorErr) {
+				missing := fmt.Sprintf("S3 config %q not found in namespace %s",
+					configName, S3ConfigNamespace)
 				// Stamp the S3ConfigMissing condition either way for visibility.
 				logStatusErr(ctx, "stamp MetricsExported=False (s3 config missing)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
-					metav1.ConditionFalse, dfaasv1.LTReasonS3ConfigMissing,
-					fmt.Sprintf("S3 config %q not found in namespace %s",
-						configName, S3ConfigNamespace)))
+					metav1.ConditionFalse, dfaasv1.LTReasonS3ConfigMissing, missing))
 				if explicitRef {
 					// Explicit ref must exist — a missing one is a hard failure
 					// (unchanged behaviour).
-					return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
+					return r.setLoadTestPhaseDetail(ctx, lt, dfaasv1.LoadTestFailed,
+						dfaasv1.LTReasonS3ConfigMissing, missing)
 				}
 				// Default sink missing (e.g. SeaweedFS not yet deployed) — degrade
 				// gracefully to the stdout path rather than failing the test.

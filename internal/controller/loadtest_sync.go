@@ -223,9 +223,19 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 	total := len(lt.Status.TestRuns)
 	started := 0
 	for _, ref := range lt.Status.TestRuns {
-		k6Node, ok := k6Index[ref.NodeID]
-		if !ok || k6Node.KubeconfigSecret == "" {
-			continue
+		k6Node, nerr := resolveK6Node(k6Index, ref.NodeID)
+		if nerr != nil {
+			// A node that left the Environment will never report "started":
+			// fail in one tick instead of burning the whole syncWaitBudget
+			// waiting on a runner nobody can poll.
+			logger.Info("sync barrier: node unusable; aborting all",
+				"node", ref.NodeID, "cause", nerr.Error())
+			if failed := r.teardownRemoteTestRuns(ctx, lt, env); failed > 0 {
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+			logStatusErr(ctx, "stamp SyncReady=False (node unusable)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondSyncReady,
+				metav1.ConditionFalse, dfaasv1.LTReasonSyncTimeout, nerr.Error()))
+			return r.failLoadTest(ctx, lt, "synchronized start: "+nerr.Error())
 		}
 		secretRef := types.NamespacedName{Name: k6Node.KubeconfigSecret, Namespace: lt.Namespace}
 		remoteKey := types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}

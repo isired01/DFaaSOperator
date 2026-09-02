@@ -28,6 +28,16 @@ Why this shape:
 Tuning env: `THUMB_SIZE` (default `128`, longest-side cap), `UPSTREAM_PORT`
 (default `8082`, must match `upstream_url`).
 
+**Input limits — two, guarding different things.** The request body is capped at
+32 MB (`MaxBytesReader`), which bounds the *compressed* upload. That alone is not
+enough: a small, well-formed PNG can declare enormous dimensions, and Go's
+`image.Decode` allocates a pixel buffer sized to the declared header before
+reading any pixel data — a decompression bomb that OOM-kills the pod. So the
+header is parsed first with `image.DecodeConfig` and anything above
+`maxImagePixels` (16 MPx) is rejected with **413** before decoding. This matters
+under load: a function OOM-killed mid-experiment shows up as request failures
+that look exactly like load-induced errors, quietly contaminating the results.
+
 Output JPEG is single-channel (`components 1`) grayscale; aspect ratio
 preserved (e.g. 400×300 → 128×96).
 

@@ -94,12 +94,41 @@ func (m *Manager) EnsureLibp2pKeys(ctx context.Context,
 	}
 
 	if !exists {
-		if err := m.Create(ctx, &secret); err != nil && !apierrors.IsAlreadyExists(err) {
+		err := m.Create(ctx, &secret)
+		if err == nil {
+			return out, nil
+		}
+		if !apierrors.IsAlreadyExists(err) {
 			return nil, fmt.Errorf("create libp2p keys secret: %w", err)
 		}
-		return out, nil
+		// Lost the create race (concurrent reconcile, or a BYO Secret applied
+		// in between). The keys just generated were never persisted, so
+		// returning them would hand the playbook a peer identity nobody else
+		// agrees on — fall through to the merge path, which keeps whatever the
+		// winner stored and reports it back.
 	}
 
+	merged, err := m.mergeLibp2pKeys(ctx, secretKey, secret.Data)
+	if err != nil {
+		return nil, err
+	}
+	// Re-read every requested node off the persisted Secret: a concurrent
+	// writer may have won on some nodeIDs, and its keys are authoritative.
+	for nodeID := range out {
+		if key, ok := merged[nodeID]; ok {
+			out[nodeID] = key
+		}
+	}
+	return out, nil
+}
+
+// mergeLibp2pKeys merges generated entries into the persisted Secret without
+// clobbering existing ones (first writer wins per nodeID) and returns the
+// Secret's post-merge contents.
+func (m *Manager) mergeLibp2pKeys(ctx context.Context, secretKey client.ObjectKey,
+	generated map[string][]byte) (map[string]string, error) {
+
+	merged := map[string]string{}
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &corev1.Secret{}
 		if err := m.Get(ctx, secretKey, latest); err != nil {
@@ -108,17 +137,24 @@ func (m *Manager) EnsureLibp2pKeys(ctx context.Context,
 		if latest.Data == nil {
 			latest.Data = map[string][]byte{}
 		}
-		for nodeID, key := range secret.Data {
+		for nodeID, key := range generated {
 			if _, ok := latest.Data[nodeID]; !ok {
 				latest.Data[nodeID] = key
 			}
 		}
-		return m.Update(ctx, latest)
+		if err := m.Update(ctx, latest); err != nil {
+			return err
+		}
+		merged = make(map[string]string, len(latest.Data))
+		for nodeID, key := range latest.Data {
+			merged[nodeID] = string(key)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("update libp2p keys secret: %w", err)
 	}
-	return out, nil
+	return merged, nil
 }
 
 // generateLibp2pKey returns a base64-encoded PKCS#8 ed25519 private key in the

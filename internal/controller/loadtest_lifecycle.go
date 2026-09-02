@@ -17,6 +17,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -81,11 +82,12 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, true, nil
 	}
 	if count >= dispatchRetryBudget {
+		detail := fmt.Sprintf("remote dispatch failed %d consecutive times: %s",
+			count, condMessage(dispatchErr))
 		logStatusErr(ctx, "stamp K6Dispatched=False (dispatch failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
-			metav1.ConditionFalse, dfaasv1.LTReasonDispatchFailed,
-			fmt.Sprintf("remote dispatch failed %d consecutive times: %s",
-				count, condMessage(dispatchErr))))
-		res, err := r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestFailed)
+			metav1.ConditionFalse, dfaasv1.LTReasonDispatchFailed, detail))
+		res, err := r.setLoadTestPhaseDetail(ctx, lt, dfaasv1.LoadTestFailed,
+			dfaasv1.LTReasonDispatchFailed, detail)
 		return res, true, err
 	}
 	// P13: sub-reason (ScriptMirrorFailed / StaleCleanupFailed / ApplyFailed)
@@ -162,7 +164,7 @@ func (r *LoadTestReconciler) finishDispatch(ctx context.Context,
 		latest.Status.StartTime = &now
 		latest.Status.TestRuns = refs
 		latest.Status.Phase = dfaasv1.LoadTestRunning
-		stampLTAggregate(latest, dfaasv1.LoadTestRunning)
+		stampLTAggregate(latest, dfaasv1.LoadTestRunning, "", "")
 		return nil
 	}); err != nil {
 		return ctrl.Result{}, err
@@ -178,6 +180,27 @@ func computeK6NodeIndex(env *dfaasv1.Environment) map[string]dfaasv1.K6NodeStatu
 		k6Index[n.NodeID] = n
 	}
 	return k6Index
+}
+
+// resolveK6Node looks one nodeID up in the Environment's k6 index and returns
+// the node only when it is actually usable, i.e. still declared on the
+// Environment AND carrying a kubeconfig Secret. Single policy for every caller:
+// an unusable node is an error, never a silent skip. A node that vanished
+// mid-test can neither be polled nor released, so the paths that need it to
+// make progress (observeK6, awaitSyncBarrier) fail the LoadTest on the spot
+// instead of waiting out a budget it can never satisfy, and the best-effort
+// cleanup paths (teardownRemoteTestRuns, captureK6Logs) log the same error
+// before moving on — counting it as a failure there would wedge the abort loop
+// on a node that is unreachable by definition.
+func resolveK6Node(k6Index map[string]dfaasv1.K6NodeStatus, nodeID string) (dfaasv1.K6NodeStatus, error) {
+	node, ok := k6Index[nodeID]
+	if !ok {
+		return dfaasv1.K6NodeStatus{}, fmt.Errorf("k6 node %q is no longer part of the environment", nodeID)
+	}
+	if node.KubeconfigSecret == "" {
+		return dfaasv1.K6NodeStatus{}, fmt.Errorf("k6 node %q has no kubeconfig Secret on the environment", nodeID)
+	}
+	return node, nil
 }
 
 // resumePartialDispatch seeds the dispatch state from existing
@@ -231,7 +254,12 @@ func (r *LoadTestReconciler) dispatchTestRunForNode(ctx context.Context,
 		return refs, false, ctrl.Result{}, nil
 	}
 
-	tr := buildRemoteTestRun(trName, lt, perNode)
+	tr, berr := buildRemoteTestRun(trName, lt, perNode)
+	if berr != nil {
+		res, ferr := r.failLoadTest(ctx, lt,
+			fmt.Sprintf("build remote TestRun for node %q: %v", perNode.NodeID, berr))
+		return refs, true, res, ferr
+	}
 	secretRef := types.NamespacedName{Name: k6Node.KubeconfigSecret, Namespace: lt.Namespace}
 	remoteKey := types.NamespacedName{Name: trName, Namespace: "default"}
 
@@ -249,9 +277,19 @@ func (r *LoadTestReconciler) dispatchTestRunForNode(ctx context.Context,
 		res, _, oerr := r.onDispatchError(ctx, lt, derr, dfaasv1.LTReasonStaleCleanupFailed)
 		return refs, true, res, oerr
 	}
-	if _, gerr := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey); gerr == nil {
+	_, gerr := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey)
+	switch {
+	case gerr == nil:
 		// Delete still propagating on the remote — wait a tick then retry.
 		return refs, true, ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	case !apierrors.IsNotFound(gerr):
+		// Only NotFound proves the stale TestRun is gone. An unreachable node
+		// or an unparsable kubeconfig says nothing about the remote state, so
+		// applying on top of it would risk racing a still-running k6 test:
+		// route it through the retry budget instead.
+		logger.Error(gerr, "remote TestRun delete-confirm poll failed", "node", perNode.NodeID)
+		res, _, oerr := r.onDispatchError(ctx, lt, gerr, dfaasv1.LTReasonStaleCleanupFailed)
+		return refs, true, res, oerr
 	}
 
 	if aerr := r.Dispatcher.ApplyTestRun(ctx, secretRef, tr); aerr != nil {
@@ -360,8 +398,10 @@ func (r *LoadTestReconciler) ensureMirroredS3Secret(ctx context.Context,
 }
 
 // buildRemoteTestRun assembles an unstructured k6.io/v1alpha1 TestRun manifest
-// for one PerNodeLoad entry. Applied to the matching k6 machine's k3s.
-func buildRemoteTestRun(name string, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad) *unstructured.Unstructured {
+// for one PerNodeLoad entry. Applied to the matching k6 machine's k3s. Returns
+// an error if the spec map cannot be nested (a dispatched TestRun with an empty
+// spec would start no runner at all).
+func buildRemoteTestRun(name string, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad) (*unstructured.Unstructured, error) {
 	tr := &unstructured.Unstructured{}
 	tr.SetGroupVersionKind(k6dispatch.TestRunGVK)
 	tr.SetName(name)
@@ -378,9 +418,12 @@ func buildRemoteTestRun(name string, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNo
 				"file": "script.js",
 			},
 		},
-		// VUs and duration are commonly set inside the script, but we surface
-		// them as annotations so the operator can carry them across to the
-		// remote cluster if a TestRun-level field is needed in the future.
+		// VUs and duration deliberately do not appear here: k6 takes both from
+		// options.scenarios inside the script, and we set no TestRun field that
+		// could carry them. They used to be mirrored onto annotations "in case a
+		// TestRun-level field is needed in the future" — nothing ever read them,
+		// so they are gone. spec.perNodeLoad on the LoadTest CR still records
+		// both, which is where the UI reads them from.
 	}
 	// The generated script's handleSummary() PUTs its end-of-test summary
 	// JSON here (see loadtest_sync.go). Always injected: empty value (public
@@ -396,12 +439,10 @@ func buildRemoteTestRun(name string, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNo
 			map[string]interface{}{"name": "DFAAS_SYNC_URL", "value": syncGoURL(lt)})
 	}
 	spec["runner"] = map[string]interface{}{"env": runnerEnv}
-	_ = unstructured.SetNestedMap(tr.Object, spec, "spec")
-	tr.SetAnnotations(map[string]string{
-		"dfaas.io/vus":      fmt.Sprintf("%d", perNode.VUs),
-		"dfaas.io/duration": perNode.Duration,
-	})
-	return tr
+	if err := unstructured.SetNestedMap(tr.Object, spec, "spec"); err != nil {
+		return nil, fmt.Errorf("set TestRun spec: %w", err)
+	}
+	return tr, nil
 }
 
 // mirrorScriptConfigMap reads the management-cluster ConfigMap named by

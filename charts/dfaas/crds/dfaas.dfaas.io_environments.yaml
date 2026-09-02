@@ -51,6 +51,11 @@ spec:
                 description: CleanupOnDelete drives the finalizer's behavior.
                 type: boolean
               nodes:
+                description: |-
+                  Nodes is keyed by nodeID: the API server rejects duplicates at admission
+                  (listType=map). Without it two entries sharing a nodeID collide on every
+                  derived object name (kubeconfig Secret, libp2p key entry, remote TestRun)
+                  and the second silently overwrites the first.
                 items:
                   description: EnvironmentNode declares one machine in the federation.
                   properties:
@@ -84,11 +89,13 @@ spec:
                         properties:
                           execTimeout:
                             default: 5
+                            minimum: 1
                             type: integer
                           image:
                             type: string
                           maxInflight:
                             default: 400
+                            minimum: 1
                             type: integer
                           maxRate:
                             default: 100
@@ -104,6 +111,7 @@ spec:
                             type: string
                           timeoutMs:
                             default: 6000
+                            minimum: 1
                             type: integer
                         required:
                         - execTimeout
@@ -151,6 +159,9 @@ spec:
                   type: object
                 minItems: 1
                 type: array
+                x-kubernetes-list-map-keys:
+                - nodeID
+                x-kubernetes-list-type: map
               s3ConfigRef:
                 description: |-
                   S3ConfigRef points at a cluster-scoped S3 server configuration
@@ -167,8 +178,13 @@ spec:
                 - name
                 type: object
               topology:
-                description: Topology declares inter-node network shaping (latency
-                  injection).
+                description: |-
+                  Topology declares inter-node network shaping (latency injection).
+
+                  NOT IMPLEMENTED: the field is schema-only. Nothing in the operator or in the
+                  Ansible playbooks reads it, so a declared link's latencyMs is never applied
+                  to any node. It is kept so existing manifests still validate; treat it as
+                  documentation of intent, not as a working feature.
                 properties:
                   links:
                     items:

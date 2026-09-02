@@ -57,14 +57,25 @@ func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
 	// Unconditional: DFAAS_SUMMARY_URL is injected regardless of syncStart.
 	logStatusErr(ctx, "delete k6 summaries (abort)", deleteSummaryObjects(ctx, lt))
 
+	// K6Healthy still carries the last count observed while the test was
+	// running ("0/2 finished, 0 error, 2 running"). The teardown above just
+	// deleted those TestRuns, so leaving it alone makes the conditions panel
+	// claim runners are live on a test that has none. Restamp it to what is
+	// now true.
+	logStatusErr(ctx, "stamp K6Healthy=False (runners reclaimed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+		metav1.ConditionFalse, dfaasv1.LTReasonRunnersReclaimed,
+		fmt.Sprintf("%d remote TestRun(s) deleted — test was aborted before completion", len(lt.Spec.PerNodeLoad))))
+
 	// MetricsExported never ran on abort — stamp False/Skipped per P9 so
 	// UI does not show "in flight" forever on the aborted CR.
 	logStatusErr(ctx, "stamp MetricsExported=False (export skipped)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
 		metav1.ConditionFalse, dfaasv1.LTReasonExportSkipped,
 		"no exporter ran — test was aborted"))
-	logStatusErr(ctx, "stamp Ready=False (aborted)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondReady, metav1.ConditionFalse,
-		reason, message))
-	return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestAborted)
+	// Carry the caller's reason + message through the phase transition: the
+	// aggregator would otherwise replace them with the generic "load test
+	// aborted", and the UI looks the abort explanation up by
+	// Ready/UserAborted specifically.
+	return r.setLoadTestPhaseDetail(ctx, lt, dfaasv1.LoadTestAborted, reason, message)
 }
 
 // teardownRemoteTestRuns issues DeleteTestRun for every remote TestRun of lt
@@ -82,8 +93,11 @@ func (r *LoadTestReconciler) teardownRemoteTestRuns(ctx context.Context,
 	type target struct{ nodeID, secretName, trName, trNs string }
 	targets := map[string]target{}
 	for _, ref := range lt.Status.TestRuns {
-		k6Node, ok := k6Index[ref.NodeID]
-		if !ok || k6Node.KubeconfigSecret == "" {
+		k6Node, nerr := resolveK6Node(k6Index, ref.NodeID)
+		if nerr != nil {
+			// Unreachable by definition: no kubeconfig, no remote API to delete
+			// through. Counting it as a failure would requeue the abort forever.
+			logger.Error(nerr, "skipping remote TestRun delete", "node", ref.NodeID)
 			continue
 		}
 		targets[ref.NodeID+"|"+ref.Name] = target{
@@ -92,8 +106,9 @@ func (r *LoadTestReconciler) teardownRemoteTestRuns(ctx context.Context,
 		}
 	}
 	for _, perNode := range lt.Spec.PerNodeLoad {
-		k6Node, ok := k6Index[perNode.NodeID]
-		if !ok || k6Node.KubeconfigSecret == "" {
+		k6Node, nerr := resolveK6Node(k6Index, perNode.NodeID)
+		if nerr != nil {
+			logger.Error(nerr, "skipping remote TestRun delete", "node", perNode.NodeID)
 			continue
 		}
 		trName := fmt.Sprintf("%s-%s", lt.Name, sanitize(perNode.NodeID))

@@ -29,9 +29,13 @@ spec:
         metricName: mem_available
         query: node_memory_MemAvailable_bytes
         comment: "Free memory per node (bare metric)"
+      # Rate windows must be >= 4x the federation interval. The management
+      # Prometheus federates from each worker once a minute, so rate(...[1m])
+      # sees at most one sample and silently returns NOTHING; [5m] is the
+      # smallest window that reliably yields data here.
       - type: custom-promql
         metricName: cpu_rate
-        query: rate(node_cpu_seconds_total[1m])
+        query: rate(node_cpu_seconds_total[5m])
         comment: "CPU usage rate per node (PromQL expression)"
     # CSV destination is decided on the Environment (spec.s3ConfigRef).
     # When the Environment has no s3ConfigRef, the exporter writes to the

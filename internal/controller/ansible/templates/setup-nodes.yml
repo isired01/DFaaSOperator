@@ -122,6 +122,13 @@
       kubernetes.core.helm_repository:
         name: "{{ item.name }}"
         repo_url: "{{ item.url }}"
+        # force_update makes this idempotent across re-provisioning. Without it the
+        # module hard-fails with "Repository already have a repository named <x>"
+        # whenever a repo of that name already exists with even a slightly different
+        # URL (a trailing slash is enough). Since this playbook re-runs on every
+        # spec edit — the documented update path — the second provisioning run of
+        # any Environment died here, before any function change could be applied.
+        force_update: true
       loop:
         - { name: "haproxytech", url: "https://haproxytech.github.io/helm-charts" }
         - { name: "prometheus-community", url: "https://prometheus-community.github.io/helm-charts" }

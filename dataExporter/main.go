@@ -311,11 +311,16 @@ func main() {
 		}
 		attempted++
 
-		result, _, err := promAPI.QueryRange(ctx, m.Query, queryRange)
+		result, warnings, err := promAPI.QueryRange(ctx, m.Query, queryRange)
 		if err != nil {
 			fmt.Printf("query error %s (%s): %v\n", m.MetricName, m.Query, err)
 			errored++
 			continue
+		}
+		// Warnings are not errors, but they explain partial or truncated
+		// results (series limits, lookback misses) during a post-mortem.
+		if len(warnings) > 0 {
+			fmt.Printf("query %s: Prometheus warnings: %s\n", m.MetricName, strings.Join(warnings, "; "))
 		}
 
 		matrix, ok := result.(model.Matrix)
@@ -326,7 +331,7 @@ func main() {
 		}
 
 		for _, series := range matrix {
-			nodeID := string(series.Metric["nodo_id"])
+			nodeID := string(series.Metric["node_id"])
 			if nodeID == "" {
 				nodeID = "unknown"
 			}
@@ -512,12 +517,73 @@ func dumpToStdout(fileName string) {
 	fmt.Println("----- END CSV -----")
 }
 
+// s3UploadAttempts bounds the PutObject tries inside uploadToS3, and
+// s3RetryBackoff is the pause before the first retry (doubled each round: 2s
+// then 4s, so at most 6s of extra wall time). One flaky PutObject used to fail
+// the exporter Job and with it the whole LoadTest, even though the k6 run had
+// already succeeded. The AWS SDK retries connection-level faults on its own;
+// this outer loop also covers what it treats as terminal (e.g. a SeaweedFS
+// bucket still settling right after CreateBucket).
+const (
+	s3UploadAttempts = 3
+	s3RetryBackoff   = 2 * time.Second
+)
+
+// ensuredBuckets memoizes the HeadBucket → CreateBucket probe per bucket name:
+// every upload used to redo it (1 + 2N round trips per run, always against the
+// same bucket). Only successful probes are recorded, so a failed one is retried
+// by the next upload. The exporter is single-threaded, so a plain map suffices.
+var ensuredBuckets = map[string]bool{}
+
+// ensureBucket runs HeadBucket and, when the bucket is missing, CreateBucket.
+// Its result is memoized, so the probe costs at most one round trip per run.
+func ensureBucket(ctx context.Context, client *s3.Client, bucket, region string) error {
+	if ensuredBuckets[bucket] {
+		return nil
+	}
+
+	// HeadBucket. NotFound (404 / *types.NotFound) → try to create.
+	_, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)})
+	if err != nil {
+		if !isS3NotFound(err) {
+			return fmt.Errorf("head bucket %q: %w", bucket, err)
+		}
+		fmt.Printf("bucket %q missing — creating\n", bucket)
+		createIn := &s3.CreateBucketInput{Bucket: aws.String(bucket)}
+		// AWS rejects LocationConstraint=us-east-1 (default region for
+		// the v2 API path). For everything else we MUST set it or the
+		// bucket lands wherever the endpoint defaults to.
+		if region != "" && region != "us-east-1" {
+			createIn.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
+				LocationConstraint: s3types.BucketLocationConstraint(region),
+			}
+		}
+		if _, cerr := client.CreateBucket(ctx, createIn); cerr != nil {
+			switch {
+			case isS3OwnedByYou(cerr):
+				// Race: another exporter Pod for the same env created it.
+				fmt.Printf("bucket %q already owned by us, continuing\n", bucket)
+			case isS3AlreadyExists(cerr):
+				// Globally-unique name collision with another tenant. Try
+				// the PutObject anyway — it will fail loudly if access is
+				// denied, which is the correct surface.
+				fmt.Printf("WARNING: bucket %q already exists in another tenant; attempting PutObject anyway\n", bucket)
+			default:
+				return fmt.Errorf("create bucket %q: %w", bucket, cerr)
+			}
+		}
+	}
+
+	ensuredBuckets[bucket] = true
+	return nil
+}
+
 // uploadToS3 uploads the file at path to s3://bucket/key with the given
-// Content-Type. The function is responsible for HeadBucket → CreateBucket
-// (when missing) → PutObject. Static creds come from S3_ACCESS_KEY_ID /
-// S3_SECRET_ACCESS_KEY; region from S3_REGION; optional custom endpoint from
-// S3_ENDPOINT (e.g. SeaweedFS); path-style addressing toggled by
-// S3_FORCE_PATH_STYLE.
+// Content-Type. It ensures the bucket exists (once per run, see ensureBucket)
+// and then PutObjects with a bounded retry. Static creds come from
+// S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY; region from S3_REGION; optional
+// custom endpoint from S3_ENDPOINT (e.g. SeaweedFS); path-style addressing
+// toggled by S3_FORCE_PATH_STYLE.
 func uploadToS3(ctx context.Context, path, bucket, key, contentType string) error {
 	region := os.Getenv("S3_REGION")
 	endpoint := os.Getenv("S3_ENDPOINT")
@@ -542,40 +608,13 @@ func uploadToS3(ctx context.Context, path, bucket, key, contentType string) erro
 		o.UsePathStyle = forcePathStyle
 	})
 
-	// 1. HeadBucket. NotFound (404 / *types.NotFound) → try to create.
-	_, err = client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)})
-	if err != nil {
-		if isS3NotFound(err) {
-			fmt.Printf("bucket %q missing — creating\n", bucket)
-			createIn := &s3.CreateBucketInput{Bucket: aws.String(bucket)}
-			// AWS rejects LocationConstraint=us-east-1 (default region for
-			// the v2 API path). For everything else we MUST set it or the
-			// bucket lands wherever the endpoint defaults to.
-			if region != "" && region != "us-east-1" {
-				createIn.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
-					LocationConstraint: s3types.BucketLocationConstraint(region),
-				}
-			}
-			if _, cerr := client.CreateBucket(ctx, createIn); cerr != nil {
-				switch {
-				case isS3OwnedByYou(cerr):
-					// Race: another exporter Pod for the same env created it.
-					fmt.Printf("bucket %q already owned by us, continuing\n", bucket)
-				case isS3AlreadyExists(cerr):
-					// Globally-unique name collision with another tenant. Try
-					// the PutObject anyway — it will fail loudly if access is
-					// denied, which is the correct surface.
-					fmt.Printf("WARNING: bucket %q already exists in another tenant; attempting PutObject anyway\n", bucket)
-				default:
-					return fmt.Errorf("create bucket %q: %w", bucket, cerr)
-				}
-			}
-		} else {
-			return fmt.Errorf("head bucket %q: %w", bucket, err)
-		}
+	// 1. Bucket: HeadBucket → CreateBucket when missing, memoized per run.
+	if err := ensureBucket(ctx, client, bucket, region); err != nil {
+		return err
 	}
 
-	// 2. PutObject.
+	// 2. PutObject, retried up to s3UploadAttempts times. The body is rewound
+	// before every attempt because PutObject consumes the reader.
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open file: %w", err)
@@ -583,14 +622,31 @@ func uploadToS3(ctx context.Context, path, bucket, key, contentType string) erro
 	defer f.Close()
 
 	fmt.Printf("uploading to s3://%s/%s\n", bucket, key)
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(bucket),
-		Key:         aws.String(key),
-		Body:        f,
-		ContentType: aws.String(contentType),
-	})
-	if err != nil {
-		return fmt.Errorf("put object: %w", err)
+	backoff := s3RetryBackoff
+	for attempt := 1; ; attempt++ {
+		if _, serr := f.Seek(0, io.SeekStart); serr != nil {
+			return fmt.Errorf("rewind file: %w", serr)
+		}
+		_, err = client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:      aws.String(bucket),
+			Key:         aws.String(key),
+			Body:        f,
+			ContentType: aws.String(contentType),
+		})
+		if err == nil {
+			break
+		}
+		if attempt == s3UploadAttempts {
+			return fmt.Errorf("put object after %d attempts: %w", s3UploadAttempts, err)
+		}
+		fmt.Printf("put object s3://%s/%s attempt %d/%d failed: %v — retrying in %s\n",
+			bucket, key, attempt, s3UploadAttempts, err, backoff)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("put object: %w", err)
+		case <-time.After(backoff):
+		}
+		backoff *= 2
 	}
 	fmt.Printf("uploaded s3://%s/%s\n", bucket, key)
 	return nil

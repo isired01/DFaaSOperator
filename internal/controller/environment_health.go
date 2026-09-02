@@ -101,15 +101,13 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 	}
 
 	// Throttle against our own status writes.
-	if last := env.Status.LastHealthCheck; last != nil {
-		due := healthCheckInterval
-		if c := meta.FindStatusCondition(env.Status.Conditions, dfaasv1.EnvCondNodesReachable); c != nil &&
-			c.Status == metav1.ConditionFalse {
-			due = healthRetryInterval
-		}
-		if elapsed := time.Since(last.Time); elapsed < due {
-			return ctrl.Result{RequeueAfter: due - elapsed}, nil
-		}
+	due := healthCheckInterval
+	if c := meta.FindStatusCondition(env.Status.Conditions, dfaasv1.EnvCondNodesReachable); c != nil &&
+		c.Status == metav1.ConditionFalse {
+		due = healthRetryInterval
+	}
+	if wait := r.probeThrottle(ctx, env, due); wait > 0 {
+		return ctrl.Result{RequeueAfter: wait}, nil
 	}
 
 	var unreachable []string
@@ -168,10 +166,8 @@ func (r *EnvironmentReconciler) reconcileUnreachable(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	if last := env.Status.LastHealthCheck; last != nil {
-		if elapsed := time.Since(last.Time); elapsed < unreachableRetryInterval {
-			return ctrl.Result{RequeueAfter: unreachableRetryInterval - elapsed}, nil
-		}
+	if wait := r.probeThrottle(ctx, env, unreachableRetryInterval); wait > 0 {
+		return ctrl.Result{RequeueAfter: wait}, nil
 	}
 
 	var unreachable []string
@@ -219,6 +215,46 @@ func (r *EnvironmentReconciler) reconcileUnreachable(ctx context.Context,
 // markNodesReachable stamps NodesReachable=True and refreshes lastHealthCheck
 // in a single status update (one write per healthy round → one re-enqueue,
 // caught by the throttle).
+// probeThrottle reports how long to wait before the next SSH probe, 0 when one
+// is due now.
+//
+// It checks the cached status first and, only when that says "go", confirms
+// against a LIVE read. The informer cache lags this controller's own status
+// writes by a few milliseconds, so a reconcile triggered by our own write would
+// see the previous lastHealthCheck, judge the interval elapsed, and probe again
+// immediately. Measured on a real node outage: the miss counter went 1 → 3 in
+// 22 s with lastHealthCheck advancing only 2 s between the last two probes, so
+// healthRetryBudget stopped buying any tolerance for a transient blip — which
+// is the entire reason the budget exists.
+//
+// Nil APIReader (unit tests) or a failed read falls back to the cached decision:
+// the throttle is an optimisation, never a correctness gate.
+func (r *EnvironmentReconciler) probeThrottle(ctx context.Context,
+	env *dfaasv1.Environment, due time.Duration) time.Duration {
+
+	remaining := func(last *metav1.Time) time.Duration {
+		if last == nil {
+			return 0
+		}
+		if elapsed := time.Since(last.Time); elapsed < due {
+			return due - elapsed
+		}
+		return 0
+	}
+
+	if wait := remaining(env.Status.LastHealthCheck); wait > 0 {
+		return wait
+	}
+	if r.APIReader == nil {
+		return 0
+	}
+	var fresh dfaasv1.Environment
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(env), &fresh); err != nil {
+		return 0
+	}
+	return remaining(fresh.Status.LastHealthCheck)
+}
+
 func (r *EnvironmentReconciler) markNodesReachable(ctx context.Context,
 	env *dfaasv1.Environment) error {
 	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
@@ -227,6 +263,16 @@ func (r *EnvironmentReconciler) markNodesReachable(ctx context.Context,
 			Status:  metav1.ConditionTrue,
 			Reason:  dfaasv1.EnvReasonSSHReachable,
 			Message: "live SSH liveness OK: all declared nodes reachable on :22",
+		})
+		// Kept in step with NodesReachable: VMsReady is written by provisioning
+		// and was then left untouched by the health loop, so during a Ready-state
+		// outage the conditions panel showed a green "VMsReady — nodes reachable
+		// again on :22" directly above a red "NodesReachable — g4 unreachable".
+		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+			Type:    dfaasv1.EnvCondVMsReady,
+			Status:  metav1.ConditionTrue,
+			Reason:  dfaasv1.EnvReasonSSHReachable,
+			Message: "all declared nodes reachable on :22",
 		})
 		now := metav1.Now()
 		latest.Status.LastHealthCheck = &now
@@ -241,6 +287,14 @@ func (r *EnvironmentReconciler) markNodesUnreachable(ctx context.Context,
 	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
 		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
 			Type:    dfaasv1.EnvCondNodesReachable,
+			Status:  metav1.ConditionFalse,
+			Reason:  dfaasv1.EnvReasonSSHUnreachable,
+			Message: msg,
+		})
+		// See markNodesReachable: the two must not disagree. A node that stopped
+		// answering :22 is exactly what VMsReady=False means.
+		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+			Type:    dfaasv1.EnvCondVMsReady,
 			Status:  metav1.ConditionFalse,
 			Reason:  dfaasv1.EnvReasonSSHUnreachable,
 			Message: msg,

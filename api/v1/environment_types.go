@@ -78,6 +78,11 @@ const (
 	EnvReasonLibp2pKeyError     = "Libp2pKeyError"
 	EnvReasonNodeStatusError    = "NodeStatusError"
 	EnvReasonJobPending         = "JobPending"
+	// EnvReasonCheckFailed marks a readiness probe that could not be evaluated
+	// at all (e.g. the Pod List was refused), as opposed to WaitingPods which
+	// means "evaluated, not ready yet". Without the split an RBAC regression
+	// looks exactly like a slow rollout.
+	EnvReasonCheckFailed = "CheckFailed"
 )
 
 // EnvironmentNode declares one machine in the federation.
@@ -124,7 +129,13 @@ type EnvironmentNode struct {
 
 // EnvironmentSpec is the desired federation infrastructure.
 type EnvironmentSpec struct {
+	// Nodes is keyed by nodeID: the API server rejects duplicates at admission
+	// (listType=map). Without it two entries sharing a nodeID collide on every
+	// derived object name (kubeconfig Secret, libp2p key entry, remote TestRun)
+	// and the second silently overwrites the first.
 	// +kubebuilder:validation:MinItems=1
+	// +listType=map
+	// +listMapKey=nodeID
 	Nodes []EnvironmentNode `json:"nodes"`
 
 	// +optional

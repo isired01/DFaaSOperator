@@ -6,6 +6,11 @@
 *.dylib
 bin/*
 Dockerfile.cross
+
+# Compiled companion binaries — each ships as its own image, built from source by
+# its own Dockerfile; the tracked copies are dead weight.
+/dataExporter/dfaas-exporter
+/imageFunction/dfaas-imgproc
 .DS_Store
 /out
 .claude

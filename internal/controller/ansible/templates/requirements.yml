@@ -2,10 +2,19 @@
 # Ansible Galaxy collections required by the playbooks under this directory.
 # Installed at Job startup via:
 #   ansible-galaxy collection install -r /ansible/playbooks/requirements.yml
+# Versions are pinned EXACTLY, not floored: the install runs inside every
+# Ansible Job pod, so a ">=" floor re-resolves on each provisioning run and a
+# breaking upstream release would silently change two runs of the same
+# experiment. Pins below are the versions the floors resolved to on
+# 2026-08-29, all compatible with the pinned alpine/ansible:2.18.6 image
+# (requires_ansible: kubernetes.core >=2.16, community.general >=2.18,
+# mschuchard.general >=2.12). Bump deliberately, then re-provision.
 collections:
   - name: kubernetes.core
-    version: ">=3.0.0"
+    version: "6.5.0"
   - name: community.general
-    version: ">=8.0.0"
+    version: "13.3.0"
+  # 1.4.2 is the first release with the absolute-import fix
+  # (ModuleNotFoundError: No module named 'mschuchard') — never pin lower.
   - name: mschuchard.general
-    version: ">=1.4.2"
+    version: "1.4.2"

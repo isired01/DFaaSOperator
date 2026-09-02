@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/go-logr/logr"
 	"helm.sh/helm/v3/pkg/action"
@@ -26,51 +27,24 @@ import (
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/storage/driver"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/client-go/rest"
 )
 
-// InstallOrUpgrade installs the release if it does not exist, otherwise
-// upgrades it.
+// InstallOrUpgradeFromArchive installs the release if it does not exist,
+// otherwise upgrades it. The chart is loaded directly from a .tgz/.tar.gz
+// io.Reader (typically a bytes.Reader over a go:embed []byte) — the operator
+// only ever ships vendored archives, so there is no chart-path/repo variant.
 //
 // Parameters:
 //   - releaseName: Helm release name (must be DNS-1123 compliant).
-//   - chartPathOrName: either a local filesystem path ("./monitoring-chart")
-//     or a "repo/chart" reference. Repo references require the repo to be
-//     present in the local Helm repository configuration
-//     (settings.RepositoryConfig, defaulting to ~/.config/helm/repositories.yaml).
+//   - archive: the packaged chart.
 //   - namespace: target namespace for the release. Created if missing on
 //     first install.
 //   - values: dynamic value overrides, equivalent to `--set` / `-f values.yaml`.
 //
 // Errors are wrapped with %w so callers can use errors.Is / errors.As. No
 // panics are emitted by this package.
-func InstallOrUpgrade(
-	ctx context.Context,
-	log logr.Logger,
-	releaseName, chartPathOrName, namespace string,
-	values map[string]interface{},
-) (*release.Release, error) {
-
-	cfg, settings, err := newActionConfig(namespace, log)
-	if err != nil {
-		return nil, fmt.Errorf("init helm action config: %w", err)
-	}
-
-	chartPath, err := (&action.ChartPathOptions{}).LocateChart(chartPathOrName, settings)
-	if err != nil {
-		return nil, fmt.Errorf("locate chart %q: %w", chartPathOrName, err)
-	}
-
-	ch, err := loader.Load(chartPath)
-	if err != nil {
-		return nil, fmt.Errorf("load chart %q: %w", chartPath, err)
-	}
-
-	return runInstallOrUpgrade(ctx, log, cfg, ch, releaseName, chartPathOrName, namespace, values)
-}
-
-// InstallOrUpgradeFromArchive is the in-memory variant of InstallOrUpgrade:
-// it loads the chart directly from a .tgz/.tar.gz io.Reader (typically a
-// bytes.Reader over a go:embed []byte). Same install-vs-upgrade semantics.
 func InstallOrUpgradeFromArchive(
 	ctx context.Context,
 	log logr.Logger,
@@ -80,7 +54,7 @@ func InstallOrUpgradeFromArchive(
 	values map[string]interface{},
 ) (*release.Release, error) {
 
-	cfg, _, err := newActionConfig(namespace, log)
+	cfg, err := newActionConfig(namespace, log)
 	if err != nil {
 		return nil, fmt.Errorf("init helm action config: %w", err)
 	}
@@ -93,8 +67,8 @@ func InstallOrUpgradeFromArchive(
 	return runInstallOrUpgrade(ctx, log, cfg, ch, releaseName, "<archive>", namespace, values)
 }
 
-// runInstallOrUpgrade is the shared install/upgrade branch used by both the
-// path-based and the archive-based entry points.
+// runInstallOrUpgrade is the shared install/upgrade branch behind the archive
+// entry point.
 func runInstallOrUpgrade(
 	ctx context.Context,
 	log logr.Logger,
@@ -105,7 +79,8 @@ func runInstallOrUpgrade(
 ) (*release.Release, error) {
 
 	get := action.NewGet(cfg)
-	if _, err := get.Run(releaseName); err != nil {
+	current, err := get.Run(releaseName)
+	if err != nil {
 		if !errors.Is(err, driver.ErrReleaseNotFound) {
 			return nil, fmt.Errorf("lookup release %q: %w", releaseName, err)
 		}
@@ -125,6 +100,16 @@ func runInstallOrUpgrade(
 		return rel, nil
 	}
 
+	// A call interrupted mid-flight (operator pod killed, context cancelled)
+	// leaves the release parked in a pending-* status, and Helm then refuses
+	// every later Upgrade with "another operation (install/upgrade/rollback) is
+	// in progress" — forever, since nothing clears that state on its own and
+	// the operator never runs `helm rollback`. Unwedge it by marking the stuck
+	// revision failed, which is what an Upgrade over a failed release expects.
+	if err := recoverPendingRelease(cfg, log, current); err != nil {
+		return nil, err
+	}
+
 	log.Info("Helm upgrade", "release", releaseName, "namespace", namespace, "chart", chartLabel)
 
 	up := action.NewUpgrade(cfg)
@@ -139,23 +124,73 @@ func runInstallOrUpgrade(
 	return rel, nil
 }
 
+// recoverPendingRelease clears a release stuck in one of the pending-*
+// statuses by marking its latest revision Failed in the storage driver. No-op
+// for any other status. Mirrors what an operator would do by hand
+// (`helm rollback` / deleting the pending release Secret) — without it, one
+// interrupted call wedges every subsequent upgrade of that release.
+func recoverPendingRelease(cfg *action.Configuration, log logr.Logger, rel *release.Release) error {
+	if rel == nil || rel.Info == nil || !isPendingStatus(rel.Info.Status) {
+		return nil
+	}
+	log.Info("Helm release stuck in a pending status; marking it failed",
+		"release", rel.Name, "revision", rel.Version, "status", rel.Info.Status.String())
+
+	rel.Info.Status = release.StatusFailed
+	rel.Info.Description = "operation interrupted; marked failed by dfaas-operator"
+	if err := cfg.Releases.Update(rel); err != nil {
+		return fmt.Errorf("recover pending release %q (revision %d): %w", rel.Name, rel.Version, err)
+	}
+	return nil
+}
+
+// isPendingStatus reports whether a release status means "an operation was
+// started and never finished".
+func isPendingStatus(s release.Status) bool {
+	return s == release.StatusPendingInstall ||
+		s == release.StatusPendingUpgrade ||
+		s == release.StatusPendingRollback
+}
+
+// helmRequestTimeout caps every Kubernetes API request Helm issues. cli.New()
+// leaves rest.Config.Timeout at zero, so an unresponsive API server would block
+// the reconcile worker on the OS-default TCP behaviour instead of failing —
+// same reason the remote k6 dispatcher sets one.
+const helmRequestTimeout = 30 * time.Second
+
+// timeoutRESTClientGetter decorates Helm's RESTClientGetter so every REST
+// config it hands out carries helmRequestTimeout.
+type timeoutRESTClientGetter struct {
+	genericclioptions.RESTClientGetter
+	timeout time.Duration
+}
+
+func (g timeoutRESTClientGetter) ToRESTConfig() (*rest.Config, error) {
+	cfg, err := g.RESTClientGetter.ToRESTConfig()
+	if err != nil {
+		return nil, err
+	}
+	cfg.Timeout = g.timeout
+	return cfg, nil
+}
+
 // newActionConfig builds a Helm action.Configuration tied to the given
 // namespace, wiring the controller-runtime logger to Helm's internal debug
 // hook at log verbosity level 1.
-func newActionConfig(namespace string, log logr.Logger) (*action.Configuration, *cli.EnvSettings, error) {
+func newActionConfig(namespace string, log logr.Logger) (*action.Configuration, error) {
 	settings := cli.New()
 	settings.SetNamespace(namespace)
 
 	cfg := new(action.Configuration)
 	if err := cfg.Init(
-		settings.RESTClientGetter(),
+		timeoutRESTClientGetter{settings.RESTClientGetter(), helmRequestTimeout},
 		namespace,
 		"secret",
 		func(format string, v ...interface{}) {
 			log.V(1).Info(fmt.Sprintf(format, v...))
 		},
 	); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return cfg, settings, nil
+	return cfg, nil
 }

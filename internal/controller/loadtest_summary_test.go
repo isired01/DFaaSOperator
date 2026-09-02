@@ -90,7 +90,10 @@ func TestBuildRemoteTestRunEnv(t *testing.T) {
 	perNode := dfaasv1.PerNodeLoad{NodeID: "node-1"}
 
 	t.Run("summary URL always injected", func(t *testing.T) {
-		tr := buildRemoteTestRun("lt-sample-node-1", summaryTestLT(false), perNode)
+		tr, err := buildRemoteTestRun("lt-sample-node-1", summaryTestLT(false), perNode)
+		if err != nil {
+			t.Fatalf("buildRemoteTestRun: %v", err)
+		}
 		env := testRunEnv(t, tr.Object)
 		if env["DFAAS_SUMMARY_URL"] != "http://lab.example:30901/dfaas-k6-summary/default/lt-sample/node-1.json" {
 			t.Errorf("DFAAS_SUMMARY_URL = %q", env["DFAAS_SUMMARY_URL"])
@@ -100,7 +103,10 @@ func TestBuildRemoteTestRunEnv(t *testing.T) {
 		}
 	})
 	t.Run("sync URL added with syncStart", func(t *testing.T) {
-		tr := buildRemoteTestRun("lt-sample-node-1", summaryTestLT(true), perNode)
+		tr, err := buildRemoteTestRun("lt-sample-node-1", summaryTestLT(true), perNode)
+		if err != nil {
+			t.Fatalf("buildRemoteTestRun: %v", err)
+		}
 		env := testRunEnv(t, tr.Object)
 		if _, ok := env["DFAAS_SUMMARY_URL"]; !ok {
 			t.Error("DFAAS_SUMMARY_URL missing with syncStart")

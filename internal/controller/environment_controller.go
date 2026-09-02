@@ -40,6 +40,12 @@ type EnvironmentReconciler struct {
 	// cannot stream logs). Used best-effort to extract the failing Ansible task
 	// from a retained failed Job pod; nil-safe (unit tests leave it unset).
 	Clientset kubernetes.Interface
+	// APIReader is an uncached reader used to confirm status.lastHealthCheck
+	// before running an SSH probe. The informer cache lags this controller's own
+	// status writes, and reading a stale timestamp let a second probe through
+	// milliseconds after the first — collapsing the health-miss budget. Nil-safe
+	// (unit tests leave it unset and fall back to the cached value).
+	APIReader client.Reader
 }
 
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=environments,verbs=get;list;watch;create;update;patch;delete

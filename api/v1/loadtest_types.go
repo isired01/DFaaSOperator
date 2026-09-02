@@ -45,8 +45,6 @@ const (
 
 // Condition Reasons stamped on LoadTest.status.conditions (P15).
 const (
-	LTReasonDraftSaved             = "DraftSaved"
-	LTReasonActivated              = "Activated"
 	LTReasonScheduledArmed         = "ScheduledArmed"
 	LTReasonScheduledFired         = "ScheduledFired"
 	LTReasonScheduledDelayedEnvNot = "ScheduledDelayedEnvNotReady"
@@ -60,26 +58,35 @@ const (
 	LTReasonAllFailed              = "AllFailed"
 	LTReasonRunning                = "Running"
 	LTReasonK6Running              = "K6Running"
+	LTReasonExportCooldown         = "ExportCooldown"
 	LTReasonExporterRunning        = "ExporterRunning"
 	LTReasonExportSucceeded        = "ExportSucceeded"
 	LTReasonJobFailed              = "JobFailed"
 	LTReasonExportSkipped          = "Skipped"
-	LTReasonS3ConfigMissing        = "S3ConfigMissing"
-	LTReasonUserAborted            = "UserAborted"
-	LTReasonCompleted              = "Completed"
-	LTReasonFailed                 = "Failed"
-	LTReasonAborted                = "Aborted"
-	LTReasonScriptMirrorFailed     = "ScriptMirrorFailed"
-	LTReasonStaleCleanupFailed     = "StaleCleanupFailed"
-	LTReasonAwaitingRunners        = "AwaitingRunners"
-	LTReasonGoPublished            = "GoPublished"
-	LTReasonSyncTimeout            = "SyncTimeout"
-	LTReasonApplyFailed            = "ApplyFailed"
-	LTReasonPostStart              = "PostStart"
-	LTReasonEnvNotFound            = "EnvNotFound"
-	LTReasonEnvFound               = "EnvFound"
-	LTReasonEnvFailed              = "EnvFailed"
-	LTReasonEnvDegraded            = "EnvDegraded"
+	// LTReasonRunnersReclaimed restamps K6Healthy after an abort tore the
+	// remote TestRuns down. Without it the condition keeps the last observed
+	// running count ("2 running") on a test whose runners are already gone.
+	LTReasonRunnersReclaimed   = "RunnersReclaimed"
+	LTReasonS3ConfigMissing    = "S3ConfigMissing"
+	LTReasonUserAborted        = "UserAborted"
+	LTReasonCompleted          = "Completed"
+	LTReasonFailed             = "Failed"
+	LTReasonAborted            = "Aborted"
+	LTReasonScriptMirrorFailed = "ScriptMirrorFailed"
+	LTReasonStaleCleanupFailed = "StaleCleanupFailed"
+	LTReasonAwaitingRunners    = "AwaitingRunners"
+	LTReasonGoPublished        = "GoPublished"
+	LTReasonSyncTimeout        = "SyncTimeout"
+	LTReasonApplyFailed        = "ApplyFailed"
+	// LTReasonFetchFailed marks a failed READ of a remote TestRun (status
+	// poll), as opposed to ApplyFailed which marks a failed write. Reusing
+	// ApplyFailed for both made a dead k6 node read like a rejected manifest.
+	LTReasonFetchFailed = "FetchFailed"
+	LTReasonPostStart   = "PostStart"
+	LTReasonEnvNotFound = "EnvNotFound"
+	LTReasonEnvFound    = "EnvFound"
+	LTReasonEnvFailed   = "EnvFailed"
+	LTReasonEnvDegraded = "EnvDegraded"
 	// Queue-gate reasons (FIFO serialization on a shared Environment).
 	LTReasonEnvBusy      = "EnvBusy"
 	LTReasonQueuedBehind = "QueuedBehind"
@@ -104,8 +111,12 @@ type PerNodeLoad struct {
 	// +kubebuilder:validation:Minimum=1
 	VUs int `json:"vus"`
 
-	// k6 test duration (Go duration string, e.g. "30s", "5m").
+	// k6 test duration as a Go duration string, e.g. "30s", "5m", "1h30m".
+	// The pattern is the admission-time guard: a human-readable value such as
+	// "5 minutes" used to pass validation and only fail inside the remote k6
+	// runner, after the whole dispatch had already happened.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
 	Duration string `json:"duration"`
 
 	// ScriptConfigMap references a ConfigMap in the same namespace exposing
@@ -174,8 +185,11 @@ type MetricsExportSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	Metrics []MetricExportEntry `json:"metrics"`
 
-	// Step for QueryRange (Go duration string).
+	// Step for QueryRange, as a Go duration string (e.g. "15s", "1m").
+	// Same admission-time guard as PerNodeLoad.Duration: an unparsable step
+	// would otherwise only surface inside the exporter Job.
 	// +kubebuilder:default="15s"
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
 	Step string `json:"step,omitempty"`
 }
 
@@ -185,20 +199,26 @@ type LoadTestSpec struct {
 	// +kubebuilder:validation:Required
 	TargetEnvironment string `json:"targetEnvironment"`
 
-	// One entry per k6-load-generator node the test should hit.
+	// One entry per k6-load-generator node the test should hit. Keyed by
+	// nodeID: the API server rejects duplicates at admission (listType=map),
+	// which would otherwise produce two entries competing over the same remote
+	// TestRun name.
 	// +kubebuilder:validation:MinItems=1
+	// +listType=map
+	// +listMapKey=nodeID
 	PerNodeLoad []PerNodeLoad `json:"perNodeLoad"`
 
 	// +kubebuilder:validation:Required
 	MetricsExport MetricsExportSpec `json:"metricsExport"`
 
 	// Suspended marks the LoadTest as a "Save as Draft": when true, the
-	// reconciler keeps phase=Pending, stamps Conditions[Suspended]=True,
-	// and does NOT dispatch any k6 TestRun. PATCHing to false activates
-	// the test (the Suspended Condition flips to False, phase advances to
-	// Running). Once execution begins (phase=Running or beyond), changes
-	// to this field are ignored — the run-once guard makes the state
-	// machine immutable post-start.
+	// reconciler keeps phase=Pending and does NOT dispatch any k6 TestRun.
+	// PATCHing to false activates the test (phase advances to Running).
+	// Once execution begins (phase=Running or beyond), changes to this field
+	// are ignored — the run-once guard makes the state machine immutable
+	// post-start. No Condition mirrors this field: consumers must read
+	// spec.suspended itself to tell a draft apart from a test waiting on its
+	// Environment.
 	//
 	// Pattern mirrors batch/v1.Job.spec.suspend.
 	// +kubebuilder:default=false
