@@ -139,9 +139,11 @@ func (r *LoadTestReconciler) teardownRemoteTestRuns(ctx context.Context,
 //
 // Steps:
 //  1. If our finalizer is absent, nothing to do.
-//  2. Fetch the parent Environment. NotFound → remote kubeconfig Secrets
-//     are gone with it, no way to delete remote TestRuns. Just remove the
-//     finalizer and let the CR go.
+//  2. Fetch the parent Environment. NotFound → the remote kubeconfig Secrets
+//     went with it (ownerReference stamped by the k6 playbook, plus the
+//     Environment finalizer's pruneK6Kubeconfigs sweep for older ones), so
+//     there is no way to delete remote TestRuns. Just remove the finalizer
+//     and let the CR go.
 //  3. Drive abortLoadTest (reason=UserAborted) to issue DeleteTestRun
 //     against every node in spec ∪ status. abortLoadTest itself transitions
 //     phase to Aborted on the first clean sweep; we don't care about that
@@ -162,8 +164,11 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 	envKey := types.NamespacedName{Name: lt.Spec.TargetEnvironment, Namespace: lt.Namespace}
 	err := r.Get(ctx, envKey, &env)
 	if apierrors.IsNotFound(err) {
-		// Environment already gone — kubeconfig Secrets cascade with it.
-		// Best-effort done; release the CR.
+		// Environment already gone, and with it the kubeconfig Secrets: the
+		// k6 playbook stamps an Environment ownerReference on each one, and
+		// the Environment finalizer drains any that predate that change
+		// (pruneK6Kubeconfigs). No credentials left to reach the remote k3s,
+		// so best-effort is done; release the CR.
 		logger.Info("environment gone during loadtest deletion — releasing finalizer",
 			"env", lt.Spec.TargetEnvironment)
 		return ctrl.Result{}, r.removeLTFinalizer(ctx, lt)

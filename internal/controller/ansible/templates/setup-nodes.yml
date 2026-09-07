@@ -28,7 +28,87 @@
     dfaas_agent_image: "ghcr.io/isired01/dfaas-agent:dev"
     dfaas_agent_image_pull_policy: "Always"
 
+    # Role recorded on the node itself; see the repave block at the top of
+    # tasks. Must match the NodeRole enum in api/v1/common_types.go.
+    dfaas_role: dfaas-worker
+    dfaas_role_marker: /etc/dfaas-role
+
   tasks:
+
+    # --- Role-flip repave -------------------------------------------------
+    # The node records its own role in {{ dfaas_role_marker }} as the last task
+    # of a successful run. A mismatch means this machine was provisioned for the
+    # other role, so its k3s -- installed with the other role's INSTALL_K3S_EXEC
+    # flags -- and every workload on it must go before we layer this role on
+    # top. k3s-uninstall.sh removes /var/lib/rancher/k3s (the embedded
+    # datastore), so every Helm release, namespace and workload goes with it,
+    # plus /etc/rancher/k3s and the uninstaller itself -- hence the stat guards.
+    # The install tasks below are guarded on `stat /usr/local/bin/k3s`, so once
+    # this block has run they reinstall k3s with THIS role's flags.
+    #
+    # ponytail: duplicated verbatim in the twin playbook. Factoring it into an
+    # included tasks file needs Go plumbing, because EnsurePlaybookConfigMap
+    # (ansible/config.go) ships only the one playbook for the role being run.
+    - name: Check for a recorded role marker
+      ansible.builtin.stat:
+        path: "{{ dfaas_role_marker }}"
+      register: dfaas_role_marker_stat
+
+    # No failed_when: false here. Reading an existing marker as root must not
+    # fail silently -- a swallowed read error would look like "fresh node" and
+    # skip the wipe.
+    - name: Read previously provisioned role
+      ansible.builtin.slurp:
+        src: "{{ dfaas_role_marker }}"
+      register: dfaas_prev_role
+      when: dfaas_role_marker_stat.stat.exists
+
+    - name: Wipe k3s when the node held a different role
+      when:
+        - dfaas_role_marker_stat.stat.exists
+        - (dfaas_prev_role.content | default('') | b64decode | trim) != dfaas_role
+      block:
+        - name: Check for the k3s uninstaller
+          ansible.builtin.stat:
+            path: /usr/local/bin/k3s-uninstall.sh
+          register: k3s_uninstaller
+
+        - name: Check whether k3s is still installed
+          ansible.builtin.stat:
+            path: /usr/local/bin/k3s
+          register: k3s_present
+
+        # Refuse to install this role on top of the other role's stack. A
+        # missing uninstaller while k3s is still present means the node cannot
+        # be cleaned, and continuing anyway is precisely the bug this block
+        # exists to prevent. k3s already absent == nothing to wipe, so that
+        # case falls through and provisioning proceeds normally.
+        - name: Fail when the node holds a stale stack that cannot be removed
+          ansible.builtin.fail:
+            msg: >-
+              node was provisioned as
+              '{{ dfaas_prev_role.content | default('') | b64decode | trim }}' but
+              /usr/local/bin/k3s-uninstall.sh is missing while
+              /usr/local/bin/k3s is still present; refusing to layer
+              '{{ dfaas_role }}' on top of the previous role's stack.
+              Wipe the node manually and re-run.
+          when:
+            - k3s_present.stat.exists
+            - not k3s_uninstaller.stat.exists
+
+        - name: Run k3s-uninstall.sh
+          ansible.builtin.command: /usr/local/bin/k3s-uninstall.sh
+          when: k3s_uninstaller.stat.exists
+          changed_when: true
+
+        # Dropped straight after the wipe, not at the end of the play: if the
+        # reinstall then fails mid-way, the next attempt sees no marker, resumes
+        # the install on the already-clean node, and does not wipe a second time.
+        - name: Drop the stale role marker
+          ansible.builtin.file:
+            path: "{{ dfaas_role_marker }}"
+            state: absent
+    # --- end role-flip repave --------------------------------------------
     - name: Disable APT automatic upgrades
       ansible.builtin.copy:
         dest: /etc/apt/apt.conf.d/99-disable-auto-upgrades
@@ -350,3 +430,12 @@
                         value: "prometheus.monitoring.svc.cluster.local"
                       - name: faas_prometheus_port
                         value: "9090"
+
+    # Recorded LAST. A play that dies mid-way therefore leaves either the
+    # previous role on disk or no marker at all (if the wipe already ran), so
+    # the next attempt re-evaluates instead of trusting a half-done install.
+    - name: Record the provisioned role on the node
+      ansible.builtin.copy:
+        dest: "{{ dfaas_role_marker }}"
+        content: "{{ dfaas_role }}\n"
+        mode: '0644'

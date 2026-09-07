@@ -89,6 +89,24 @@ func (m *Manager) EnsureLibp2pKeys(ctx context.Context,
 		dirty = true
 	}
 
+	// Prune entries for nodes that spec still lists but that no longer hold the
+	// worker role: a flipped node runs no agent, so its identity is dead weight
+	// in a Secret that is handed to every provisioning run. Deliberately scoped
+	// to nodeIDs *present in spec* — an entry for a nodeID absent from spec is
+	// the BYO escape hatch documented above (pre-seed the Secret to pin a peer
+	// identity before adding the node) and must survive.
+	prune := map[string]struct{}{}
+	for _, n := range env.Spec.Nodes {
+		if n.Role == dfaasv1.RoleDfaasWorker {
+			continue
+		}
+		if _, ok := secret.Data[n.NodeID]; ok {
+			prune[n.NodeID] = struct{}{}
+			delete(secret.Data, n.NodeID)
+			dirty = true
+		}
+	}
+
 	if !dirty {
 		return out, nil
 	}
@@ -108,7 +126,7 @@ func (m *Manager) EnsureLibp2pKeys(ctx context.Context,
 		// winner stored and reports it back.
 	}
 
-	merged, err := m.mergeLibp2pKeys(ctx, secretKey, secret.Data)
+	merged, err := m.mergeLibp2pKeys(ctx, secretKey, secret.Data, prune)
 	if err != nil {
 		return nil, err
 	}
@@ -123,10 +141,13 @@ func (m *Manager) EnsureLibp2pKeys(ctx context.Context,
 }
 
 // mergeLibp2pKeys merges generated entries into the persisted Secret without
-// clobbering existing ones (first writer wins per nodeID) and returns the
-// Secret's post-merge contents.
+// clobbering existing ones (first writer wins per nodeID), removes the nodeIDs
+// in prune, and returns the Secret's post-merge contents. The prune runs inside
+// the same retry loop as the merge: dropping the entries locally before calling
+// this would not stick, because the loop re-reads the latest Secret and would
+// merge them straight back in.
 func (m *Manager) mergeLibp2pKeys(ctx context.Context, secretKey client.ObjectKey,
-	generated map[string][]byte) (map[string]string, error) {
+	generated map[string][]byte, prune map[string]struct{}) (map[string]string, error) {
 
 	merged := map[string]string{}
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -141,6 +162,11 @@ func (m *Manager) mergeLibp2pKeys(ctx context.Context, secretKey client.ObjectKe
 			if _, ok := latest.Data[nodeID]; !ok {
 				latest.Data[nodeID] = key
 			}
+		}
+		// After the merge, so a concurrent writer cannot resurrect an identity
+		// for a node that has left the worker role.
+		for nodeID := range prune {
+			delete(latest.Data, nodeID)
 		}
 		if err := m.Update(ctx, latest); err != nil {
 			return err

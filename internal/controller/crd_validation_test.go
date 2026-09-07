@@ -67,4 +67,42 @@ var _ = Describe("Environment CRD validation", func() {
 		Expect(k8sClient.Create(ctx, env)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, env)).To(Succeed())
 	})
+
+	// One machine is one node. The listMapKey above only guards nodeID, so
+	// before the CEL rule two entries could share an ipAddress: the Ansible run
+	// then installed dfaas-agent twice on that box with two different libp2p
+	// keys, and the last one to land left every peer dialling a dead peer ID.
+	// The rule needs MaxItems on spec.nodes and MaxLength on ipAddress to stay
+	// inside the CRD cost budget — this spec fails at CRD-install time if either
+	// is dropped, so it also guards the budget.
+	It("rejects two nodes sharing an ipAddress", func() {
+		env := &dfaasv1.Environment{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "dup-ip-", Namespace: "default"},
+			Spec: dfaasv1.EnvironmentSpec{Nodes: []dfaasv1.EnvironmentNode{
+				validationNode("worker-1", "10.0.0.1"),
+				validationNode("worker-2", "10.0.0.1"),
+			}},
+		}
+		err := k8sClient.Create(ctx, env)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "expected an admission rejection, got %v", err)
+		Expect(err.Error()).To(ContainSubstring("each ipAddress must appear at most once"))
+	})
+
+	// A k6 generator and a dfaas-worker on the same box is the same collision:
+	// the rule spans the whole list, not one role.
+	It("rejects an ipAddress shared across roles", func() {
+		k6 := validationNode("gen-1", "10.0.0.1")
+		k6.Role = dfaasv1.RoleK6LoadGenerator
+		env := &dfaasv1.Environment{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "dup-ip-roles-", Namespace: "default"},
+			Spec: dfaasv1.EnvironmentSpec{Nodes: []dfaasv1.EnvironmentNode{
+				validationNode("worker-1", "10.0.0.1"),
+				k6,
+			}},
+		}
+		err := k8sClient.Create(ctx, env)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "expected an admission rejection, got %v", err)
+	})
 })

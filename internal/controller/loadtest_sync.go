@@ -53,7 +53,7 @@ const syncPollRequeue = 3 * time.Second
 
 // syncFilerBase is the in-cluster SeaweedFS filer endpoint the OPERATOR
 // writes the GO object to. Distinct from the VM-facing public URL.
-const syncFilerBase = "http://seaweedfs.monitoring.svc.cluster.local:8888"
+const syncFilerBase = "http://seaweedfs-all-in-one.monitoring.svc.cluster.local:8888"
 
 // syncFilerNodePort is the filer's NodePort, used to build the VM-facing GO
 // URL from the management node IP.

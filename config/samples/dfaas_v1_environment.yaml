@@ -4,7 +4,6 @@ metadata:
   name: env-sample
   namespace: default
 spec:
-  cleanupOnDelete: false
   # s3ConfigRef is optional. When set, every LoadTest targeting this
   # Environment uploads its metrics CSV to the S3 endpoint registered as
   # Secret "dfaas-s3/<name>" (label dfaas.io/s3-config=true). When unset,

@@ -59,7 +59,7 @@ ui:
     PORT: "8082"
     CORS_ORIGINS: ""              # csv; empty = same-origin only
     # SEAWEEDFS_ENDPOINT: ""      # override gateway→SeaweedFS dial endpoint; default: auto
-                                  #   (in-cluster → seaweedfs.monitoring.svc…:8333, dev → <nodeIP>:30900)
+                                  #   (in-cluster → seaweedfs-all-in-one.monitoring.svc…:8333, dev → <nodeIP>:30900)
     # SEAWEEDFS_PUBLIC_URL: ""    # override the asset URL handed to k6; default: <nodeIP>:30900
 
 # CRDs are NOT installed by this chart. Apply them once before creating any

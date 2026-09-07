@@ -211,9 +211,13 @@ func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole,
 	case dfaasv1.RoleK6LoadGenerator:
 		inv = "[k6_nodes]\n"
 		for _, n := range nodes {
+			// env_uid feeds the ownerReference the playbook stamps on the
+			// kubeconfig Secret it pushes back to the management cluster, so
+			// that Secret is garbage-collected with the Environment instead of
+			// lingering with dead credentials after a role flip.
 			inv += fmt.Sprintf(
-				"%s ansible_user=%s ansible_password=%s node_id='%s' env_name='%s' env_namespace='%s'\n",
-				n.IPAddress, n.Username, n.Password, n.NodeID, env.Name, env.Namespace,
+				"%s ansible_user=%s ansible_password=%s node_id='%s' env_name='%s' env_namespace='%s' env_uid='%s'\n",
+				n.IPAddress, n.Username, n.Password, n.NodeID, env.Name, env.Namespace, env.UID,
 			)
 		}
 	}
@@ -297,6 +301,16 @@ const (
 	LabelEnvironment = "dfaas.io/environment"
 	LabelRole        = "dfaas.io/role"
 	LabelGeneration  = "dfaas.io/generation"
+)
+
+// Label keys the k6 playbook stamps on the per-node kubeconfig Secret it
+// pushes back into the management cluster. Note these are NOT LabelEnvironment
+// above: that one tags Jobs and inventory Secrets with "dfaas.io/environment",
+// while the kubeconfig Secret uses the shorter "dfaas.io/env". Both halves are
+// hand-synced with templates/setup-k6-nodes.yml, which is the source of truth.
+const (
+	LabelKubeconfigEnv    = "dfaas.io/env"
+	LabelKubeconfigNodeID = "dfaas.io/node-id"
 )
 
 // jobLabels returns the canonical label set for an Ansible Job + its

@@ -4,27 +4,21 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 
 	"dfaas-operator/internal/helm"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	sigsyaml "sigs.k8s.io/yaml"
 )
 
-// seaweedfsFieldOwner is the server-side-apply field manager used for the raw
-// SeaweedFS objects, so re-applies are an idempotent merge rather than a clobber.
-const seaweedfsFieldOwner = "dfaas-operator"
-
-// Deploy installs or upgrades the two Helm releases of the monitoring stack
-// (Prometheus + Grafana) in the "monitoring" namespace. Idempotent: the first
-// Reconcile runs an Install, subsequent ones an Upgrade.
+// Deploy installs or upgrades the three Helm releases of the monitoring stack
+// (Prometheus + Grafana + SeaweedFS) in the "monitoring" namespace. Idempotent:
+// the first Reconcile runs an Install, subsequent ones an Upgrade.
 func (m *Manager) Deploy(ctx context.Context) error {
 	log := log.FromContext(ctx)
 
@@ -63,64 +57,65 @@ func (m *Manager) Deploy(ctx context.Context) error {
 		return fmt.Errorf("helm grafana: %w", err)
 	}
 
-	// 4. SeaweedFS — the in-cluster default S3 sink. Not a Helm chart: decode the
-	//    embedded multi-doc manifest and server-side-apply each object. The
-	//    Service resolves as seaweedfs.monitoring.svc.cluster.local:8333 and is
-	//    referenced by the dfaas-s3/seaweedfs-default config Secret. The S3 port
-	//    8333 → NodePort 30900 is chosen to avoid colliding with Prometheus
-	//    (9090/30090) and Grafana (30300).
-	if err := m.deploySeaweedFS(ctx); err != nil {
-		return fmt.Errorf("deploy seaweedfs: %w", err)
+	// 4. SeaweedFS — the in-cluster default S3 sink, from the official chart in
+	//    all-in-one mode (master + volume + filer + S3 gateway in one process).
+	//    The Service resolves as
+	//    seaweedfs-all-in-one.monitoring.svc.cluster.local:8333 and is referenced
+	//    by the dfaas-s3/seaweedfs-default config Secret. The S3 port 8333 →
+	//    NodePort 30900 and the filer 8888 → 30901 are chosen to avoid colliding
+	//    with Prometheus (9090/30090) and Grafana (30300).
+	if err := m.pruneLegacySeaweedFS(ctx); err != nil {
+		return fmt.Errorf("prune legacy seaweedfs: %w", err)
+	}
+	var swfsValues map[string]interface{}
+	if err := sigsyaml.Unmarshal(seaweedfsValuesYAML, &swfsValues); err != nil {
+		return fmt.Errorf("parse seaweedfs values: %w", err)
+	}
+	if _, err := helm.InstallOrUpgradeFromArchive(
+		ctx, log, "seaweedfs",
+		bytes.NewReader(seaweedfsChartTGZ),
+		"monitoring", swfsValues,
+	); err != nil {
+		return fmt.Errorf("helm seaweedfs: %w", err)
 	}
 
 	return nil
 }
 
-// deploySeaweedFS decodes the embedded multi-doc seaweedfs.yaml and
-// server-side-applies each object with FieldOwner "dfaas-operator". Idempotent:
-// re-runs merge into the existing objects rather than recreating them. The
-// "monitoring" namespace is guaranteed to exist by the caller (Deploy creates
-// it first).
-func (m *Manager) deploySeaweedFS(ctx context.Context) error {
+// pruneLegacySeaweedFS deletes the four objects the operator used to
+// server-side-apply before SeaweedFS became a Helm release. They carry no Helm
+// ownership metadata, so `helm install` would not adopt them, and the legacy
+// "seaweedfs" Service holds NodePorts 30900/30901 — the install would fail with
+// "provided port is already allocated" until it is gone. The Service therefore
+// goes first: it frees both ports at once and has no finalizer, so nothing has
+// to be awaited before the install.
+//
+// Deleting the legacy PVC discards CSVs and k6 logs exported before the
+// migration; the chart provisions a fresh seaweedfs-all-in-one-data claim.
+//
+// ponytail: dead code once every cluster has migrated — drop it then. Every
+// name here differs from the release's own objects (seaweedfs-all-in-one,
+// seaweedfs-all-in-one-data, seaweedfs-s3-secret), so this can never remove
+// what the chart just installed.
+func (m *Manager) pruneLegacySeaweedFS(ctx context.Context) error {
 	logger := log.FromContext(ctx)
 
-	objs, err := decodeMultiDocYAML(seaweedfsYAML)
-	if err != nil {
-		return fmt.Errorf("decode seaweedfs manifest: %w", err)
+	legacy := []client.Object{
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "seaweedfs", Namespace: "monitoring"}},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "seaweedfs-deployment", Namespace: "monitoring"}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "seaweedfs-pvc", Namespace: "monitoring"}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "seaweedfs-creds", Namespace: "monitoring"}},
 	}
 
-	for _, obj := range objs {
-		gvk := obj.GroupVersionKind()
-		logger.Info("applying seaweedfs object",
-			"kind", gvk.Kind, "name", obj.GetName(), "namespace", obj.GetNamespace())
-		if err := m.Patch(ctx, obj, client.Apply,
-			client.FieldOwner(seaweedfsFieldOwner), client.ForceOwnership); err != nil {
-			return fmt.Errorf("apply seaweedfs %s/%s: %w", gvk.Kind, obj.GetName(), err)
-		}
-	}
-	logger.Info("seaweedfs default S3 sink applied", "objects", len(objs))
-	return nil
-}
-
-// decodeMultiDocYAML splits a multi-document YAML stream into a slice of
-// unstructured objects, skipping empty documents. Returned objects are ready
-// for server-side apply (each carries apiVersion/kind/metadata from the
-// manifest).
-func decodeMultiDocYAML(data []byte) ([]*unstructured.Unstructured, error) {
-	dec := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
-	var out []*unstructured.Unstructured
-	for {
-		raw := map[string]interface{}{}
-		if err := dec.Decode(&raw); err != nil {
-			if err == io.EOF {
-				break
+	for _, obj := range legacy {
+		if err := m.Delete(ctx, obj); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
 			}
-			return nil, err
+			return fmt.Errorf("delete %T %s: %w", obj, obj.GetName(), err)
 		}
-		if len(raw) == 0 {
-			continue
-		}
-		out = append(out, &unstructured.Unstructured{Object: raw})
+		logger.Info("removed pre-Helm SeaweedFS object",
+			"kind", fmt.Sprintf("%T", obj), "name", obj.GetName())
 	}
-	return out, nil
+	return nil
 }

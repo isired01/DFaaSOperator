@@ -1,0 +1,93 @@
+# Override values for the official seaweedfs/seaweedfs chart (4.45.0), installed
+# by the operator as the in-cluster default S3 sink during the Environment
+# ProvisioningMonitoring phase. Release name "seaweedfs" in the "monitoring"
+# namespace, so seaweedfs.fullname == "seaweedfs" and the objects come out as
+# seaweedfs-all-in-one (Deployment + Service), seaweedfs-all-in-one-data (PVC),
+# seaweedfs-s3-secret (Secret) and seaweedfs (ServiceAccount).
+
+global:
+  seaweedfs:
+    # The chart's ClusterRole only exists for its "delete the master pod after a
+    # migration" hack, and the operator's own ClusterRole does not grant
+    # clusterroles/clusterrolebindings — leaving this on would make the Helm
+    # install fail as Forbidden.
+    createClusterRole: false
+
+# allInOne does NOT switch the single components off: master-statefulset.yaml &
+# co. are guarded only by their own .enabled, so leaving these true would deploy
+# BOTH the all-in-one pod and a full master/volume/filer StatefulSet set. The
+# blocks stay in values (the all-in-one pod reads .Values.master.port,
+# .Values.volume.port, .Values.filer.port from them) — only the workloads go.
+master:
+  enabled: false
+volume:
+  enabled: false
+filer:
+  enabled: false
+
+# The standalone S3 gateway stays off: it runs inside the all-in-one process.
+# The credentials, however, are read from here by templates/s3/s3-secret.yaml,
+# which renders seaweedfs-s3-secret with the seaweedfs_s3_config identity file.
+s3:
+  enabled: false
+  credentials:
+    # MUST match access_key_id / secret_access_key written into the
+    # dfaas-s3/seaweedfs-default Secret by EnsureDefaultS3Config in
+    # internal/controller/s3_bootstrap.go — that Secret is what the exporter Job
+    # and the UI gateway authenticate with. Rotate both together.
+    # Lab-grade on purpose; note for hardening.
+    admin:
+      accessKey: admin
+      secretKey: admin123
+    # Unused by dFaaS, but pinned anyway: left empty the chart generates a random
+    # pair on every render, so the Secret would churn on each helm upgrade.
+    read:
+      accessKey: reader
+      secretKey: reader123
+
+allInOne:
+  # One process: master + volume + filer + S3 gateway, one PVC, one pod. Same
+  # topology the operator used to server-side-apply as a raw manifest.
+  enabled: true
+  s3:
+    enabled: true
+    port: 8333
+    # Mounts seaweedfs-s3-secret at /etc/sw/s3 and passes
+    # -s3.config=/etc/sw/s3/seaweedfs_s3_config.
+    enableAuth: true
+  service:
+    # NodePort so the remote k6 VMs and the UI gateway can reach S3 and the filer
+    # from outside the cluster. Only these two ports are pinned; the service also
+    # publishes master/volume/grpc/metrics ports, for which Kubernetes allocates
+    # ephemeral NodePorts we never use.
+    type: NodePort
+    nodePorts:
+      # S3 API (8333). Also resolves in-cluster as
+      # seaweedfs-all-in-one.monitoring.svc.cluster.local:8333.
+      s3: 30900
+      # Filer web UI + REST (8888): object browser at http://<nodeIP>:30901 and
+      # the authless channel for the syncStart GO signal and the k6 summaries.
+      # 30900/30901 avoid Prometheus (30090) and Grafana (30300).
+      filer: 30901
+  data:
+    # Chart-managed PVC named seaweedfs-all-in-one-data, ReadWriteOnce by
+    # default. updateStrategy is Recreate (chart default), so the old pod always
+    # releases the volume before the new one starts — no lock contention on
+    # -dir=/data, which is why the raw manifest needed maxSurge: 0.
+    type: persistentVolumeClaim
+    size: 10Gi
+  resources:
+    # Chart defaults are 500m/1Gi requests and 2 CPU/2Gi limits — too greedy for
+    # a management node that also runs Prometheus and Grafana.
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# Not configurable, worth knowing: the chart also renders a seaweedfs-sftp-secret
+# (random passwords + host key) because templates/sftp/sftp-secret.yaml is
+# guarded by `or sftp.enabled allInOne.enabled` instead of allInOne.sftp.enabled.
+# Nothing mounts it — allInOne.sftp.enabled is false — and its values are read
+# back from the cluster on upgrade, so it is inert noise, not a rotating secret.

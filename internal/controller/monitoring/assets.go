@@ -14,10 +14,8 @@ var prometheusValuesYAML []byte
 //go:embed values/grafana-values.yaml
 var grafanaValuesYAML []byte
 
-// seaweedfsYAML is the raw multi-doc manifest for the in-cluster SeaweedFS
-// instance that serves as the default S3 sink (Secret + PVC + Deployment +
-// Service in the "monitoring" namespace). Unlike Prometheus/Grafana it is not a
-// Helm chart; Deploy decodes and server-side-applies each object directly.
-//
-//go:embed seaweedfs.yaml
-var seaweedfsYAML []byte
+//go:embed charts/seaweedfs-4.45.0.tgz
+var seaweedfsChartTGZ []byte
+
+//go:embed values/seaweedfs-values.yaml
+var seaweedfsValuesYAML []byte

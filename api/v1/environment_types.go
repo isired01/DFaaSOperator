@@ -98,7 +98,13 @@ type EnvironmentNode struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	NodeID string `json:"nodeID"`
 
+	// MaxLength is not cosmetic: without it the CEL uniqueness rule on
+	// spec.nodes below is rejected, because the cost estimator assumes the
+	// largest string the request budget allows for every comparison. 45 is the
+	// longest possible textual IP (IPv6 with an embedded IPv4, e.g.
+	// ffff:...:255.255.255.255).
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MaxLength=45
 	IPAddress string `json:"ipAddress"`
 
 	// +kubebuilder:validation:Required
@@ -133,7 +139,21 @@ type EnvironmentSpec struct {
 	// (listType=map). Without it two entries sharing a nodeID collide on every
 	// derived object name (kubeconfig Secret, libp2p key entry, remote TestRun)
 	// and the second silently overwrites the first.
+	//
+	// ipAddress is unique too, enforced by the CEL rule below: one physical
+	// machine is one node. Two entries sharing an IP used to be valid (the
+	// listMapKey only guards nodeID) and produced two libp2p identities on one
+	// box — the Ansible run installs dfaas-agent twice with different keys, and
+	// whichever lands last leaves every peer dialling a dead peer ID.
+	// MaxItems is what makes the rule admissible at all: CEL cost estimation on
+	// an unbounded array blows the schema budget (same reason nodeID uses an
+	// OpenAPI Pattern instead of CEL), and this comparison is O(n²).
+	// NOTE: scope is one Environment. Nothing stops two *different* Environments
+	// from declaring the same machine — that needs a cross-object check the CRD
+	// schema cannot express.
 	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=50
+	// +kubebuilder:validation:XValidation:rule="self.all(n, self.exists_one(m, m.ipAddress == n.ipAddress))",message="each ipAddress must appear at most once: one machine is one node"
 	// +listType=map
 	// +listMapKey=nodeID
 	Nodes []EnvironmentNode `json:"nodes"`
@@ -141,9 +161,10 @@ type EnvironmentSpec struct {
 	// +optional
 	Topology Topology `json:"topology,omitempty"`
 
-	// CleanupOnDelete drives the finalizer's behavior.
-	// +kubebuilder:default=false
-	CleanupOnDelete bool `json:"cleanupOnDelete,omitempty"`
+	// REMOVED: CleanupOnDelete. It was documented as driving the finalizer, but
+	// nothing ever read it: the finalizer in environment_lifecycle.go always
+	// runs CleanupTargets and then drops itself, on every deletion. Keeping the
+	// field made the UI promise a VM teardown that never happened.
 
 	// S3ConfigRef points at a cluster-scoped S3 server configuration
 	// registered in namespace "dfaas-s3" (Secret with label

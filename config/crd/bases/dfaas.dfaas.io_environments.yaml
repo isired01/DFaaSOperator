@@ -46,16 +46,24 @@ spec:
           spec:
             description: EnvironmentSpec is the desired federation infrastructure.
             properties:
-              cleanupOnDelete:
-                default: false
-                description: CleanupOnDelete drives the finalizer's behavior.
-                type: boolean
               nodes:
                 description: |-
                   Nodes is keyed by nodeID: the API server rejects duplicates at admission
                   (listType=map). Without it two entries sharing a nodeID collide on every
                   derived object name (kubeconfig Secret, libp2p key entry, remote TestRun)
                   and the second silently overwrites the first.
+
+                  ipAddress is unique too, enforced by the CEL rule below: one physical
+                  machine is one node. Two entries sharing an IP used to be valid (the
+                  listMapKey only guards nodeID) and produced two libp2p identities on one
+                  box — the Ansible run installs dfaas-agent twice with different keys, and
+                  whichever lands last leaves every peer dialling a dead peer ID.
+                  MaxItems is what makes the rule admissible at all: CEL cost estimation on
+                  an unbounded array blows the schema budget (same reason nodeID uses an
+                  OpenAPI Pattern instead of CEL), and this comparison is O(n²).
+                  NOTE: scope is one Environment. Nothing stops two *different* Environments
+                  from declaring the same machine — that needs a cross-object check the CRD
+                  schema cannot express.
                 items:
                   description: EnvironmentNode declares one machine in the federation.
                   properties:
@@ -123,6 +131,13 @@ spec:
                         type: object
                       type: array
                     ipAddress:
+                      description: |-
+                        MaxLength is not cosmetic: without it the CEL uniqueness rule on
+                        spec.nodes below is rejected, because the cost estimator assumes the
+                        largest string the request budget allows for every comparison. 45 is the
+                        longest possible textual IP (IPv6 with an embedded IPv4, e.g.
+                        ffff:...:255.255.255.255).
+                      maxLength: 45
                       type: string
                     nodeID:
                       description: |-
@@ -157,11 +172,16 @@ spec:
                   - role
                   - username
                   type: object
+                maxItems: 50
                 minItems: 1
                 type: array
                 x-kubernetes-list-map-keys:
                 - nodeID
                 x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: 'each ipAddress must appear at most once: one machine is
+                    one node'
+                  rule: self.all(n, self.exists_one(m, m.ipAddress == n.ipAddress))
               s3ConfigRef:
                 description: |-
                   S3ConfigRef points at a cluster-scoped S3 server configuration

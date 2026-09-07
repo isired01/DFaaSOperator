@@ -12,9 +12,12 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -58,6 +61,15 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 		if err := mm.CleanupTargets(ctx, env); err != nil {
 			logger.Error(err, "cleanup Prometheus targets failed; keeping the finalizer and retrying")
 			return ctrl.Result{}, fmt.Errorf("cleanup Prometheus targets: %w", err)
+		}
+
+		// Kubeconfig Secrets pushed before the playbook started stamping
+		// ownerReferences have no owner, so GC cannot reach them. Held to the
+		// same guarantee as CleanupTargets: keep the finalizer on failure
+		// rather than leaking node credentials into the namespace forever.
+		if err := r.pruneK6Kubeconfigs(ctx, env, nil); err != nil {
+			logger.Error(err, "cleanup k6 kubeconfig Secrets failed; keeping the finalizer and retrying")
+			return ctrl.Result{}, fmt.Errorf("cleanup k6 kubeconfig secrets: %w", err)
 		}
 
 		controllerutil.RemoveFinalizer(env, environmentFinalizer)
@@ -192,6 +204,12 @@ func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Cont
 		log.FromContext(ctx).Error(err, "syncNodeStatus failed; retrying")
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
+	// Both roles have finished provisioning by this point, so a node that
+	// flipped away from k6-load-generator has already been repaved and its
+	// pushed kubeconfig is dead. Best-effort: a stale Secret is inert (dispatch
+	// resolves nodes through status.k6Nodes), so it must not hold up Ready.
+	logStatusErr(ctx, "prune k6 kubeconfig secrets",
+		r.pruneK6Kubeconfigs(ctx, env, k6NodeIDs(env)))
 	return r.setEnvPhase(ctx, env, dfaasv1.EnvReady)
 }
 
@@ -302,6 +320,63 @@ func (r *EnvironmentReconciler) syncNodeStatus(ctx context.Context, env *dfaasv1
 		latest.Status.DfaasNodes = dfaas
 		return nil
 	})
+}
+
+// pruneK6Kubeconfigs deletes the per-node kubeconfig Secrets of env whose
+// nodeID is absent from keep. Those Secrets are pushed by the k6 playbook via
+// `delegate_to: localhost` and hold credentials for that node's k3s API. Once a
+// node leaves the k6-load-generator role its k3s has been wiped and
+// reinstalled, so the stored credentials are dead — and nothing else removes
+// them: the LoadTest dispatch index is derived from status.k6Nodes, which drops
+// the node silently.
+//
+// Two call sites, deliberately different keep sets:
+//
+//   - reconcile: keep = every current k6-load-generator nodeID, so a role flip
+//     drops exactly the Secret of the node that moved.
+//   - deletion: keep = nil, draining the lot. Redundant for Secrets carrying
+//     the ownerReference the playbook now stamps, but Secrets pushed before
+//     that change have no owner at all and Kubernetes GC cannot reach them.
+//
+// Selection is by the labels the playbook writes, never by name, and a Secret
+// with no node-id label is skipped — that is what keeps the unlabelled
+// <env>-libp2p-keys Secret out of scope.
+func (r *EnvironmentReconciler) pruneK6Kubeconfigs(ctx context.Context,
+	env *dfaasv1.Environment, keep map[string]struct{}) error {
+
+	var secrets corev1.SecretList
+	if err := r.List(ctx, &secrets, client.InNamespace(env.Namespace),
+		client.MatchingLabels{ansible.LabelKubeconfigEnv: env.Name}); err != nil {
+		return fmt.Errorf("list k6 kubeconfig secrets: %w", err)
+	}
+
+	var errs []error
+	for i := range secrets.Items {
+		sec := &secrets.Items[i]
+		nodeID := sec.Labels[ansible.LabelKubeconfigNodeID]
+		if nodeID == "" {
+			continue
+		}
+		if _, ok := keep[nodeID]; ok {
+			continue
+		}
+		if err := r.Delete(ctx, sec); err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("delete kubeconfig secret %s: %w", sec.Name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// k6NodeIDs returns the set of nodeIDs currently holding the k6-load-generator
+// role, i.e. the keep set for pruneK6Kubeconfigs on the reconcile path.
+func k6NodeIDs(env *dfaasv1.Environment) map[string]struct{} {
+	keep := map[string]struct{}{}
+	for _, n := range env.Spec.Nodes {
+		if n.Role == dfaasv1.RoleK6LoadGenerator {
+			keep[n.NodeID] = struct{}{}
+		}
+	}
+	return keep
 }
 
 // atomicStatusUpdate runs mutate against the freshly-fetched Environment and
