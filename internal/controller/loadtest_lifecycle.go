@@ -12,14 +12,12 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -122,9 +120,9 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 	}
 
 	// Seed from Status.TestRuns so a re-entry after a partial-dispatch error
-	resumes where it left off: a node already represented there has a live
-	remote run that must NOT be re-deleted and re-applied (that would yank a
-	running k6 test off the generator).
+	// resumes where it left off: a node already represented there has a live
+	// remote run that must NOT be re-deleted and re-applied (that would yank a
+	// running k6 test off the generator).
 	refs := append([]dfaasv1.TestRunRef(nil), lt.Status.TestRuns...)
 	dispatched := map[string]bool{}
 	for _, ref := range refs {

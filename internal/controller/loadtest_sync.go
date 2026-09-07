@@ -26,7 +26,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
-	"dfaas-operator/internal/k6dispatch"
 )
 
 // Synchronized start (spec.syncStart) — the GO-signal barrier.

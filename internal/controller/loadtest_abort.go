@@ -12,6 +12,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/k6dispatch"
 )
 
 // abortLoadTest performs the multi-cluster cascading abort: best-effort
