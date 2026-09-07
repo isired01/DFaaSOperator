@@ -1,0 +1,190 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+*/
+
+// Package fake is the in-memory k6dispatch adapter for tests. It records every
+// remote operation and returns whatever stage the test has set; nothing
+// progresses on its own — a test that wants a transition sets it and
+// reconciles again.
+package fake
+
+import (
+	"context"
+	"sync"
+
+	corev1 "k8s.io/api/core/v1"
+
+	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/k6dispatch"
+)
+
+// Applied records one Node.Apply call.
+type Applied struct {
+	NodeID  string
+	Name    string
+	PerNode dfaasv1.PerNodeLoad
+	Env     k6dispatch.RunnerEnv
+}
+
+// Fleet implements k6dispatch.Dispatcher.
+type Fleet struct {
+	mu       sync.Mutex
+	stages   map[string]string // TestRun key → stage; absent = NotFound
+	applied  []Applied
+	deleted  []string // TestRun keys, in order
+	mirrored []string // "<nodeID>/<cm name>"
+	logs     map[string]string
+	failNext map[string]error // "<nodeID>|<op>" → error, consumed on first use
+}
+
+// New returns an empty fleet.
+func New() *Fleet {
+	return &Fleet{stages: map[string]string{}, logs: map[string]string{}, failNext: map[string]error{}}
+}
+
+func key(nodeID string, lt *dfaasv1.LoadTest) string {
+	return nodeID + "|" + k6dispatch.TestRunName(lt, nodeID)
+}
+
+// Node implements Dispatcher with the same usability policy as Live, so
+// tests exercise the real "node left the environment" path.
+func (f *Fleet) Node(_ context.Context, env *dfaasv1.Environment, nodeID string) (k6dispatch.Node, error) {
+	if _, err := k6dispatch.ResolveKubeconfig(env, nodeID); err != nil {
+		return nil, err
+	}
+	return &node{f: f, nodeID: nodeID}, nil
+}
+
+// SetStage sets what Stage reports for lt on nodeID. Also makes the TestRun
+// "exist" if it did not.
+func (f *Fleet) SetStage(nodeID string, lt *dfaasv1.LoadTest, stage string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stages[key(nodeID, lt)] = stage
+}
+
+// SetLogs sets what Logs returns for nodeID.
+func (f *Fleet) SetLogs(nodeID, logs string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.logs[nodeID] = logs
+}
+
+// FailNext makes the next op ("mirror", "apply", "stage", "delete", "logs")
+// on nodeID return err, once.
+func (f *Fleet) FailNext(nodeID, op string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failNext[nodeID+"|"+op] = err
+}
+
+// Applied returns every Apply call in order.
+func (f *Fleet) Applied() []Applied {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]Applied(nil), f.applied...)
+}
+
+// Deleted returns every Delete call (TestRun keys) in order.
+func (f *Fleet) Deleted() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.deleted...)
+}
+
+// Mirrored returns every MirrorConfigMap call as "<nodeID>/<cm name>".
+func (f *Fleet) Mirrored() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.mirrored...)
+}
+
+// Exists reports whether lt's TestRun is present on nodeID.
+func (f *Fleet) Exists(nodeID string, lt *dfaasv1.LoadTest) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.stages[key(nodeID, lt)]
+	return ok
+}
+
+func (f *Fleet) takeFailure(nodeID, op string) error {
+	k := nodeID + "|" + op
+	if err, ok := f.failNext[k]; ok {
+		delete(f.failNext, k)
+		return err
+	}
+	return nil
+}
+
+type node struct {
+	f      *Fleet
+	nodeID string
+}
+
+func (n *node) Ref(lt *dfaasv1.LoadTest) dfaasv1.TestRunRef {
+	return dfaasv1.TestRunRef{NodeID: n.nodeID, Name: k6dispatch.TestRunName(lt, n.nodeID), Namespace: "default"}
+}
+
+func (n *node) MirrorConfigMap(_ context.Context, cm *corev1.ConfigMap) error {
+	n.f.mu.Lock()
+	defer n.f.mu.Unlock()
+	if err := n.f.takeFailure(n.nodeID, "mirror"); err != nil {
+		return err
+	}
+	n.f.mirrored = append(n.f.mirrored, n.nodeID+"/"+cm.Name)
+	return nil
+}
+
+func (n *node) Apply(_ context.Context, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad, env k6dispatch.RunnerEnv) error {
+	n.f.mu.Lock()
+	defer n.f.mu.Unlock()
+	if err := n.f.takeFailure(n.nodeID, "apply"); err != nil {
+		return err
+	}
+	k := key(n.nodeID, lt)
+	n.f.applied = append(n.f.applied, Applied{NodeID: n.nodeID, Name: k6dispatch.TestRunName(lt, n.nodeID), PerNode: perNode, Env: env})
+	if _, ok := n.f.stages[k]; !ok {
+		n.f.stages[k] = "created"
+	}
+	return nil
+}
+
+func (n *node) Stage(_ context.Context, lt *dfaasv1.LoadTest) (string, error) {
+	n.f.mu.Lock()
+	defer n.f.mu.Unlock()
+	if err := n.f.takeFailure(n.nodeID, "stage"); err != nil {
+		return "", err
+	}
+	stage, ok := n.f.stages[key(n.nodeID, lt)]
+	if !ok {
+		return "", k6dispatch.ErrNotFound
+	}
+	return stage, nil
+}
+
+func (n *node) Delete(_ context.Context, lt *dfaasv1.LoadTest) error {
+	n.f.mu.Lock()
+	defer n.f.mu.Unlock()
+	if err := n.f.takeFailure(n.nodeID, "delete"); err != nil {
+		return err
+	}
+	k := key(n.nodeID, lt)
+	n.f.deleted = append(n.f.deleted, k)
+	delete(n.f.stages, k)
+	return nil
+}
+
+func (n *node) Logs(_ context.Context, _ *dfaasv1.LoadTest) (string, error) {
+	n.f.mu.Lock()
+	defer n.f.mu.Unlock()
+	if err := n.f.takeFailure(n.nodeID, "logs"); err != nil {
+		return "", err
+	}
+	return n.f.logs[n.nodeID], nil
+}

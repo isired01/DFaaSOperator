@@ -47,23 +47,22 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	k6Index := computeK6NodeIndex(env)
-
 	allDone := true
 	var errorCount, finishedCount int
 	updatedRefs := make([]dfaasv1.TestRunRef, len(lt.Status.TestRuns))
 	copy(updatedRefs, lt.Status.TestRuns)
 
 	for i, ref := range lt.Status.TestRuns {
-		k6Node, nerr := resolveK6Node(k6Index, ref.NodeID)
+		node, nerr := r.Dispatcher.Node(ctx, env, ref.NodeID)
 		if nerr != nil {
+			// A node that vanished mid-test can neither be polled nor released:
+			// fail on the spot instead of waiting out a budget it cannot satisfy.
 			return r.failLoadTest(ctx, lt, nerr.Error())
 		}
-		secretRef := types.NamespacedName{Name: k6Node.KubeconfigSecret, Namespace: lt.Namespace}
-		remoteKey := types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}
-
-		tr, err := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey)
+		stage, err := node.Stage(ctx, lt)
 		if err != nil {
+			// ErrNotFound included: a TestRun that disappeared under a running
+			// test is a fetch failure, routed through the retry budget.
 			logger.Error(err, "remote TestRun fetch failed", "node", ref.NodeID, "name", ref.Name)
 			res, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonFetchFailed)
 			return res, oerr
@@ -72,7 +71,6 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 		if rerr := r.resetDispatchAttempts(ctx, lt); rerr != nil {
 			logger.Error(rerr, "resetDispatchAttempts failed; non-fatal")
 		}
-		stage := k6dispatch.StageOf(tr)
 		updatedRefs[i].Phase = stage
 
 		switch stage {
@@ -162,17 +160,14 @@ func (r *LoadTestReconciler) captureK6Logs(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) {
 	logger := log.FromContext(ctx)
 
-	k6Index := computeK6NodeIndex(env)
 	for _, ref := range lt.Status.TestRuns {
-		k6Node, nerr := resolveK6Node(k6Index, ref.NodeID)
+		node, nerr := r.Dispatcher.Node(ctx, env, ref.NodeID)
 		if nerr != nil {
 			// Best-effort path: nothing to read from a node we cannot reach.
 			logger.Error(nerr, "skipping k6 log capture", "node", ref.NodeID)
 			continue
 		}
-
-		secretRef := types.NamespacedName{Name: k6Node.KubeconfigSecret, Namespace: lt.Namespace}
-		logs, err := r.Dispatcher.GetK6RunnerLogs(ctx, secretRef, ref.Name, ref.Namespace)
+		logs, err := node.Logs(ctx, lt)
 		if err != nil {
 			// Record the failure as a placeholder so the operator/user still
 			// gets a per-VM artifact noting capture did not succeed.

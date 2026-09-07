@@ -41,8 +41,11 @@ const loadTestFinalizer = "dfaas.dfaas.io/loadtest-finalizer"
 // the metrics exporter.
 type LoadTestReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	Dispatcher *k6dispatch.Dispatcher
+	Scheme *runtime.Scheme
+	// Dispatcher is the seam to the k6 fleet: k6dispatch.Live in production,
+	// k6dispatch/fake.Fleet in tests. Everything about reaching a node lives
+	// behind it; the reconciler only knows nodeIDs.
+	Dispatcher k6dispatch.Dispatcher
 	// APIReader reads straight from the API server, bypassing the informer
 	// cache. Used for the single decisive List in envOccupancyGate: the
 	// single-active-test-per-Environment invariant is decided from that List

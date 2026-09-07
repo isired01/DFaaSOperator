@@ -121,19 +121,48 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 			"awaiting first remote TestRun apply"))
 	}
 
-	k6Index := computeK6NodeIndex(env)
-
-	// Seed refs from existing Status.TestRuns so that a re-entry after a
-	// partial-dispatch error resumes from where it left off. The per-node
-	// guard below skips nodes already represented in this slice.
-	refs, alreadyDispatched := resumePartialDispatch(lt)
+	// Seed from Status.TestRuns so a re-entry after a partial-dispatch error
+	resumes where it left off: a node already represented there has a live
+	remote run that must NOT be re-deleted and re-applied (that would yank a
+	running k6 test off the generator).
+	refs := append([]dfaasv1.TestRunRef(nil), lt.Status.TestRuns...)
+	dispatched := map[string]bool{}
+	for _, ref := range refs {
+		dispatched[ref.NodeID] = true
+	}
 
 	for _, perNode := range lt.Spec.PerNodeLoad {
-		updatedRefs, stop, res, err := r.dispatchTestRunForNode(
-			ctx, lt, env, perNode, k6Index, refs, alreadyDispatched)
-		refs = updatedRefs
-		if stop {
+		if dispatched[perNode.NodeID] {
+			continue
+		}
+		node, nerr := r.Dispatcher.Node(ctx, env, perNode.NodeID)
+		if nerr != nil {
+			return r.failLoadTest(ctx, lt,
+				fmt.Sprintf("perNodeLoad %q on env %q: %v", perNode.NodeID, env.Name, nerr))
+		}
+		if res, stop, err := r.dispatchOne(ctx, lt, node, perNode); stop {
 			return res, err
+		}
+		// Apply succeeded — record and persist incrementally so a failure later
+		// in the loop leaves the already-dispatched runs visible to observeK6 /
+		// abortLoadTest / the deletion finalizer.
+		refs = append(refs, node.Ref(lt))
+		dispatched[perNode.NodeID] = true
+		if perr := r.persistTestRuns(ctx, lt, refs); perr != nil {
+			// The run is live on the remote; back off and let the next reconcile
+			// re-encounter it through the guard above once status catches up.
+			log.FromContext(ctx).Error(perr, "persist TestRuns after apply failed")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		// Successful dispatcher round-trip — reset the budget counter and
+		// surface partial progress on K6Dispatched (P9).
+		if rerr := r.resetDispatchAttempts(ctx, lt); rerr != nil {
+			log.FromContext(ctx).Error(rerr, "resetDispatchAttempts failed; non-fatal")
+		}
+		if len(refs) < len(lt.Spec.PerNodeLoad) {
+			logStatusErr(ctx, "stamp K6Dispatched=False (in flight)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+				metav1.ConditionFalse, dfaasv1.LTReasonInFlight,
+				fmt.Sprintf("%d/%d TestRun(s) dispatched", len(refs), len(lt.Spec.PerNodeLoad))))
 		}
 	}
 
@@ -173,167 +202,73 @@ func (r *LoadTestReconciler) finishDispatch(ctx context.Context,
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
-// computeK6NodeIndex builds a lookup from NodeID → kubeconfig Secret name,
-// sourced from Environment.status.k6Nodes (populated by EnvironmentReconciler).
-func computeK6NodeIndex(env *dfaasv1.Environment) map[string]dfaasv1.K6NodeStatus {
-	k6Index := map[string]dfaasv1.K6NodeStatus{}
-	for _, n := range env.Status.K6Nodes {
-		k6Index[n.NodeID] = n
-	}
-	return k6Index
-}
-
-// resolveK6Node looks one nodeID up in the Environment's k6 index and returns
-// the node only when it is actually usable, i.e. still declared on the
-// Environment AND carrying a kubeconfig Secret. Single policy for every caller:
-// an unusable node is an error, never a silent skip. A node that vanished
-// mid-test can neither be polled nor released, so the paths that need it to
-// make progress (observeK6, awaitSyncBarrier) fail the LoadTest on the spot
-// instead of waiting out a budget it can never satisfy, and the best-effort
-// cleanup paths (teardownRemoteTestRuns, captureK6Logs) log the same error
-// before moving on — counting it as a failure there would wedge the abort loop
-// on a node that is unreachable by definition.
-func resolveK6Node(k6Index map[string]dfaasv1.K6NodeStatus, nodeID string) (dfaasv1.K6NodeStatus, error) {
-	node, ok := k6Index[nodeID]
-	if !ok {
-		return dfaasv1.K6NodeStatus{}, fmt.Errorf("k6 node %q is no longer part of the environment", nodeID)
-	}
-	if node.KubeconfigSecret == "" {
-		return dfaasv1.K6NodeStatus{}, fmt.Errorf("k6 node %q has no kubeconfig Secret on the environment", nodeID)
-	}
-	return node, nil
-}
-
-// resumePartialDispatch seeds the dispatch state from existing
-// Status.TestRuns so a re-entry after a partial-dispatch error resumes from
-// where it left off. The returned refs slice is a copy of the persisted runs;
-// alreadyDispatched keys each run as "<nodeID>|<name>" so the per-node guard
-// can skip nodes that were already dispatched.
-func resumePartialDispatch(lt *dfaasv1.LoadTest) ([]dfaasv1.TestRunRef, map[string]bool) {
-	refs := make([]dfaasv1.TestRunRef, len(lt.Status.TestRuns))
-	copy(refs, lt.Status.TestRuns)
-	alreadyDispatched := map[string]bool{}
-	for _, ref := range refs {
-		alreadyDispatched[ref.NodeID+"|"+ref.Name] = true
-	}
-	return refs, alreadyDispatched
-}
-
-// dispatchTestRunForNode dispatches the remote TestRun for a single
-// PerNodeLoad entry. It returns the (possibly extended) refs slice, a stop
-// flag, and the Result/error the caller must return when stop is true. When
-// stop is false the caller continues to the next PerNodeLoad entry. The
-// alreadyDispatched map is mutated in place. Same control flow and error
-// handling as the original inline loop body in startK6.
-func (r *LoadTestReconciler) dispatchTestRunForNode(ctx context.Context,
-	lt *dfaasv1.LoadTest, env *dfaasv1.Environment, perNode dfaasv1.PerNodeLoad,
-	k6Index map[string]dfaasv1.K6NodeStatus, refs []dfaasv1.TestRunRef,
-	alreadyDispatched map[string]bool) (updatedRefs []dfaasv1.TestRunRef, stop bool, res ctrl.Result, err error) {
+// dispatchOne runs the mirror → wipe → confirm-gone → apply protocol for lt on
+// one node. stop=true means the caller returns (res, err) as-is: the LoadTest
+// failed, the retry budget spoke, or we wait a tick for the remote delete to
+// propagate. stop=false means the TestRun is applied.
+func (r *LoadTestReconciler) dispatchOne(ctx context.Context, lt *dfaasv1.LoadTest,
+	node k6dispatch.Node, perNode dfaasv1.PerNodeLoad) (res ctrl.Result, stop bool, err error) {
 	logger := log.FromContext(ctx)
+	nodeID := perNode.NodeID
 
-	k6Node, ok := k6Index[perNode.NodeID]
-	if !ok {
-		res, ferr := r.failLoadTest(ctx, lt,
-			fmt.Sprintf("nodeID %q in perNodeLoad is not a k6-load-generator on env %q",
-				perNode.NodeID, env.Name))
-		return refs, true, res, ferr
-	}
-	if k6Node.KubeconfigSecret == "" {
-		res, ferr := r.failLoadTest(ctx, lt,
-			fmt.Sprintf("k6 node %q has no kubeconfig Secret on env %q",
-				perNode.NodeID, env.Name))
-		return refs, true, res, ferr
-	}
-
-	trName := fmt.Sprintf("%s-%s", lt.Name, sanitize(perNode.NodeID))
-
-	// Per-node guard: if Status.TestRuns already has {NodeID, Name} for
-	// this entry, the remote TestRun is live and we must NOT re-delete
-	// and re-apply it (that would yank a running k6 test off the
-	// worker). Skip straight to the next entry.
-	if alreadyDispatched[perNode.NodeID+"|"+trName] {
-		return refs, false, ctrl.Result{}, nil
-	}
-
-	tr, berr := buildRemoteTestRun(trName, lt, perNode)
-	if berr != nil {
-		res, ferr := r.failLoadTest(ctx, lt,
-			fmt.Sprintf("build remote TestRun for node %q: %v", perNode.NodeID, berr))
-		return refs, true, res, ferr
-	}
-	secretRef := types.NamespacedName{Name: k6Node.KubeconfigSecret, Namespace: lt.Namespace}
-	remoteKey := types.NamespacedName{Name: trName, Namespace: "default"}
-
-	// Mirror the script ConfigMap onto the remote k3s. k6-operator resolves
-	// spec.script.configMap in its own cluster, so the CM must exist there.
-	if merr := r.mirrorScriptConfigMap(ctx, lt, perNode, secretRef); merr != nil {
-		logger.Error(merr, "remote script CM mirror failed", "node", perNode.NodeID)
+	// Mirror the script ConfigMap onto the remote k3s first: k6-operator
+	// resolves spec.script.configMap in its own cluster.
+	var src corev1.ConfigMap
+	srcKey := types.NamespacedName{Name: perNode.ScriptConfigMap.Name, Namespace: lt.Namespace}
+	if gerr := r.Get(ctx, srcKey, &src); gerr != nil {
+		merr := fmt.Errorf("read script ConfigMap %s/%s: %w", srcKey.Namespace, srcKey.Name, gerr)
+		logger.Error(merr, "remote script CM mirror failed", "node", nodeID)
 		res, oerr := r.onDispatchError(ctx, lt, merr, dfaasv1.LTReasonScriptMirrorFailed)
-		return refs, true, res, oerr
+		return res, true, oerr
+	}
+	if _, ok := src.Data["script.js"]; !ok {
+		merr := fmt.Errorf("script ConfigMap %s/%s missing key \"script.js\"", srcKey.Namespace, srcKey.Name)
+		logger.Error(merr, "remote script CM mirror failed", "node", nodeID)
+		res, oerr := r.onDispatchError(ctx, lt, merr, dfaasv1.LTReasonScriptMirrorFailed)
+		return res, true, oerr
+	}
+	if merr := node.MirrorConfigMap(ctx, &src); merr != nil {
+		logger.Error(merr, "remote script CM mirror failed", "node", nodeID)
+		res, oerr := r.onDispatchError(ctx, lt, merr, dfaasv1.LTReasonScriptMirrorFailed)
+		return res, true, oerr
 	}
 
-	// Wipe stale TestRun from previous runs so we start with fresh status.
-	if derr := r.Dispatcher.DeleteTestRun(ctx, secretRef, remoteKey); derr != nil {
-		logger.Error(derr, "remote TestRun cleanup failed", "node", perNode.NodeID)
+	// Wipe a stale TestRun from a previous run so we start with fresh status,
+	// and only proceed once the remote confirms it is gone: an unreachable node
+	// or an unparsable kubeconfig says nothing about the remote state, and
+	// applying on top of it would risk racing a still-running k6 test.
+	if derr := node.Delete(ctx, lt); derr != nil {
+		logger.Error(derr, "remote TestRun cleanup failed", "node", nodeID)
 		res, oerr := r.onDispatchError(ctx, lt, derr, dfaasv1.LTReasonStaleCleanupFailed)
-		return refs, true, res, oerr
+		return res, true, oerr
 	}
-	_, gerr := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey)
+	_, serr := node.Stage(ctx, lt)
 	switch {
-	case gerr == nil:
+	case serr == nil:
 		// Delete still propagating on the remote — wait a tick then retry.
-		return refs, true, ctrl.Result{RequeueAfter: 3 * time.Second}, nil
-	case !apierrors.IsNotFound(gerr):
-		// Only NotFound proves the stale TestRun is gone. An unreachable node
-		// or an unparsable kubeconfig says nothing about the remote state, so
-		// applying on top of it would risk racing a still-running k6 test:
-		// route it through the retry budget instead.
-		logger.Error(gerr, "remote TestRun delete-confirm poll failed", "node", perNode.NodeID)
-		res, oerr := r.onDispatchError(ctx, lt, gerr, dfaasv1.LTReasonStaleCleanupFailed)
-		return refs, true, res, oerr
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, true, nil
+	case !errors.Is(serr, k6dispatch.ErrNotFound):
+		logger.Error(serr, "remote TestRun delete-confirm poll failed", "node", nodeID)
+		res, oerr := r.onDispatchError(ctx, lt, serr, dfaasv1.LTReasonStaleCleanupFailed)
+		return res, true, oerr
 	}
 
-	if aerr := r.Dispatcher.ApplyTestRun(ctx, secretRef, tr); aerr != nil {
-		logger.Error(aerr, "remote TestRun apply failed", "node", perNode.NodeID)
-		// Persist any partial refs accumulated so far so the next
-		// reconcile resumes from this exact node rather than re-applying
-		// already-running TestRuns.
-		if perr := r.persistTestRuns(ctx, lt, refs); perr != nil {
-			logger.Error(perr, "persist partial TestRuns failed")
-		}
+	if aerr := node.Apply(ctx, lt, perNode, r.runnerEnv(lt, nodeID)); aerr != nil {
+		logger.Error(aerr, "remote TestRun apply failed", "node", nodeID)
 		res, oerr := r.onDispatchError(ctx, lt, aerr, dfaasv1.LTReasonApplyFailed)
-		return refs, true, res, oerr
+		return res, true, oerr
 	}
+	return ctrl.Result{}, false, nil
+}
 
-	// Apply succeeded — append and persist incrementally so a failure
-	// later in the loop leaves the already-dispatched runs visible to
-	// observeK6 / abortLoadTest / the deletion finalizer.
-	refs = append(refs, dfaasv1.TestRunRef{
-		NodeID:    perNode.NodeID,
-		Name:      trName,
-		Namespace: "default", // remote namespace; TestRun is applied in default on the k6 k3s
-	})
-	alreadyDispatched[perNode.NodeID+"|"+trName] = true
-	if perr := r.persistTestRuns(ctx, lt, refs); perr != nil {
-		// Failed to persist — back off without losing the dispatch (it's
-		// on the remote already). Next reconcile will re-encounter the
-		// same TestRun and the guard above (if status caught up) or the
-		// delete-then-apply path will reconcile it.
-		logger.Error(perr, "persist TestRuns after apply failed")
-		return refs, true, ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+// runnerEnv is what the reconciler decides about the k6 runner's environment:
+// the URLs the generated script talks to. The dispatcher only carries them.
+func (r *LoadTestReconciler) runnerEnv(lt *dfaasv1.LoadTest, nodeID string) k6dispatch.RunnerEnv {
+	env := k6dispatch.RunnerEnv{SummaryURL: summaryURL(lt, nodeID)}
+	if lt.Spec.SyncStart {
+		env.SyncURL = syncGoURL(lt)
 	}
-	// Successful dispatcher round-trip — reset the budget counter and
-	// surface partial progress on K6Dispatched (P9).
-	if rerr := r.resetDispatchAttempts(ctx, lt); rerr != nil {
-		logger.Error(rerr, "resetDispatchAttempts failed; non-fatal")
-	}
-	if len(refs) < len(lt.Spec.PerNodeLoad) {
-		logStatusErr(ctx, "stamp K6Dispatched=False (in flight)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
-			metav1.ConditionFalse, dfaasv1.LTReasonInFlight,
-			fmt.Sprintf("%d/%d TestRun(s) dispatched",
-				len(refs), len(lt.Spec.PerNodeLoad))))
-	}
-	return refs, false, ctrl.Result{}, nil
+	return env
 }
 
 // persistTestRuns writes the cumulative TestRunRef slice into
@@ -398,87 +333,7 @@ func (r *LoadTestReconciler) ensureMirroredS3Secret(ctx context.Context,
 	return mirror.Name, nil
 }
 
-// buildRemoteTestRun assembles an unstructured k6.io/v1alpha1 TestRun manifest
-// for one PerNodeLoad entry. Applied to the matching k6 machine's k3s. Returns
-// an error if the spec map cannot be nested (a dispatched TestRun with an empty
-// spec would start no runner at all).
-func buildRemoteTestRun(name string, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad) (*unstructured.Unstructured, error) {
-	tr := &unstructured.Unstructured{}
-	tr.SetGroupVersionKind(k6dispatch.TestRunGVK)
-	tr.SetName(name)
-	tr.SetNamespace("default")
-	tr.SetLabels(map[string]string{
-		"dfaas.io/loadtest-name": lt.Name,
-		"dfaas.io/node-id":       perNode.NodeID,
-	})
-	spec := map[string]interface{}{
-		"parallelism": int64(1),
-		"script": map[string]interface{}{
-			"configMap": map[string]interface{}{
-				"name": perNode.ScriptConfigMap.Name,
-				"file": "script.js",
-			},
-		},
-		// VUs and duration deliberately do not appear here: k6 takes both from
-		// options.scenarios inside the script, and we set no TestRun field that
-		// could carry them. They used to be mirrored onto annotations "in case a
-		// TestRun-level field is needed in the future" — nothing ever read them,
-		// so they are gone. spec.perNodeLoad on the LoadTest CR still records
-		// both, which is where the UI reads them from.
-	}
-	// The generated script's handleSummary() PUTs its end-of-test summary
-	// JSON here (see loadtest_sync.go). Always injected: empty value (public
-	// base unresolvable) or scripts without handleSummary just skip it.
-	runnerEnv := []interface{}{
-		map[string]interface{}{"name": "DFAAS_SUMMARY_URL", "value": summaryURL(lt, perNode.NodeID)},
-	}
-	if lt.Spec.SyncStart {
-		// The generated script's setup() blocks polling this URL until the
-		// reconciler publishes the GO signal (see loadtest_sync.go). Scripts
-		// without the barrier simply ignore the env var.
-		runnerEnv = append(runnerEnv,
-			map[string]interface{}{"name": "DFAAS_SYNC_URL", "value": syncGoURL(lt)})
-	}
-	spec["runner"] = map[string]interface{}{"env": runnerEnv}
-	if err := unstructured.SetNestedMap(tr.Object, spec, "spec"); err != nil {
-		return nil, fmt.Errorf("set TestRun spec: %w", err)
-	}
-	return tr, nil
-}
-
-// mirrorScriptConfigMap reads the management-cluster ConfigMap named by
-// perNode.ScriptConfigMap and server-side-applies a copy of it on the remote
-// k3s in the "default" namespace (where the dispatched TestRun lives). The
-// remote ConfigMap keeps the same name so spec.script.configMap.name in the
-// TestRun resolves correctly.
-func (r *LoadTestReconciler) mirrorScriptConfigMap(ctx context.Context,
-	lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad,
-	secretRef types.NamespacedName) error {
-
-	var src corev1.ConfigMap
-	srcKey := types.NamespacedName{Name: perNode.ScriptConfigMap.Name, Namespace: lt.Namespace}
-	if err := r.Get(ctx, srcKey, &src); err != nil {
-		return fmt.Errorf("read script ConfigMap %s/%s: %w", srcKey.Namespace, srcKey.Name, err)
-	}
-	if _, ok := src.Data["script.js"]; !ok {
-		return fmt.Errorf("script ConfigMap %s/%s missing key \"script.js\"", srcKey.Namespace, srcKey.Name)
-	}
-	return r.Dispatcher.ApplyConfigMap(ctx, secretRef,
-		perNode.ScriptConfigMap.Name, "default", src.Data)
-}
-
-// sanitize lowercases and replaces non-DNS-1123 chars with "-", to make Names
-// valid for k8s objects.
-func sanitize(s string) string {
-	s = strings.ToLower(s)
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('-')
-		}
-	}
-	return b.String()
-}
+// sanitize is k6dispatch.Sanitize: the remote TestRun names and the
+// management-cluster names derived from a nodeID (k6 log ConfigMaps, summary
+// object keys) must agree on the spelling.
+var sanitize = k6dispatch.Sanitize

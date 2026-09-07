@@ -219,11 +219,10 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	k6Index := computeK6NodeIndex(env)
 	total := len(lt.Status.TestRuns)
 	started := 0
 	for _, ref := range lt.Status.TestRuns {
-		k6Node, nerr := resolveK6Node(k6Index, ref.NodeID)
+		node, nerr := r.Dispatcher.Node(ctx, env, ref.NodeID)
 		if nerr != nil {
 			// A node that left the Environment will never report "started":
 			// fail in one tick instead of burning the whole syncWaitBudget
@@ -237,15 +236,14 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 				metav1.ConditionFalse, dfaasv1.LTReasonSyncTimeout, nerr.Error()))
 			return r.failLoadTest(ctx, lt, "synchronized start: "+nerr.Error())
 		}
-		secretRef := types.NamespacedName{Name: k6Node.KubeconfigSecret, Namespace: lt.Namespace}
-		remoteKey := types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}
-		tr, err := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey)
+		stage, err := node.Stage(ctx, lt)
 		if err != nil {
-			// Transient remote hiccup: keep waiting, the budget bounds us.
+			// Transient remote hiccup (or not yet visible): keep waiting, the
+			// budget bounds us.
 			logger.Error(err, "sync barrier: remote TestRun poll failed", "node", ref.NodeID)
 			continue
 		}
-		switch k6dispatch.StageOf(tr) {
+		switch stage {
 		case "started", "finished", "stopped":
 			// finished/stopped should not happen while parked on the barrier,
 			// but count them as past-the-start so the GO still fires.

@@ -88,46 +88,31 @@ func (r *LoadTestReconciler) teardownRemoteTestRuns(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (failed int) {
 	logger := log.FromContext(ctx)
 
-	k6Index := computeK6NodeIndex(env)
-
-	type target struct{ nodeID, secretName, trName, trNs string }
-	targets := map[string]target{}
+	// Union of status.testRuns and spec.perNodeLoad catches partial-dispatch
+	// races. Remote names are deterministic per node, so the union is a set
+	// of nodeIDs.
+	nodeIDs := map[string]struct{}{}
 	for _, ref := range lt.Status.TestRuns {
-		k6Node, nerr := resolveK6Node(k6Index, ref.NodeID)
+		nodeIDs[ref.NodeID] = struct{}{}
+	}
+	for _, perNode := range lt.Spec.PerNodeLoad {
+		nodeIDs[perNode.NodeID] = struct{}{}
+	}
+
+	for nodeID := range nodeIDs {
+		node, nerr := r.Dispatcher.Node(ctx, env, nodeID)
 		if nerr != nil {
 			// Unreachable by definition: no kubeconfig, no remote API to delete
 			// through. Counting it as a failure would requeue the abort forever.
-			logger.Error(nerr, "skipping remote TestRun delete", "node", ref.NodeID)
+			logger.Error(nerr, "skipping remote TestRun delete", "node", nodeID)
 			continue
 		}
-		targets[ref.NodeID+"|"+ref.Name] = target{
-			nodeID: ref.NodeID, secretName: k6Node.KubeconfigSecret,
-			trName: ref.Name, trNs: ref.Namespace,
-		}
-	}
-	for _, perNode := range lt.Spec.PerNodeLoad {
-		k6Node, nerr := resolveK6Node(k6Index, perNode.NodeID)
-		if nerr != nil {
-			logger.Error(nerr, "skipping remote TestRun delete", "node", perNode.NodeID)
-			continue
-		}
-		trName := fmt.Sprintf("%s-%s", lt.Name, sanitize(perNode.NodeID))
-		targets[perNode.NodeID+"|"+trName] = target{
-			nodeID: perNode.NodeID, secretName: k6Node.KubeconfigSecret,
-			trName: trName, trNs: "default",
-		}
-	}
-
-	for _, t := range targets {
-		secretRef := types.NamespacedName{Name: t.secretName, Namespace: lt.Namespace}
-		remoteKey := types.NamespacedName{Name: t.trName, Namespace: t.trNs}
-		if err := r.Dispatcher.DeleteTestRun(ctx, secretRef, remoteKey); err != nil {
-			logger.Error(err, "remote TestRun delete failed",
-				"node", t.nodeID, "testRun", t.trName)
+		if err := node.Delete(ctx, lt); err != nil {
+			logger.Error(err, "remote TestRun delete failed", "node", nodeID)
 			failed++
 			continue
 		}
-		logger.Info("remote TestRun aborted", "node", t.nodeID, "testRun", t.trName)
+		logger.Info("remote TestRun aborted", "node", nodeID)
 	}
 	return failed
 }
@@ -198,46 +183,28 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 	// Poll: every TestRun in spec ∪ status must report NotFound on the
 	// remote cluster before we drop the finalizer. Mirrors the abort target
 	// set construction so a partial-dispatch ride-along is also covered.
-	k6Index := computeK6NodeIndex(&env)
-	type pollTarget struct{ secretName, trName, trNs string }
-	targets := map[string]pollTarget{}
+	nodeIDs := map[string]struct{}{}
 	for _, ref := range lt.Status.TestRuns {
-		k6Node, ok := k6Index[ref.NodeID]
-		if !ok || k6Node.KubeconfigSecret == "" {
-			continue
-		}
-		targets[ref.NodeID+"|"+ref.Name] = pollTarget{
-			secretName: k6Node.KubeconfigSecret,
-			trName:     ref.Name,
-			trNs:       ref.Namespace,
-		}
+		nodeIDs[ref.NodeID] = struct{}{}
 	}
 	for _, perNode := range lt.Spec.PerNodeLoad {
-		k6Node, ok := k6Index[perNode.NodeID]
-		if !ok || k6Node.KubeconfigSecret == "" {
+		nodeIDs[perNode.NodeID] = struct{}{}
+	}
+	for nodeID := range nodeIDs {
+		node, nerr := r.Dispatcher.Node(ctx, &env, nodeID)
+		if nerr != nil {
+			// Nothing to poll on a node we cannot reach; it cannot hold up release.
 			continue
 		}
-		trName := fmt.Sprintf("%s-%s", lt.Name, sanitize(perNode.NodeID))
-		targets[perNode.NodeID+"|"+trName] = pollTarget{
-			secretName: k6Node.KubeconfigSecret,
-			trName:     trName,
-			trNs:       "default",
-		}
-	}
-
-	for _, t := range targets {
-		secretRef := types.NamespacedName{Name: t.secretName, Namespace: lt.Namespace}
-		remoteKey := types.NamespacedName{Name: t.trName, Namespace: t.trNs}
-		_, err := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey)
+		_, err := node.Stage(ctx, lt)
 		if err == nil {
 			// Still present — keep polling.
 			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 		}
-		if !apierrors.IsNotFound(err) {
+		if !errors.Is(err, k6dispatch.ErrNotFound) {
 			// Transient (kubeconfig parse, network, etc). Keep polling rather
 			// than wedge the CR; the finalizer guarantees we revisit.
-			logger.Error(err, "remote TestRun NotFound-poll errored",
-				"node", t.trName)
+			logger.Error(err, "remote TestRun NotFound-poll errored", "node", nodeID)
 			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 		}
 	}

@@ -171,7 +171,7 @@ func main() {
 	if err = (&controller.LoadTestReconciler{
 		Client:     mgr.GetClient(),
 		Scheme:     mgr.GetScheme(),
-		Dispatcher: &k6dispatch.Dispatcher{Local: mgr.GetClient()},
+		Dispatcher: &k6dispatch.Live{Local: mgr.GetClient()},
 		// Cache-bypassing reader for the single-active-test-per-Environment
 		// gate, which must not decide from a stale informer snapshot.
 		APIReader: mgr.GetAPIReader(),
