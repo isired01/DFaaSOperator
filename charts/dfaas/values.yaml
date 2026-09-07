@@ -56,7 +56,7 @@ ui:
     annotations: {}
     tls: []                       # list of {secretName, hosts: []}
   env:                            # free-form key→value, each rendered as a container env var
-    PORT: "8082"
+                                  # PORT is derived from ui.service.port — do not set it here
     CORS_ORIGINS: ""              # csv; empty = same-origin only
     # SEAWEEDFS_ENDPOINT: ""      # override gateway→SeaweedFS dial endpoint; default: auto
                                   #   (in-cluster → seaweedfs-all-in-one.monitoring.svc…:8333, dev → <nodeIP>:30900)

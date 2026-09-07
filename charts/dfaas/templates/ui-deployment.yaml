@@ -29,6 +29,12 @@ spec:
               containerPort: {{ .Values.ui.service.port }}
               protocol: TCP
           env:
+            # Single source of truth for the listen port: containerPort,
+            # Service targetPort and the app's own bind address all derive
+            # from ui.service.port. Setting PORT in ui.env still wins (it is
+            # rendered after this), but then it must match ui.service.port.
+            - name: PORT
+              value: {{ .Values.ui.service.port | quote }}
             {{- range $k, $v := .Values.ui.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
