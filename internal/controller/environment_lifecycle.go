@@ -18,7 +18,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -28,6 +27,8 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/controller/ansible"
 	"dfaas-operator/internal/controller/monitoring"
+	"dfaas-operator/internal/controller/roles"
+	"dfaas-operator/internal/controller/statuswriter"
 )
 
 // monitoringAttemptsAnnotation persists the consecutive-error counter for
@@ -90,10 +91,10 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 	logger := log.FromContext(ctx)
 
 	if len(env.Spec.Nodes) == 0 {
-		logStatusErr(ctx, "stamp VMsReady=True (skipped)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
+		r.cond(ctx, env, dfaasv1.EnvCondVMsReady,
 			metav1.ConditionTrue, dfaasv1.EnvReasonSkipped,
-			"no nodes declared — placeholder phase"))
-		return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningInfra)
+			"no nodes declared — placeholder phase")
+		return r.phase(ctx, env, dfaasv1.EnvProvisioningInfra)
 	}
 
 	var unreachable []string
@@ -103,32 +104,32 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 		}
 	}
 	if len(unreachable) > 0 {
-		count, bumpErr := r.bumpSSHAttempts(ctx, env)
+		count, bumpErr := r.writer().Bump(ctx, env, sshAttemptsAnnotation)
 		if bumpErr != nil {
 			logger.Error(bumpErr, "bumpSSHAttempts failed; continuing without budget enforcement")
 		}
 		if count >= sshRetryBudget {
 			logger.Info("VMs not SSH-reachable after fast-retry budget; entering Unreachable (will keep retrying)",
 				"nodes", unreachable, "attempts", count)
-			logStatusErr(ctx, "stamp VMsReady=False (entering Unreachable)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
+			r.cond(ctx, env, dfaasv1.EnvCondVMsReady,
 				metav1.ConditionFalse, dfaasv1.EnvReasonSSHUnreachable,
 				fmt.Sprintf("SSH :22 dial failed for %v after %d fast attempts; retrying every %s",
-					unreachable, count, unreachableRetryInterval)))
-			return r.setEnvPhase(ctx, env, dfaasv1.EnvUnreachable)
+					unreachable, count, unreachableRetryInterval))
+			return r.phase(ctx, env, dfaasv1.EnvUnreachable)
 		}
 		logger.Info("VMs not SSH-reachable, retrying", "nodes", unreachable, "attempts", count)
-		logStatusErr(ctx, "stamp VMsReady=False (retrying)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
+		r.cond(ctx, env, dfaasv1.EnvCondVMsReady,
 			metav1.ConditionFalse, dfaasv1.EnvReasonSSHUnreachable,
-			fmt.Sprintf("SSH :22 dial failed for: %v", unreachable)))
+			fmt.Sprintf("SSH :22 dial failed for: %v", unreachable))
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
-	if rerr := r.resetSSHAttempts(ctx, env); rerr != nil {
+	if rerr := r.writer().Reset(ctx, env, sshAttemptsAnnotation); rerr != nil {
 		logger.Error(rerr, "resetSSHAttempts failed; non-fatal")
 	}
-	logStatusErr(ctx, "stamp VMsReady=True (reachable)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
+	r.cond(ctx, env, dfaasv1.EnvCondVMsReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonSSHReachable,
-		"provisioning SSH check passed: all declared nodes reachable on :22"))
-	return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningInfra)
+		"provisioning SSH check passed: all declared nodes reachable on :22")
+	return r.phase(ctx, env, dfaasv1.EnvProvisioningInfra)
 }
 
 // reconcileProvisioningInfra runs the dfaas-worker Ansible Job and the k6
@@ -147,35 +148,41 @@ func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	vmsDone, vmsFailed, err := r.ensureVMsJob(ctx, env, libp2pKeys)
-	if err != nil {
-		return ctrl.Result{}, err
+	// One provisioning stream per role, every role driven every tick, so the
+	// Conditions reflect a coherent picture ("dfaas OK, k6 failed") rather
+	// than aborting one stream mid-flight.
+	allTerminal, anyFailed := true, false
+	for _, rs := range roles.All() {
+		keys := libp2pKeys
+		if !rs.NeedsLibp2pKeys {
+			keys = nil
+		}
+		done, failed, err := r.ensureAnsibleJob(ctx, env, rs, keys)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		allTerminal = allTerminal && (done || failed)
+		anyFailed = anyFailed || failed
 	}
-	k6Done, k6Failed, err := r.ensureK6Job(ctx, env)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	vmsTerminal := vmsDone || vmsFailed
-	k6Terminal := k6Done || k6Failed
-	if !(vmsTerminal && k6Terminal) {
+	if !allTerminal {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
-	if vmsFailed || k6Failed {
-		logStatusErr(ctx, "stamp InfrastructureReady=False", r.setEnvCondition(ctx, env, dfaasv1.EnvCondInfrastructureReady,
+	if anyFailed {
+		r.cond(ctx, env, dfaasv1.EnvCondInfrastructureReady,
 			metav1.ConditionFalse, dfaasv1.EnvReasonInfraFailed,
-			"dfaas-worker or k6 provisioning failed; inspect DFaaSNodesReady and K6Ready conditions"))
-		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
+			"dfaas-worker or k6 provisioning failed; inspect DFaaSNodesReady and K6Ready conditions")
+		return r.phase(ctx, env, dfaasv1.EnvFailed)
 	}
 	// Both Jobs succeeded and the fan-in has settled. Now — and only now — is
 	// it safe to stamp the success TTL: neither sibling will be re-checked
 	// again from this phase, so auto-deletion can no longer trigger a recreate.
-	r.patchAnsibleJobTTL(ctx, env, "vms", jobTTLSuccessSeconds)
-	r.patchAnsibleJobTTL(ctx, env, "k6", jobTTLSuccessSeconds)
-	logStatusErr(ctx, "stamp InfrastructureReady=True", r.setEnvCondition(ctx, env, dfaasv1.EnvCondInfrastructureReady,
+	for _, rs := range roles.All() {
+		r.patchAnsibleJobTTL(ctx, env, rs.JobSuffix, jobTTLSuccessSeconds)
+	}
+	r.cond(ctx, env, dfaasv1.EnvCondInfrastructureReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonInfraReady,
-		"dfaas-worker and k6 Ansible Jobs completed"))
-	return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningMonitoring)
+		"dfaas-worker and k6 Ansible Jobs completed")
+	return r.phase(ctx, env, dfaasv1.EnvProvisioningMonitoring)
 }
 
 // reconcileProvisioningMonitoring installs Prometheus + Grafana via Helm,
@@ -195,7 +202,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Cont
 		// so the operator surfaces it loudly instead of leaving a half-usable env.
 		// Failed is terminal — no auto-retry; recovery is a spec edit or
 		// delete+recreate (see the EnvFailed case in environment_controller.go).
-		return r.setEnvPhase(ctx, env, dfaasv1.EnvFailed)
+		return r.phase(ctx, env, dfaasv1.EnvFailed)
 	}
 	if !done {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -210,7 +217,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Cont
 	// resolves nodes through status.k6Nodes), so it must not hold up Ready.
 	logStatusErr(ctx, "prune k6 kubeconfig secrets",
 		r.pruneK6Kubeconfigs(ctx, env, k6NodeIDs(env)))
-	return r.setEnvPhase(ctx, env, dfaasv1.EnvReady)
+	return r.phase(ctx, env, dfaasv1.EnvReady)
 }
 
 // ensureMonitoring drives the Helm monitoring stack install. P4: after
@@ -223,15 +230,15 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 
 	mm := &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
 	if derr := mm.Deploy(ctx); derr != nil {
-		count, bumpErr := r.bumpMonitoringAttempts(ctx, env)
+		count, bumpErr := r.writer().Bump(ctx, env, monitoringAttemptsAnnotation)
 		if bumpErr != nil {
 			logger.Error(bumpErr, "bumpMonitoringAttempts failed; continuing without budget enforcement")
 		}
 		if count >= monitoringRetryBudget {
-			logStatusErr(ctx, "stamp MonitoringReady=False (helm failed)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
+			r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 				metav1.ConditionFalse, dfaasv1.EnvReasonHelmFailed,
 				fmt.Sprintf("monitoring Helm install failed %d consecutive times: %s",
-					count, condMessage(derr))))
+					count, condMessage(derr)))
 			return false, true, nil
 		}
 		// P7 + P14: first ever observation is Unknown; subsequent retries
@@ -242,12 +249,12 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 		if count == 1 {
 			condStatus = metav1.ConditionUnknown
 		}
-		logStatusErr(ctx, "stamp MonitoringReady (helm installing)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
+		r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 			condStatus, dfaasv1.EnvReasonHelmInstalling,
-			"monitoring Helm install in progress / retrying: "+condMessage(derr)))
+			"monitoring Helm install in progress / retrying: "+condMessage(derr))
 		return false, false, nil
 	}
-	if rerr := r.resetMonitoringAttempts(ctx, env); rerr != nil {
+	if rerr := r.writer().Reset(ctx, env, monitoringAttemptsAnnotation); rerr != nil {
 		logger.Error(rerr, "resetMonitoringAttempts failed; non-fatal")
 	}
 	ready, checkErr := mm.Check(ctx)
@@ -256,52 +263,29 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 		// regression, API server down) would otherwise be indistinguishable from
 		// a slow rollout and the Environment would sit in ProvisioningMonitoring
 		// with a reassuring "pods not Ready yet" message.
-		logStatusErr(ctx, "stamp MonitoringReady=Unknown (check failed)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
+		r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 			metav1.ConditionUnknown, dfaasv1.EnvReasonCheckFailed,
-			"monitoring readiness could not be evaluated: "+condMessage(checkErr)))
+			"monitoring readiness could not be evaluated: "+condMessage(checkErr))
 		return false, false, nil
 	}
 	if !ready {
-		logStatusErr(ctx, "stamp MonitoringReady=False (waiting pods)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
+		r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 			metav1.ConditionFalse, dfaasv1.EnvReasonWaitingPods,
-			"monitoring pods not Ready yet"))
+			"monitoring pods not Ready yet")
 		return false, false, nil
 	}
 
-	logStatusErr(ctx, "stamp MonitoringReady=True", r.setEnvCondition(ctx, env, dfaasv1.EnvCondMonitoringReady,
+	r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonPodsRunning,
-		"monitoring stack up"))
+		"monitoring stack up")
 	logStatusErr(ctx, "reconcile Prometheus targets", mm.ReconcileTargets(ctx, env))
 	return true, false, nil
-}
-
-// bumpMonitoringAttempts increments the env-level retry counter for the
-// monitoring Helm install. P4 mirror of LoadTest dispatchAttempts.
-func (r *EnvironmentReconciler) bumpMonitoringAttempts(ctx context.Context,
-	env *dfaasv1.Environment) (int, error) {
-	var n int
-	err := updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
-		func(latest *dfaasv1.Environment) bool {
-			n = bumpPlainCounter(latest, monitoringAttemptsAnnotation)
-			return true
-		})
-	return n, err
-}
-
-// resetMonitoringAttempts zeroes the counter annotation on success. No-op
-// when already "0" to avoid churn.
-func (r *EnvironmentReconciler) resetMonitoringAttempts(ctx context.Context,
-	env *dfaasv1.Environment) error {
-	return updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
-		func(latest *dfaasv1.Environment) bool {
-			return resetPlainCounter(latest, monitoringAttemptsAnnotation)
-		})
 }
 
 // syncNodeStatus surfaces k6/dfaas node info into status, for fast lookup by
 // the LoadTestReconciler.
 func (r *EnvironmentReconciler) syncNodeStatus(ctx context.Context, env *dfaasv1.Environment) error {
-	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
+	return r.writer().Record(ctx, env, envTransition{Touch: func(latest *dfaasv1.Environment) error {
 		var k6 []dfaasv1.K6NodeStatus
 		var dfaas []string
 		for _, n := range latest.Spec.Nodes {
@@ -319,7 +303,7 @@ func (r *EnvironmentReconciler) syncNodeStatus(ctx context.Context, env *dfaasv1
 		latest.Status.K6Nodes = k6
 		latest.Status.DfaasNodes = dfaas
 		return nil
-	})
+	}})
 }
 
 // pruneK6Kubeconfigs deletes the per-node kubeconfig Secrets of env whose
@@ -379,16 +363,6 @@ func k6NodeIDs(env *dfaasv1.Environment) map[string]struct{} {
 	return keep
 }
 
-// atomicStatusUpdate runs mutate against the freshly-fetched Environment and
-// persists it via Status().Update. Typed adapter over statusUpdateWithRetry: it
-// re-fetches to absorb informer cache lag, retries on conflict, and returns the
-// final error so callers can decide whether to surface it. Fire-and-forget
-// callers should route the result through logStatusErr rather than discarding it.
-func (r *EnvironmentReconciler) atomicStatusUpdate(ctx context.Context,
-	key client.ObjectKey, mutate func(env *dfaasv1.Environment) error) error {
-	return statusUpdateWithRetry(ctx, r.Client, key, &dfaasv1.Environment{}, mutate)
-}
-
 // logStatusErr logs a best-effort operation failure instead of silently
 // dropping it. op is a short human-readable label for the operation that
 // failed. Used at fire-and-forget sites (condition/status stamping, Prometheus
@@ -400,33 +374,12 @@ func logStatusErr(ctx context.Context, op string, err error) {
 	}
 }
 
-// setEnvCondition sets a Condition on Environment.status using the
-// re-fetch-then-update pattern that absorbs informer cache lag.
-func (r *EnvironmentReconciler) setEnvCondition(ctx context.Context,
-	env *dfaasv1.Environment, condType string, status metav1.ConditionStatus,
-	reason, message string) error {
-
-	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
-		// Note: omit LastTransitionTime — meta.SetStatusCondition stamps it
-		// only when status/reason/message actually changes. Letting the
-		// helper set it preserves stability across no-op reconciles (P14).
-		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
-			Type:    condType,
-			Status:  status,
-			Reason:  reason,
-			Message: message,
-		})
-		return nil
-	})
-}
-
 // resetTransientConditions handles generation drift (P8): the spec was edited
 // after a settled run, so every condition is reset to Unknown — none is
-// trustworthy until the fresh provisioning pass re-stamps it. The Ready
-// aggregator plus the five per-subsystem conditions all flip to
-// Unknown/Updating so consumers stop trusting the previous values.
+// trustworthy until the fresh provisioning pass re-stamps it. One write.
 func (r *EnvironmentReconciler) resetTransientConditions(ctx context.Context,
 	env *dfaasv1.Environment) error {
+	var conds []statuswriter.Cond
 	for _, condType := range []string{
 		dfaasv1.EnvCondReady,
 		dfaasv1.EnvCondVMsReady,
@@ -435,11 +388,8 @@ func (r *EnvironmentReconciler) resetTransientConditions(ctx context.Context,
 		dfaasv1.EnvCondInfrastructureReady,
 		dfaasv1.EnvCondMonitoringReady,
 	} {
-		if err := r.setEnvCondition(ctx, env, condType,
-			metav1.ConditionUnknown, dfaasv1.EnvReasonUpdating,
-			"spec edited; re-provisioning — condition will be re-evaluated"); err != nil {
-			return err
-		}
+		conds = append(conds, statuswriter.Cond{Type: condType, Status: metav1.ConditionUnknown,
+			Reason: dfaasv1.EnvReasonUpdating, Message: "spec edited; re-provisioning — condition will be re-evaluated"})
 	}
-	return nil
+	return r.writer().Record(ctx, env, envTransition{Conditions: conds})
 }

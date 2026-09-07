@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/statuswriter"
 	"dfaas-operator/internal/k6dispatch"
 )
 
@@ -92,10 +93,10 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err := r.Get(ctx, envKey, &env); err != nil {
 		if apierrors.IsNotFound(err) {
 			// P9: surface link state on EnvironmentLinked before failing.
-			logStatusErr(ctx, "stamp EnvironmentLinked=False (not found)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
+			r.cond(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
 				metav1.ConditionFalse, dfaasv1.LTReasonEnvNotFound,
 				fmt.Sprintf("environment %q not found in namespace %s",
-					lt.Spec.TargetEnvironment, lt.Namespace)))
+					lt.Spec.TargetEnvironment, lt.Namespace))
 			return r.failLoadTest(ctx, &lt,
 				fmt.Sprintf("environment %q not found in namespace %s",
 					lt.Spec.TargetEnvironment, lt.Namespace))
@@ -108,17 +109,17 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// reason=EnvDegraded so consumers know to expect missing metrics later.
 	switch env.Status.Phase {
 	case dfaasv1.EnvFailed:
-		logStatusErr(ctx, "stamp EnvironmentLinked=False (env failed)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
+		r.cond(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
 			metav1.ConditionFalse, dfaasv1.LTReasonEnvFailed,
-			fmt.Sprintf("environment %q is in phase Failed", env.Name)))
+			fmt.Sprintf("environment %q is in phase Failed", env.Name))
 	case dfaasv1.EnvDegraded:
-		logStatusErr(ctx, "stamp EnvironmentLinked=True (env degraded)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
+		r.cond(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
 			metav1.ConditionTrue, dfaasv1.LTReasonEnvDegraded,
-			fmt.Sprintf("environment %q is Degraded — monitoring unavailable, exporter step may fail", env.Name)))
+			fmt.Sprintf("environment %q is Degraded — monitoring unavailable, exporter step may fail", env.Name))
 	default:
-		logStatusErr(ctx, "stamp EnvironmentLinked=True (env found)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
+		r.cond(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
 			metav1.ConditionTrue, dfaasv1.LTReasonEnvFound,
-			fmt.Sprintf("environment %q resolved", env.Name)))
+			fmt.Sprintf("environment %q resolved", env.Name))
 	}
 
 	// Abort short-circuit. User PATCHed spec.stop=true.
@@ -141,19 +142,19 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		switch {
 		case time.Now().Before(fireT):
 			// Armed: future startAt.
-			logStatusErr(ctx, "stamp Scheduled=True (armed)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondScheduled,
+			r.cond(ctx, &lt, dfaasv1.LTCondScheduled,
 				metav1.ConditionTrue, dfaasv1.LTReasonScheduledArmed,
-				"armed for "+fireT.UTC().Format(time.RFC3339)))
+				"armed for "+fireT.UTC().Format(time.RFC3339))
 			return ctrl.Result{RequeueAfter: time.Until(fireT)}, nil
 
 		case env.Status.Phase != dfaasv1.EnvReady && env.Status.Phase != dfaasv1.EnvDegraded:
 			// Fire time elapsed but the target Environment is not ready
 			// (Degraded is treated as good-enough to dispatch — only
 			// Failed / still-Provisioning hold the schedule).
-			logStatusErr(ctx, "stamp Scheduled=True (delayed, env not ready)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondScheduled,
+			r.cond(ctx, &lt, dfaasv1.LTCondScheduled,
 				metav1.ConditionTrue, dfaasv1.LTReasonScheduledDelayedEnvNot,
 				fmt.Sprintf("schedule fired at %s; waiting for env %s phase=%s",
-					fireT.UTC().Format(time.RFC3339), env.Name, env.Status.Phase)))
+					fireT.UTC().Format(time.RFC3339), env.Name, env.Status.Phase))
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 
 		default:
@@ -165,9 +166,9 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			if patchErr != nil {
 				return ctrl.Result{}, patchErr
 			}
-			logStatusErr(ctx, "stamp Scheduled=True (fired)", r.setLoadTestCondition(ctx, &lt, dfaasv1.LTCondScheduled,
+			r.cond(ctx, &lt, dfaasv1.LTCondScheduled,
 				metav1.ConditionTrue, dfaasv1.LTReasonScheduledFired,
-				"schedule fired at "+fireT.UTC().Format(time.RFC3339)))
+				"schedule fired at "+fireT.UTC().Format(time.RFC3339))
 			return ctrl.Result{Requeue: true}, nil
 		}
 	}
@@ -197,7 +198,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			// Save-as-Draft: hold at Pending, dispatch nothing. PATCH
 			// spec.suspended=false to start.
 			if lt.Status.Phase == "" {
-				return r.setLoadTestPhase(ctx, &lt, dfaasv1.LoadTestPending)
+				return r.phase(ctx, &lt, dfaasv1.LoadTestPending, "", "")
 			}
 			return ctrl.Result{}, nil
 		}
@@ -205,7 +206,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		// Block while Environment is mid-flight.
 		if env.Status.Phase != dfaasv1.EnvReady && env.Status.Phase != dfaasv1.EnvDegraded {
 			logger.Info("waiting for environment", "env", env.Name, "phase", env.Status.Phase)
-			return r.setLoadTestPhase(ctx, &lt, dfaasv1.LoadTestPending)
+			return r.phase(ctx, &lt, dfaasv1.LoadTestPending, "", "")
 		}
 	}
 
@@ -235,33 +236,6 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.runExporter(ctx, &lt, &env)
 	}
 	return ctrl.Result{}, nil
-}
-
-// setLoadTestPhase patches status.phase, retrying on conflict. Also stamps
-// the LTCondReady aggregator (P9) with the generic per-phase text.
-func (r *LoadTestReconciler) setLoadTestPhase(ctx context.Context,
-	lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase) (ctrl.Result, error) {
-	return r.setLoadTestPhaseDetail(ctx, lt, phase, "", "")
-}
-
-// setLoadTestPhaseDetail is setLoadTestPhase with an explicit reason/message
-// for the Ready aggregator. Callers that already computed a specific
-// diagnostic ("all 3 remote TestRuns reported error stage") must go through
-// here: meta.SetStatusCondition overwrites Reason and Message wholesale, so a
-// condition stamped before the phase transition is otherwise replaced by the
-// generic text one instant later. The UI renders both verbatim.
-func (r *LoadTestReconciler) setLoadTestPhaseDetail(ctx context.Context,
-	lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase, reason, message string) (ctrl.Result, error) {
-
-	err := r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
-		latest.Status.Phase = phase
-		stampLTAggregate(latest, phase, reason, message)
-		return nil
-	})
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	return ctrl.Result{Requeue: true}, nil
 }
 
 // stampLTAggregate writes the LTCondReady aggregator (P9) onto the in-memory
@@ -321,36 +295,51 @@ func stampLTAggregate(lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase, reasonO
 func (r *LoadTestReconciler) failLoadTest(ctx context.Context,
 	lt *dfaasv1.LoadTest, message string) (ctrl.Result, error) {
 
-	return r.setLoadTestPhaseDetail(ctx, lt, dfaasv1.LoadTestFailed,
+	return r.phase(ctx, lt, dfaasv1.LoadTestFailed,
 		dfaasv1.LTReasonFailed, message)
 }
 
-// atomicStatusUpdate runs mutate against the freshly-fetched LoadTest and
-// persists it via Status().Update. Typed adapter over statusUpdateWithRetry:
-// re-fetches to absorb informer cache lag, retries on conflict, and returns the
-// final error so callers can decide whether to surface it. Fire-and-forget
-// callers should route the result through logStatusErr rather than discarding it.
-func (r *LoadTestReconciler) atomicStatusUpdate(ctx context.Context,
-	key types.NamespacedName, mutate func(lt *dfaasv1.LoadTest) error) error {
-	return statusUpdateWithRetry(ctx, r.Client, key, &dfaasv1.LoadTest{}, mutate)
+// writer is the one way this reconciler persists LoadTest status. Stateless;
+// built per call from the client.
+func (r *LoadTestReconciler) writer() statuswriter.Writer[*dfaasv1.LoadTest, dfaasv1.LoadTestPhase] {
+	return statuswriter.Writer[*dfaasv1.LoadTest, dfaasv1.LoadTestPhase]{
+		Client:     r.Client,
+		New:        func() *dfaasv1.LoadTest { return &dfaasv1.LoadTest{} },
+		SetPhase:   func(lt *dfaasv1.LoadTest, p dfaasv1.LoadTestPhase) { lt.Status.Phase = p },
+		Aggregate:  stampLTAggregate,
+		Conditions: func(lt *dfaasv1.LoadTest) *[]metav1.Condition { return &lt.Status.Conditions },
+	}
 }
 
-// setLoadTestCondition sets a Condition on status using the re-fetch-then-update pattern.
-// Omits LastTransitionTime so meta.SetStatusCondition keeps it stable across
-// reconciles that produce the same (status, reason, message) tuple (P14).
-func (r *LoadTestReconciler) setLoadTestCondition(ctx context.Context,
-	lt *dfaasv1.LoadTest, condType string, status metav1.ConditionStatus,
-	reason, message string) error {
-
-	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
-		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
-			Type:    condType,
-			Status:  status,
-			Reason:  reason,
-			Message: message,
-		})
-		return nil
+// cond stamps one Condition, best-effort: a failed stamp is logged, never
+// fatal to the reconcile. Hot-path state changes go through phase or Record.
+func (r *LoadTestReconciler) cond(ctx context.Context, lt *dfaasv1.LoadTest,
+	condType string, status metav1.ConditionStatus, reason, message string) {
+	r.writer().RecordBestEffort(ctx, lt, ltTransition{
+		Conditions: []statuswriter.Cond{{Type: condType, Status: status, Reason: reason, Message: message}},
 	})
+}
+
+// condErr is cond for the few sites where a failed stamp must surface to the
+// caller (the occupancy gate: a queued test whose Queued condition did not
+// land would look un-queued to the UI).
+func (r *LoadTestReconciler) condErr(ctx context.Context, lt *dfaasv1.LoadTest,
+	condType string, status metav1.ConditionStatus, reason, message string) error {
+	return r.writer().Record(ctx, lt, ltTransition{
+		Conditions: []statuswriter.Cond{{Type: condType, Status: status, Reason: reason, Message: message}},
+	})
+}
+
+// phase moves the LoadTest to p and requeues immediately so the next phase
+// handler runs without waiting for the watch. reason/message override the
+// Ready aggregator's generic text (empty = generic). This is the reconciler's
+// scheduling policy, stated once here; the writer itself never decides requeue.
+func (r *LoadTestReconciler) phase(ctx context.Context, lt *dfaasv1.LoadTest,
+	p dfaasv1.LoadTestPhase, reason, message string) (ctrl.Result, error) {
+	if err := r.writer().Record(ctx, lt, ltTransition{Phase: &p, Reason: reason, Message: message}); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{Requeue: true}, nil
 }
 
 // hasOwnerRef reports whether lt already lists env among its OwnerReferences.
@@ -402,12 +391,12 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 
 	// hold keeps this test at Pending (re-queued) with a Queued condition.
 	hold := func(reason, message string) (bool, ctrl.Result, error) {
-		if cerr := r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondQueued,
+		if cerr := r.condErr(ctx, lt, dfaasv1.LTCondQueued,
 			metav1.ConditionTrue, reason, message); cerr != nil {
 			return false, ctrl.Result{}, cerr
 		}
 		if lt.Status.Phase != dfaasv1.LoadTestPending {
-			if _, perr := r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestPending); perr != nil {
+			if _, perr := r.phase(ctx, lt, dfaasv1.LoadTestPending, "", ""); perr != nil {
 				return false, ctrl.Result{}, perr
 			}
 		}
@@ -422,7 +411,7 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 	// these runs AND let a second TestRun set dispatch concurrently on the same
 	// Environment (the single-active-test invariant this gate exists to hold).
 	if len(lt.Status.TestRuns) > 0 {
-		if cerr := r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondQueued,
+		if cerr := r.condErr(ctx, lt, dfaasv1.LTCondQueued,
 			metav1.ConditionFalse, dfaasv1.LTReasonDispatching,
 			"resuming in-flight dispatch — environment held by this test"); cerr != nil {
 			return false, ctrl.Result{}, cerr
@@ -480,7 +469,7 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 
 	// 3. Env free and this test is the front — clear the Queued gate and let
 	// the phase machine dispatch.
-	if cerr := r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondQueued,
+	if cerr := r.condErr(ctx, lt, dfaasv1.LTCondQueued,
 		metav1.ConditionFalse, dfaasv1.LTReasonDispatching,
 		"environment free and test at front of queue — dispatching"); cerr != nil {
 		return false, ctrl.Result{}, cerr

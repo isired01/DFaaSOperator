@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/statuswriter"
 )
 
 // 192.0.2.1 is TEST-NET-1 (RFC 5737) — guaranteed unroutable, so probeSSH
@@ -119,7 +120,7 @@ var _ = Describe("ProvisioningVMs SSH retry budget", func() {
 
 		reset := &dfaasv1.Environment{}
 		Expect(k8sClient.Get(ctx, key, reset)).To(Succeed())
-		gen, count := parseGenCounter(reset.Annotations[sshAttemptsAnnotation])
+		gen, count := statuswriter.ParseCounter(reset.Annotations[sshAttemptsAnnotation])
 		Expect(gen).To(Equal(reset.Generation))
 		Expect(count).To(Equal(1))
 	})

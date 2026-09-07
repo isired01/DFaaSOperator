@@ -20,22 +20,18 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/roles"
 )
 
-// EnsurePlaybookConfigMap creates/updates the per-role ConfigMap holding the
+// ensurePlaybookConfigMap creates/updates the per-role ConfigMap holding the
 // embedded Ansible playbook. The ConfigMap name encodes both env and role so
 // the dfaas-worker and k6-load-generator phases never collide.
-func (m *Manager) EnsurePlaybookConfigMap(ctx context.Context, env *dfaasv1.Environment, role dfaasv1.NodeRole) error {
-	cmName := playbookConfigMapName(env, role)
+func (m *Manager) ensurePlaybookConfigMap(ctx context.Context, env *dfaasv1.Environment, spec roles.Spec) error {
+	cmName := playbookConfigMapName(env, spec)
 
 	data := map[string]string{
 		"requirements.yml": galaxyRequirements,
-	}
-	switch role {
-	case dfaasv1.RoleK6LoadGenerator:
-		data["setup-k6-nodes.yml"] = k6Playbook
-	default:
-		data["setup-nodes.yml"] = ansiblePlaybook
+		spec.Playbook:      playbooks[spec.Playbook],
 	}
 
 	cm := &corev1.ConfigMap{
@@ -58,11 +54,11 @@ func (m *Manager) EnsurePlaybookConfigMap(ctx context.Context, env *dfaasv1.Envi
 	return m.Update(ctx, found)
 }
 
-// EnsureHelmValues creates/updates the ConfigMap holding Helm-values templates
+// ensureHelmValues creates/updates the ConfigMap holding Helm-values templates
 // consumed by the dfaas-worker playbook (HAProxy, OpenFaaS, per-VM
 // Prometheus). The same ConfigMap is mounted by both phase Jobs even though
 // the k6 playbook ignores it.
-func (m *Manager) EnsureHelmValues(ctx context.Context, env *dfaasv1.Environment) error {
+func (m *Manager) ensureHelmValues(ctx context.Context, env *dfaasv1.Environment) error {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "helm-values-config-" + env.Name,

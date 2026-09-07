@@ -26,6 +26,7 @@ import (
 
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/controller/ansible"
+	"dfaas-operator/internal/controller/roles"
 )
 
 // jobTTLSuccessSeconds is the TTLSecondsAfterFinished applied to a successful
@@ -59,58 +60,10 @@ func (r *EnvironmentReconciler) patchAnsibleJobTTL(ctx context.Context,
 	patchJobTTL(ctx, r.Client, &job, ttlSec)
 }
 
-// ansibleJobSpec bundles the role-specific knobs shared by ensureVMsJob and
-// ensureK6Job so the common ensureAnsibleJob body can stamp the right
-// Condition type, reasons and messages for each provisioning stream.
-type ansibleJobSpec struct {
-	role          dfaasv1.NodeRole // node role this Job targets
-	jobSuffix     string           // suffix passed to ansible.JobNameForRole
-	condType      string           // Condition type stamped on env.status
-	skipReason    string           // reason when the role has no nodes
-	skipMessage   string           // message when the role has no nodes
-	succeedReason string           // reason on Job success
-	humanRole     string           // human-readable role name for log/messages
-	libp2pKeys    map[string]string
-}
-
-// ensureVMsJob is the non-advancing variant for the dfaas-worker Ansible
-// Job, used by ProvisioningInfra fan-in. Returns done/failed flags and
-// stamps the DFaaSNodesReady Condition; never calls setEnvPhase.
-func (r *EnvironmentReconciler) ensureVMsJob(ctx context.Context,
-	env *dfaasv1.Environment, libp2pKeys map[string]string) (done bool, failed bool, err error) {
-	return r.ensureAnsibleJob(ctx, env, ansibleJobSpec{
-		role:          dfaasv1.RoleDfaasWorker,
-		jobSuffix:     "vms",
-		condType:      dfaasv1.EnvCondDFaaSNodesReady,
-		skipReason:    dfaasv1.EnvReasonNoWorkers,
-		skipMessage:   "no dfaas-worker nodes in spec — phase skipped",
-		succeedReason: dfaasv1.EnvReasonVMsProvisioned,
-		humanRole:     "dfaas-worker",
-		libp2pKeys:    libp2pKeys,
-	})
-}
-
-// ensureK6Job is the non-advancing variant used by the parallel
-// ProvisioningInfra fan-in. Returns done/failed flags and stamps the K6Ready
-// Condition; never calls setEnvPhase.
-func (r *EnvironmentReconciler) ensureK6Job(ctx context.Context,
-	env *dfaasv1.Environment) (done bool, failed bool, err error) {
-	return r.ensureAnsibleJob(ctx, env, ansibleJobSpec{
-		role:          dfaasv1.RoleK6LoadGenerator,
-		jobSuffix:     "k6",
-		condType:      dfaasv1.EnvCondK6Ready,
-		skipReason:    dfaasv1.EnvReasonNoK6Nodes,
-		skipMessage:   "no k6-load-generator nodes in spec — phase skipped",
-		succeedReason: dfaasv1.EnvReasonK6Provisioned,
-		humanRole:     "k6",
-		libp2pKeys:    nil,
-	})
-}
-
 // ensureAnsibleJob drives one provisioning stream of the parallel
 // ProvisioningInfra fan-in: it creates the role-filtered Ansible Job on first
 // sight, then reports its terminal state via done/failed flags while stamping
-// the per-stream Condition described by spec. It never calls setEnvPhase, so
+// the per-stream Condition described by spec. It never changes the phase, so
 // the caller owns the FSM transition once both streams settle.
 //
 // NB: the success TTL is NOT set here. While the sibling Job may still be
@@ -119,17 +72,17 @@ func (r *EnvironmentReconciler) ensureK6Job(ctx context.Context,
 // hit NotFound and recreate it, re-running the playbook. The success TTL is
 // applied once, after the fan-in settles, in reconcileProvisioningInfra.
 func (r *EnvironmentReconciler) ensureAnsibleJob(ctx context.Context,
-	env *dfaasv1.Environment, spec ansibleJobSpec) (done bool, failed bool, err error) {
+	env *dfaasv1.Environment, spec roles.Spec, libp2pKeys map[string]string) (done bool, failed bool, err error) {
 	logger := log.FromContext(ctx)
 
-	if !env.HasNodeWithRole(spec.role) {
-		logger.Info("no nodes for role, skipping Ansible phase", "role", spec.humanRole)
-		logStatusErr(ctx, "stamp "+spec.condType+"=True (skipped)", r.setEnvCondition(ctx, env, spec.condType,
-			metav1.ConditionTrue, spec.skipReason, spec.skipMessage))
+	if !env.HasNodeWithRole(spec.Role) {
+		logger.Info("no nodes for role, skipping Ansible phase", "role", spec.Human)
+		r.cond(ctx, env, spec.CondType,
+			metav1.ConditionTrue, spec.SkipReason, spec.SkipMessage)
 		return true, false, nil
 	}
 
-	jobName := ansible.JobNameForRole(env, spec.jobSuffix)
+	jobName := ansible.JobNameForRole(env, spec.JobSuffix)
 	var job batchv1.Job
 	getErr := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: env.Namespace}, &job)
 
@@ -137,37 +90,37 @@ func (r *EnvironmentReconciler) ensureAnsibleJob(ctx context.Context,
 		// P7: before kicking off the Job, the observed state is "we haven't
 		// checked yet" — stamp Unknown/JobPending. Replaced by False/
 		// AnsibleRunning once the Job exists.
-		logStatusErr(ctx, "stamp "+spec.condType+"=Unknown (job pending)", r.setEnvCondition(ctx, env, spec.condType,
+		r.cond(ctx, env, spec.CondType,
 			metav1.ConditionUnknown, dfaasv1.EnvReasonJobPending,
-			spec.humanRole+" Ansible Job not yet created"))
+			spec.Human+" Ansible Job not yet created")
 
-		logger.Info("creating Ansible Job", "role", spec.humanRole, "job", jobName)
+		logger.Info("creating Ansible Job", "role", spec.Human, "job", jobName)
 		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
-		newJob, secret, jerr := am.CreateJobForRole(ctx, env, spec.role, spec.jobSuffix, spec.libp2pKeys)
+		newJob, secret, jerr := am.CreateJobForRole(ctx, env, spec.Role, libp2pKeys)
 		if jerr != nil {
 			// P2: surface CreateJobForRole failure.
-			logStatusErr(ctx, "stamp "+spec.condType+"=False (build failed)", r.setEnvCondition(ctx, env, spec.condType,
+			r.cond(ctx, env, spec.CondType,
 				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
-				"build "+spec.humanRole+" Ansible Job: "+condMessage(jerr)))
+				"build "+spec.Human+" Ansible Job: "+condMessage(jerr))
 			return false, false, jerr
 		}
 		if cerr := r.Create(ctx, secret); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
 			// P2.
-			logStatusErr(ctx, "stamp "+spec.condType+"=False (secret create failed)", r.setEnvCondition(ctx, env, spec.condType,
+			r.cond(ctx, env, spec.CondType,
 				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
-				"create "+spec.humanRole+" inventory Secret: "+condMessage(cerr)))
+				"create "+spec.Human+" inventory Secret: "+condMessage(cerr))
 			return false, false, cerr
 		}
 		if cerr := r.Create(ctx, newJob); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
 			// P2.
-			logStatusErr(ctx, "stamp "+spec.condType+"=False (job create failed)", r.setEnvCondition(ctx, env, spec.condType,
+			r.cond(ctx, env, spec.CondType,
 				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
-				"create "+spec.humanRole+" Ansible Job: "+condMessage(cerr)))
+				"create "+spec.Human+" Ansible Job: "+condMessage(cerr))
 			return false, false, cerr
 		}
-		logStatusErr(ctx, "stamp "+spec.condType+"=False (job started)", r.setEnvCondition(ctx, env, spec.condType,
+		r.cond(ctx, env, spec.CondType,
 			metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleRunning,
-			spec.humanRole+" Ansible Job started"))
+			spec.Human+" Ansible Job started")
 		return false, false, nil
 	}
 	if getErr != nil {
@@ -182,38 +135,38 @@ func (r *EnvironmentReconciler) ensureAnsibleJob(ctx context.Context,
 	failedCount := job.Status.Failed
 
 	if job.Status.Succeeded > 0 || jobConditionTrue(&job, batchv1.JobComplete) {
-		msg := spec.humanRole + " Ansible Job completed"
+		msg := spec.Human + " Ansible Job completed"
 		if failedCount > 0 {
 			msg = fmt.Sprintf("%s after %d failed attempt(s)%s", msg, failedCount,
 				taskSuffix(r.lastFailedTask(ctx, env.Namespace, jobName), " at task: "))
 		}
-		logStatusErr(ctx, "stamp "+spec.condType+"=True (completed)", r.setEnvCondition(ctx, env, spec.condType,
-			metav1.ConditionTrue, spec.succeedReason, msg))
+		r.cond(ctx, env, spec.CondType,
+			metav1.ConditionTrue, spec.DoneReason, msg)
 		return true, false, nil
 	}
 	if jobConditionTrue(&job, batchv1.JobFailed) {
 		patchJobTTL(ctx, r.Client, &job, jobTTLFailureGraceSeconds)
 		msg := fmt.Sprintf("%s Ansible Job failed after %d attempt(s)%s; check logs",
-			spec.humanRole, failedCount, taskSuffix(r.lastFailedTask(ctx, env.Namespace, jobName), " at task: "))
-		logStatusErr(ctx, "stamp "+spec.condType+"=False (job failed)", r.setEnvCondition(ctx, env, spec.condType,
-			metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleFailed, msg))
+			spec.Human, failedCount, taskSuffix(r.lastFailedTask(ctx, env.Namespace, jobName), " at task: "))
+		r.cond(ctx, env, spec.CondType,
+			metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleFailed, msg)
 		return false, true, nil
 	}
 	// Still running. A failed pod here is mid-backoff, not terminal — keep
 	// waiting, but report the transient retry so the UI shows the hiccup.
 	logger.Info("Ansible Job still running",
-		"role", spec.humanRole,
+		"role", spec.Human,
 		"job", jobName,
 		"active", job.Status.Active,
 		"succeeded", job.Status.Succeeded,
 		"failed", failedCount)
-	msg := spec.humanRole + " Ansible Job in progress"
+	msg := spec.Human + " Ansible Job in progress"
 	if failedCount > 0 {
 		msg = fmt.Sprintf("%s (%d failed attempt(s), retrying%s)", msg, failedCount,
 			taskSuffix(r.lastFailedTask(ctx, env.Namespace, jobName), "; last task: "))
 	}
-	logStatusErr(ctx, "stamp "+spec.condType+"=False (in progress)", r.setEnvCondition(ctx, env, spec.condType,
-		metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleRunning, msg))
+	r.cond(ctx, env, spec.CondType,
+		metav1.ConditionFalse, dfaasv1.EnvReasonAnsibleRunning, msg)
 	return false, false, nil
 }
 

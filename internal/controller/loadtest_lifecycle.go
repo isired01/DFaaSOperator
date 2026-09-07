@@ -20,7 +20,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -41,31 +40,6 @@ const dispatchAttemptsAnnotation = "dfaas.dfaas.io/dispatch-attempts"
 // unreachable k6 node to come back before the LoadTest is failed.
 const dispatchRetryBudget = 15
 
-// bumpDispatchAttempts increments the counter annotation by one with conflict
-// retry, returning the new value. The Update is on the object (not status),
-// since annotations live in ObjectMeta.
-func (r *LoadTestReconciler) bumpDispatchAttempts(ctx context.Context,
-	lt *dfaasv1.LoadTest) (int, error) {
-	var n int
-	err := updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(lt), &dfaasv1.LoadTest{},
-		func(latest *dfaasv1.LoadTest) bool {
-			n = bumpPlainCounter(latest, dispatchAttemptsAnnotation)
-			return true
-		})
-	return n, err
-}
-
-// resetDispatchAttempts zeroes the counter annotation. Safe to call when the
-// annotation is absent — it will be created. No-op (cheap Get) if the value
-// is already "0", to avoid pointless Updates on every successful dispatch.
-func (r *LoadTestReconciler) resetDispatchAttempts(ctx context.Context,
-	lt *dfaasv1.LoadTest) error {
-	return updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(lt), &dfaasv1.LoadTest{},
-		func(latest *dfaasv1.LoadTest) bool {
-			return resetPlainCounter(latest, dispatchAttemptsAnnotation)
-		})
-}
-
 // onDispatchError centralises the retry-budget bookkeeping on a dispatcher
 // error path. Bumps the counter; if it tips the budget, transitions the
 // LoadTest to Failed and stamps K6Dispatched=False/DispatchFailed. Otherwise
@@ -75,7 +49,7 @@ func (r *LoadTestReconciler) resetDispatchAttempts(ctx context.Context,
 func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 	lt *dfaasv1.LoadTest, dispatchErr error, subReason string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	count, bumpErr := r.bumpDispatchAttempts(ctx, lt)
+	count, bumpErr := r.writer().Bump(ctx, lt, dispatchAttemptsAnnotation)
 	if bumpErr != nil {
 		logger.Error(bumpErr, "bumpDispatchAttempts failed; continuing without budget enforcement")
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -83,18 +57,18 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 	if count >= dispatchRetryBudget {
 		detail := fmt.Sprintf("remote dispatch failed %d consecutive times: %s",
 			count, condMessage(dispatchErr))
-		logStatusErr(ctx, "stamp K6Dispatched=False (dispatch failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
-			metav1.ConditionFalse, dfaasv1.LTReasonDispatchFailed, detail))
-		res, err := r.setLoadTestPhaseDetail(ctx, lt, dfaasv1.LoadTestFailed,
+		r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched,
+			metav1.ConditionFalse, dfaasv1.LTReasonDispatchFailed, detail)
+		res, err := r.phase(ctx, lt, dfaasv1.LoadTestFailed,
 			dfaasv1.LTReasonDispatchFailed, detail)
 		return res, err
 	}
 	// P13: sub-reason (ScriptMirrorFailed / StaleCleanupFailed / ApplyFailed)
 	// carries the diagnostic detail, retry-budget counter is in the message.
-	logStatusErr(ctx, "stamp K6Dispatched=False (retrying)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+	r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched,
 		metav1.ConditionFalse, subReason,
 		fmt.Sprintf("attempt %d/%d: %s",
-			count, dispatchRetryBudget, condMessage(dispatchErr))))
+			count, dispatchRetryBudget, condMessage(dispatchErr)))
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
@@ -114,9 +88,9 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 	// Subsequent calls below upgrade this to False/InFlight or True/
 	// AllDispatched. SetStatusCondition is idempotent on no transition.
 	if len(lt.Status.TestRuns) == 0 {
-		logStatusErr(ctx, "stamp K6Dispatched=Unknown (pending)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+		r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched,
 			metav1.ConditionUnknown, dfaasv1.LTReasonPending,
-			"awaiting first remote TestRun apply"))
+			"awaiting first remote TestRun apply")
 	}
 
 	// Seed from Status.TestRuns so a re-entry after a partial-dispatch error
@@ -154,20 +128,20 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 		}
 		// Successful dispatcher round-trip — reset the budget counter and
 		// surface partial progress on K6Dispatched (P9).
-		if rerr := r.resetDispatchAttempts(ctx, lt); rerr != nil {
+		if rerr := r.writer().Reset(ctx, lt, dispatchAttemptsAnnotation); rerr != nil {
 			log.FromContext(ctx).Error(rerr, "resetDispatchAttempts failed; non-fatal")
 		}
 		if len(refs) < len(lt.Spec.PerNodeLoad) {
-			logStatusErr(ctx, "stamp K6Dispatched=False (in flight)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+			r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched,
 				metav1.ConditionFalse, dfaasv1.LTReasonInFlight,
-				fmt.Sprintf("%d/%d TestRun(s) dispatched", len(refs), len(lt.Spec.PerNodeLoad))))
+				fmt.Sprintf("%d/%d TestRun(s) dispatched", len(refs), len(lt.Spec.PerNodeLoad)))
 		}
 	}
 
 	// All TestRuns dispatched.
-	logStatusErr(ctx, "stamp K6Dispatched=True (all dispatched)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Dispatched,
+	r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched,
 		metav1.ConditionTrue, dfaasv1.LTReasonAllDispatched,
-		fmt.Sprintf("dispatched %d remote TestRun(s)", len(refs))))
+		fmt.Sprintf("dispatched %d remote TestRun(s)", len(refs)))
 
 	// Synchronized start: hold Running until every runner is parked on the
 	// script barrier, then publish the GO signal (loadtest_sync.go).
@@ -184,17 +158,17 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 // start and the exporter's PROM window stays faithful.
 func (r *LoadTestReconciler) finishDispatch(ctx context.Context,
 	lt *dfaasv1.LoadTest, refs []dfaasv1.TestRunRef) (ctrl.Result, error) {
-	logStatusErr(ctx, "stamp K6Healthy=Unknown (awaiting observation)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+	r.cond(ctx, lt, dfaasv1.LTCondK6Healthy,
 		metav1.ConditionUnknown, dfaasv1.LTReasonRunning,
-		"k6 TestRuns dispatched, awaiting observation"))
+		"k6 TestRuns dispatched, awaiting observation")
 	now := metav1.Now()
-	if err := r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
+	if err := r.writer().Record(ctx, lt, ltTransition{Touch: func(latest *dfaasv1.LoadTest) error {
 		latest.Status.StartTime = &now
 		latest.Status.TestRuns = refs
 		latest.Status.Phase = dfaasv1.LoadTestRunning
 		stampLTAggregate(latest, dfaasv1.LoadTestRunning, "", "")
 		return nil
-	}); err != nil {
+	}}); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -275,10 +249,10 @@ func (r *LoadTestReconciler) runnerEnv(lt *dfaasv1.LoadTest, nodeID string) k6di
 // already-dispatched runs visible to observeK6 / abort / deletion paths.
 func (r *LoadTestReconciler) persistTestRuns(ctx context.Context,
 	lt *dfaasv1.LoadTest, refs []dfaasv1.TestRunRef) error {
-	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
+	return r.writer().Record(ctx, lt, ltTransition{Touch: func(latest *dfaasv1.LoadTest) error {
 		latest.Status.TestRuns = refs
 		return nil
-	})
+	}})
 }
 
 // ensureMirroredS3Secret copies the S3 config Secret from S3ConfigNamespace

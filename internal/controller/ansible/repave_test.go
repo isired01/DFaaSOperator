@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/roles"
 )
 
 func repaveScheme(t *testing.T) *runtime.Scheme {
@@ -48,7 +49,8 @@ func TestBuildInventoryK6EmitsEnvUID(t *testing.T) {
 		Username: "ubuntu", Password: "pw",
 	}}
 
-	inv, err := buildInventory(env, dfaasv1.RoleK6LoadGenerator, nodes, nil)
+	k6, _ := roles.For(dfaasv1.RoleK6LoadGenerator)
+	inv, err := buildInventory(env, k6, nodes, nil)
 	if err != nil {
 		t.Fatalf("buildInventory: %v", err)
 	}

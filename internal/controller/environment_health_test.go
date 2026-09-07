@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/statuswriter"
 )
 
 var _ = Describe("Ready-state SSH health check", func() {
@@ -99,7 +100,7 @@ var _ = Describe("Ready-state SSH health check", func() {
 
 		afterFirst := &dfaasv1.Environment{}
 		Expect(k8sClient.Get(ctx, key, afterFirst)).To(Succeed())
-		_, count := parseGenCounter(afterFirst.Annotations[healthMissesAnnotation])
+		_, count := statuswriter.ParseCounter(afterFirst.Annotations[healthMissesAnnotation])
 		Expect(count).To(Equal(1))
 
 		// Re-run with the refetched env (recent lastHealthCheck + NodesReachable
@@ -111,7 +112,7 @@ var _ = Describe("Ready-state SSH health check", func() {
 
 		afterSecond := &dfaasv1.Environment{}
 		Expect(k8sClient.Get(ctx, key, afterSecond)).To(Succeed())
-		_, count2 := parseGenCounter(afterSecond.Annotations[healthMissesAnnotation])
+		_, count2 := statuswriter.ParseCounter(afterSecond.Annotations[healthMissesAnnotation])
 		Expect(count2).To(Equal(1))
 	})
 

@@ -66,7 +66,7 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 			return res, oerr
 		}
 		// Successful dispatcher round-trip — reset the budget counter.
-		if rerr := r.resetDispatchAttempts(ctx, lt); rerr != nil {
+		if rerr := r.writer().Reset(ctx, lt, dispatchAttemptsAnnotation); rerr != nil {
 			logger.Error(rerr, "resetDispatchAttempts failed; non-fatal")
 		}
 		updatedRefs[i].Phase = stage
@@ -82,39 +82,39 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 	}
 
 	// Persist updated phases (best-effort).
-	logStatusErr(ctx, "persist updated TestRun phases", r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
+	logStatusErr(ctx, "persist updated TestRun phases", r.writer().Record(ctx, lt, ltTransition{Touch: func(latest *dfaasv1.LoadTest) error {
 		latest.Status.TestRuns = updatedRefs
 		return nil
-	}))
+	}}))
 
 	total := len(lt.Status.TestRuns)
 	runningCount := total - finishedCount - errorCount
 
 	// P9: K6Healthy rollup with a per-node count in the message.
 	if !allDone {
-		logStatusErr(ctx, "stamp K6Healthy=Unknown (running)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+		r.cond(ctx, lt, dfaasv1.LTCondK6Healthy,
 			metav1.ConditionUnknown, dfaasv1.LTReasonRunning,
 			fmt.Sprintf("%d/%d finished, %d error, %d running",
-				finishedCount, total, errorCount, runningCount)))
+				finishedCount, total, errorCount, runningCount))
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	switch {
 	case errorCount == 0:
-		logStatusErr(ctx, "stamp K6Healthy=True (all finished)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+		r.cond(ctx, lt, dfaasv1.LTCondK6Healthy,
 			metav1.ConditionTrue, dfaasv1.LTReasonAllFinished,
-			fmt.Sprintf("%d/%d TestRun(s) finished cleanly", finishedCount, total)))
+			fmt.Sprintf("%d/%d TestRun(s) finished cleanly", finishedCount, total))
 	case finishedCount == 0:
-		logStatusErr(ctx, "stamp K6Healthy=False (all failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+		r.cond(ctx, lt, dfaasv1.LTCondK6Healthy,
 			metav1.ConditionFalse, dfaasv1.LTReasonAllFailed,
-			fmt.Sprintf("%d/%d TestRun(s) reported error", errorCount, total)))
+			fmt.Sprintf("%d/%d TestRun(s) reported error", errorCount, total))
 		return r.failLoadTest(ctx, lt,
 			fmt.Sprintf("all %d remote TestRuns reported error stage", errorCount))
 	default:
-		logStatusErr(ctx, "stamp K6Healthy=False (partial failure)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+		r.cond(ctx, lt, dfaasv1.LTCondK6Healthy,
 			metav1.ConditionFalse, dfaasv1.LTReasonPartialFailure,
 			fmt.Sprintf("%d finished, %d error (of %d)",
-				finishedCount, errorCount, total)))
+				finishedCount, errorCount, total))
 		return r.failLoadTest(ctx, lt,
 			fmt.Sprintf("%d of %d remote TestRuns reported error stage", errorCount, total))
 	}
@@ -132,12 +132,12 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 
 	// All TestRuns done cleanly → stamp EndTime and move to Exporting.
 	now := metav1.Now()
-	if err := r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
+	if err := r.writer().Record(ctx, lt, ltTransition{Touch: func(latest *dfaasv1.LoadTest) error {
 		latest.Status.EndTime = &now
 		latest.Status.Phase = dfaasv1.LoadTestExporting
 		stampLTAggregate(latest, dfaasv1.LoadTestExporting, "", "")
 		return nil
-	}); err != nil {
+	}}); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{Requeue: true}, nil
@@ -210,9 +210,9 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 
 	if apierrors.IsNotFound(err) {
 		if lt.Status.StartTime == nil || lt.Status.EndTime == nil {
-			logStatusErr(ctx, "stamp MetricsExported=False (missing times)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+			r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
 				metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
-				"missing StartTime/EndTime; cannot run exporter"))
+				"missing StartTime/EndTime; cannot run exporter")
 			return r.failLoadTest(ctx, lt, "missing StartTime/EndTime; cannot run exporter")
 		}
 
@@ -231,10 +231,10 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 		// rather than starting the minute again.
 		if waited := time.Since(lt.Status.EndTime.Time); waited < exportCooldown {
 			remaining := exportCooldown - waited
-			logStatusErr(ctx, "stamp MetricsExported=Unknown (cooldown)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+			r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
 				metav1.ConditionUnknown, dfaasv1.LTReasonExportCooldown,
 				fmt.Sprintf("cooling down %s before export so Prometheus federates the end of the run (%s left)",
-					exportCooldown, remaining.Truncate(time.Second))))
+					exportCooldown, remaining.Truncate(time.Second)))
 			logger.Info("export cool-down in progress", "remaining", remaining.Truncate(time.Second))
 			return ctrl.Result{RequeueAfter: remaining}, nil
 		}
@@ -256,12 +256,12 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 				missing := fmt.Sprintf("S3 config %q not found in namespace %s",
 					configName, S3ConfigNamespace)
 				// Stamp the S3ConfigMissing condition either way for visibility.
-				logStatusErr(ctx, "stamp MetricsExported=False (s3 config missing)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
-					metav1.ConditionFalse, dfaasv1.LTReasonS3ConfigMissing, missing))
+				r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
+					metav1.ConditionFalse, dfaasv1.LTReasonS3ConfigMissing, missing)
 				if explicitRef {
 					// Explicit ref must exist — a missing one is a hard failure
 					// (unchanged behaviour).
-					return r.setLoadTestPhaseDetail(ctx, lt, dfaasv1.LoadTestFailed,
+					return r.phase(ctx, lt, dfaasv1.LoadTestFailed,
 						dfaasv1.LTReasonS3ConfigMissing, missing)
 				}
 				// Default sink missing (e.g. SeaweedFS not yet deployed) — degrade
@@ -289,21 +289,21 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 
 		newJob, err := r.createExporterJob(lt, env, lt.Status.StartTime.Time, lt.Status.EndTime.Time, s3SecretName, k6LogCMs)
 		if err != nil {
-			logStatusErr(ctx, "stamp MetricsExported=False (build failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+			r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
 				metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
-				"build exporter job: "+condMessage(err)))
+				"build exporter job: "+condMessage(err))
 			return r.failLoadTest(ctx, lt, fmt.Sprintf("build exporter job: %v", err))
 		}
 		if err := r.Create(ctx, newJob); err != nil && !apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{}, err
 		}
-		logStatusErr(ctx, "stamp MetricsExported=Unknown (exporter running)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+		r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
 			metav1.ConditionUnknown, dfaasv1.LTReasonExporterRunning,
-			"exporter Job created, awaiting completion"))
-		logStatusErr(ctx, "persist exporter Job name", r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(lt), func(latest *dfaasv1.LoadTest) error {
+			"exporter Job created, awaiting completion")
+		logStatusErr(ctx, "persist exporter Job name", r.writer().Record(ctx, lt, ltTransition{Touch: func(latest *dfaasv1.LoadTest) error {
 			latest.Status.ExporterJob = jobName
 			return nil
-		}))
+		}}))
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if err != nil {
@@ -314,10 +314,10 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 		logger.Info("exporter Job succeeded")
 		// Summaries consumed by the exporter — sweep them off the filer.
 		logStatusErr(ctx, "delete k6 summaries", deleteSummaryObjects(ctx, lt))
-		logStatusErr(ctx, "stamp MetricsExported=True", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+		r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
 			metav1.ConditionTrue, dfaasv1.LTReasonExportSucceeded,
-			"metrics exported"))
-		return r.setLoadTestPhase(ctx, lt, dfaasv1.LoadTestCompleted)
+			"metrics exported")
+		return r.phase(ctx, lt, dfaasv1.LoadTestCompleted, "", "")
 	}
 	// Decide terminal failure from the JobFailed condition, not the raw
 	// Status.Failed counter: that counter tracks failed *attempts*, and the Job
@@ -327,9 +327,9 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 	if jobConditionTrue(&job, batchv1.JobFailed) {
 		// Nothing will consume the summaries anymore — sweep them.
 		logStatusErr(ctx, "delete k6 summaries", deleteSummaryObjects(ctx, lt))
-		logStatusErr(ctx, "stamp MetricsExported=False (job failed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+		r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
 			metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
-			"exporter Job reported Failed"))
+			"exporter Job reported Failed")
 		return r.failLoadTest(ctx, lt, "exporter Job failed")
 	}
 	logger.Info("exporter Job running")

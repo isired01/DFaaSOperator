@@ -22,11 +22,11 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 )
 
-// EnsureRBAC creates / refreshes the per-env ServiceAccount + Role +
+// ensureRBAC creates / refreshes the per-env ServiceAccount + Role +
 // RoleBinding that the Ansible Job pod uses to push the k6 kubeconfig Secret
 // back into env.Namespace via `delegate_to: localhost`. Returns the SA name
 // to be set on Job.Spec.Template.Spec.ServiceAccountName.
-func (m *Manager) EnsureRBAC(ctx context.Context, env *dfaasv1.Environment) (string, error) {
+func (m *Manager) ensureRBAC(ctx context.Context, env *dfaasv1.Environment) (string, error) {
 	saName := env.Name + "-ansible-sa"
 	roleName := env.Name + "-ansible-role"
 	bindingName := env.Name + "-ansible-rb"

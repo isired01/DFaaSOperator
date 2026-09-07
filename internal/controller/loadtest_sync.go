@@ -231,8 +231,8 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 			if failed := r.teardownRemoteTestRuns(ctx, lt, env); failed > 0 {
 				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 			}
-			logStatusErr(ctx, "stamp SyncReady=False (node unusable)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondSyncReady,
-				metav1.ConditionFalse, dfaasv1.LTReasonSyncTimeout, nerr.Error()))
+			r.cond(ctx, lt, dfaasv1.LTCondSyncReady,
+				metav1.ConditionFalse, dfaasv1.LTReasonSyncTimeout, nerr.Error())
 			return r.failLoadTest(ctx, lt, "synchronized start: "+nerr.Error())
 		}
 		stage, err := node.Stage(ctx, lt)
@@ -253,9 +253,9 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 			if failed := r.teardownRemoteTestRuns(ctx, lt, env); failed > 0 {
 				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 			}
-			logStatusErr(ctx, "stamp SyncReady=False (runner error)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondSyncReady,
+			r.cond(ctx, lt, dfaasv1.LTCondSyncReady,
 				metav1.ConditionFalse, dfaasv1.LTReasonSyncTimeout,
-				fmt.Sprintf("runner on node %q reported stage=error before the GO signal", ref.NodeID)))
+				fmt.Sprintf("runner on node %q reported stage=error before the GO signal", ref.NodeID))
 			return r.failLoadTest(ctx, lt,
 				fmt.Sprintf("synchronized start: runner on node %q errored before the GO signal", ref.NodeID))
 		}
@@ -274,16 +274,16 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 				if failed := r.teardownRemoteTestRuns(ctx, lt, env); failed > 0 {
 					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 				}
-				logStatusErr(ctx, "stamp SyncReady=False (timeout)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondSyncReady,
+				r.cond(ctx, lt, dfaasv1.LTCondSyncReady,
 					metav1.ConditionFalse, dfaasv1.LTReasonSyncTimeout,
-					fmt.Sprintf("only %d/%d runners started within %s", started, total, syncWaitBudget)))
+					fmt.Sprintf("only %d/%d runners started within %s", started, total, syncWaitBudget))
 				return r.failLoadTest(ctx, lt,
 					fmt.Sprintf("synchronized start: only %d/%d runners started within %s", started, total, syncWaitBudget))
 			}
 		}
-		logStatusErr(ctx, "stamp SyncReady=False (awaiting runners)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondSyncReady,
+		r.cond(ctx, lt, dfaasv1.LTCondSyncReady,
 			metav1.ConditionFalse, dfaasv1.LTReasonAwaitingRunners,
-			fmt.Sprintf("%d/%d runners started, holding the GO signal", started, total)))
+			fmt.Sprintf("%d/%d runners started, holding the GO signal", started, total))
 		return ctrl.Result{RequeueAfter: syncPollRequeue}, nil
 	}
 
@@ -294,8 +294,8 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 		return ctrl.Result{RequeueAfter: syncPollRequeue}, nil
 	}
 	logger.Info("sync barrier: GO signal published", "runners", total)
-	logStatusErr(ctx, "stamp SyncReady=True (go published)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondSyncReady,
+	r.cond(ctx, lt, dfaasv1.LTCondSyncReady,
 		metav1.ConditionTrue, dfaasv1.LTReasonGoPublished,
-		fmt.Sprintf("GO signal published; %d runners released together", total)))
+		fmt.Sprintf("GO signal published; %d runners released together", total))
 	return r.finishDispatch(ctx, lt, lt.Status.TestRuns)
 }

@@ -23,6 +23,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/roles"
 )
 
 // libp2pBootstrapPort is the TCP port advertised in the dfaas-agent bootstrap
@@ -42,43 +43,44 @@ const libp2pBootstrapPort = 31600
 const ansibleJobDeadlineSeconds int64 = 1800
 
 // CreateJobForRole builds an Ansible Job + inventory Secret for the subset of
-// nodes in env that match role. jobSuffix becomes part of the Job/Secret/
-// playbook-ConfigMap name so VM and K6 phases run independent Jobs against
-// distinct node sets. The playbook chosen depends on the role:
-//
-//   - dfaas-worker        → setup-nodes.yml (base OS + DFaaS install)
-//   - k6-load-generator   → setup-k6-nodes.yml (k3s + k6-operator)
+// nodes in env that match role. Which playbook, inventory group and name
+// suffix a role uses comes from the roles table, so the two provisioning
+// streams run independent Jobs against distinct node sets and a role the
+// table does not know is an error rather than a silent fall-through.
 func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment,
-	role dfaasv1.NodeRole, jobSuffix string,
-	libp2pKeys map[string]string) (*batchv1.Job, *corev1.Secret, error) {
+	role dfaasv1.NodeRole, libp2pKeys map[string]string) (*batchv1.Job, *corev1.Secret, error) {
 
+	spec, err := roles.For(role)
+	if err != nil {
+		return nil, nil, err
+	}
 	nodes := env.NodesWithRole(role)
 	if len(nodes) == 0 {
 		return nil, nil, fmt.Errorf("no nodes with role %q in environment %q", role, env.Name)
 	}
 
-	if err := m.EnsureHelmValues(ctx, env); err != nil {
+	if err := m.ensureHelmValues(ctx, env); err != nil {
 		return nil, nil, fmt.Errorf("ensure helm values: %w", err)
 	}
-	if err := m.EnsurePlaybookConfigMap(ctx, env, role); err != nil {
+	if err := m.ensurePlaybookConfigMap(ctx, env, spec); err != nil {
 		return nil, nil, fmt.Errorf("ensure playbook configmap: %w", err)
 	}
-	saName, err := m.EnsureRBAC(ctx, env)
+	saName, err := m.ensureRBAC(ctx, env)
 	if err != nil {
 		return nil, nil, fmt.Errorf("ensure RBAC: %w", err)
 	}
 
-	playbookFile := playbookFileForRole(role)
-	playbookCMName := playbookConfigMapName(env, role)
+	playbookFile := spec.Playbook
+	playbookCMName := playbookConfigMapName(env, spec)
 
-	inventory, err := buildInventory(env, role, nodes, libp2pKeys)
+	inventory, err := buildInventory(env, spec, nodes, libp2pKeys)
 	if err != nil {
 		return nil, nil, fmt.Errorf("build inventory: %w", err)
 	}
 	labels := jobLabels(env, role)
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      InventorySecretName(env, jobSuffix),
+			Name:      inventorySecretName(env, spec.JobSuffix),
 			Namespace: env.Namespace,
 			Labels:    labels,
 		},
@@ -91,7 +93,7 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 	prFailed := batchv1.Failed
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      JobNameForRole(env, jobSuffix),
+			Name:      JobNameForRole(env, spec.JobSuffix),
 			Namespace: env.Namespace,
 			Labels:    labels,
 		},
@@ -171,12 +173,12 @@ func (m *Manager) CreateJobForRole(ctx context.Context, env *dfaasv1.Environment
 // EnsureLibp2pKeys for dfaas-worker nodes (Secret-backed, generated on first
 // reconcile, optionally pre-applied for BYO peer identity). Authoritative
 // source: there is no spec field for the key.
-func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole,
+func buildInventory(env *dfaasv1.Environment, spec roles.Spec,
 	nodes []dfaasv1.EnvironmentNode, libp2pKeys map[string]string) (string, error) {
 	var inv string
-	switch role {
+	switch spec.Role {
 	case dfaasv1.RoleDfaasWorker:
-		inv = "[target_nodes]\n"
+		inv = "[" + spec.Group + "]\n"
 
 		// The seed (nodes[0]) peer ID is baked into every other worker's
 		// bootstrap multiaddr, so a malformed seed key would poison the whole
@@ -209,7 +211,7 @@ func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole,
 			)
 		}
 	case dfaasv1.RoleK6LoadGenerator:
-		inv = "[k6_nodes]\n"
+		inv = "[" + spec.Group + "]\n"
 		for _, n := range nodes {
 			// env_uid feeds the ownerReference the playbook stamps on the
 			// kubeconfig Secret it pushes back to the management cluster, so
@@ -220,23 +222,16 @@ func buildInventory(env *dfaasv1.Environment, role dfaasv1.NodeRole,
 				n.IPAddress, n.Username, n.Password, n.NodeID, env.Name, env.Namespace, env.UID,
 			)
 		}
+	default:
+		// The host lines differ structurally per role, so this switch stays;
+		// a role without an arm is now an error instead of an empty inventory.
+		return "", fmt.Errorf("no inventory layout for node role %q", spec.Role)
 	}
 	return inv, nil
 }
 
-func playbookFileForRole(role dfaasv1.NodeRole) string {
-	if role == dfaasv1.RoleK6LoadGenerator {
-		return "setup-k6-nodes.yml"
-	}
-	return "setup-nodes.yml"
-}
-
-func playbookConfigMapName(env *dfaasv1.Environment, role dfaasv1.NodeRole) string {
-	suffix := "dfaas"
-	if role == dfaasv1.RoleK6LoadGenerator {
-		suffix = "k6"
-	}
-	return fmt.Sprintf("ansible-playbooks-%s-%s", suffix, env.Name)
+func playbookConfigMapName(env *dfaasv1.Environment, spec roles.Spec) string {
+	return fmt.Sprintf("ansible-playbooks-%s-%s", spec.ConfigMapSuffix, env.Name)
 }
 
 // shortUID returns the first 8 chars of env.UID, or the whole UID if shorter.
@@ -288,8 +283,8 @@ func JobNameForRole(env *dfaasv1.Environment, jobSuffix string) string {
 		jobSuffix, shortUID(env), env.Generation))
 }
 
-// InventorySecretName mirrors JobNameForRole for the per-Job inventory Secret.
-func InventorySecretName(env *dfaasv1.Environment, jobSuffix string) string {
+// inventorySecretName mirrors JobNameForRole for the per-Job inventory Secret.
+func inventorySecretName(env *dfaasv1.Environment, jobSuffix string) string {
 	return fmt.Sprintf("%s-ansible-%s-%s-g%d-inventory",
 		env.Name, jobSuffix, shortUID(env), env.Generation)
 }

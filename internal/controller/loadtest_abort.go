@@ -64,20 +64,20 @@ func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
 	// deleted those TestRuns, so leaving it alone makes the conditions panel
 	// claim runners are live on a test that has none. Restamp it to what is
 	// now true.
-	logStatusErr(ctx, "stamp K6Healthy=False (runners reclaimed)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondK6Healthy,
+	r.cond(ctx, lt, dfaasv1.LTCondK6Healthy,
 		metav1.ConditionFalse, dfaasv1.LTReasonRunnersReclaimed,
-		fmt.Sprintf("%d remote TestRun(s) deleted — test was aborted before completion", len(lt.Spec.PerNodeLoad))))
+		fmt.Sprintf("%d remote TestRun(s) deleted — test was aborted before completion", len(lt.Spec.PerNodeLoad)))
 
 	// MetricsExported never ran on abort — stamp False/Skipped per P9 so
 	// UI does not show "in flight" forever on the aborted CR.
-	logStatusErr(ctx, "stamp MetricsExported=False (export skipped)", r.setLoadTestCondition(ctx, lt, dfaasv1.LTCondMetricsExported,
+	r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
 		metav1.ConditionFalse, dfaasv1.LTReasonExportSkipped,
-		"no exporter ran — test was aborted"))
+		"no exporter ran — test was aborted")
 	// Carry the caller's reason + message through the phase transition: the
 	// aggregator would otherwise replace them with the generic "load test
 	// aborted", and the UI looks the abort explanation up by
 	// Ready/UserAborted specifically.
-	return r.setLoadTestPhaseDetail(ctx, lt, dfaasv1.LoadTestAborted, reason, message)
+	return r.phase(ctx, lt, dfaasv1.LoadTestAborted, reason, message)
 }
 
 // teardownRemoteTestRuns issues DeleteTestRun for every remote TestRun of lt

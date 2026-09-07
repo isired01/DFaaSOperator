@@ -19,3 +19,11 @@ var openfaasValues string
 
 //go:embed templates/prometheus-values.yaml
 var prometheusValues string
+
+// playbooks maps a roles.Spec.Playbook filename to its embedded content, so
+// the ConfigMap that ships a role's playbook is built from the role table
+// instead of a switch that had to agree with two others.
+var playbooks = map[string]string{
+	"setup-nodes.yml":    ansiblePlaybook,
+	"setup-k6-nodes.yml": k6Playbook,
+}

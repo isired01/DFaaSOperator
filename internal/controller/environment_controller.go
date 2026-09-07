@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/statuswriter"
 )
 
 const environmentFinalizer = "dfaas.dfaas.io/environment-finalizer"
@@ -93,7 +94,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	switch env.Status.Phase {
 	case "", dfaasv1.EnvIdle:
-		return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
+		return r.phase(ctx, &env, dfaasv1.EnvProvisioningVMs)
 	case dfaasv1.EnvProvisioningVMs:
 		return r.reconcileProvisioningVMs(ctx, &env)
 	case dfaasv1.EnvProvisioningInfra:
@@ -102,7 +103,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.reconcileProvisioningMonitoring(ctx, &env)
 	case dfaasv1.EnvReady:
 		// Generation drifted: restart from VMs.
-		return r.setEnvPhase(ctx, &env, dfaasv1.EnvProvisioningVMs)
+		return r.phase(ctx, &env, dfaasv1.EnvProvisioningVMs)
 	case dfaasv1.EnvUnreachable:
 		// Non-terminal: nodes stopped answering SSH. Re-probe indefinitely and
 		// auto-recover when they return (→ Ready or → ProvisioningInfra).
@@ -118,7 +119,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// reaching Ready, or pre-dates the settle-time stamp). Record the
 			// current generation so a later spec edit is seen as drift and
 			// re-triggers provisioning.
-			return r.setEnvPhase(ctx, &env, env.Status.Phase)
+			return r.phase(ctx, &env, env.Status.Phase)
 		}
 		logger.V(1).Info("environment settled, awaiting spec edit or recreation",
 			"phase", env.Status.Phase)
@@ -159,34 +160,46 @@ func (r *EnvironmentReconciler) handleGenerationDrift(ctx context.Context,
 	if rerr := r.resetTransientConditions(ctx, env); rerr != nil {
 		logger.Error(rerr, "reset transient Conditions failed")
 	}
-	res, err = r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningVMs)
+	res, err = r.phase(ctx, env, dfaasv1.EnvProvisioningVMs)
 	return true, res, err
 }
 
-// setEnvPhase patches status.phase, retrying on conflict via atomicStatusUpdate.
-// When transitioning into a settled phase (Ready, Failed, or Degraded) it also
-// stamps observedGeneration so future ticks short-circuit and a later spec edit
-// is seen as generation drift. Stamps the top-level EnvCondReady aggregator (P1).
-func (r *EnvironmentReconciler) setEnvPhase(ctx context.Context,
-	env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase) (ctrl.Result, error) {
+// writer is the one way this reconciler persists Environment status. On a
+// settled phase (Ready, Failed, Degraded) SetPhase also stamps
+// observedGeneration: it records the spec generation the controller has
+// finished processing, so a later spec edit is detected as drift at the top
+// of Reconcile. Without it an Environment that failed on its first provision
+// kept observedGeneration == 0, the drift guard skipped it, and a spec edit
+// from the UI was silently ignored — wedging it in Failed forever.
+func (r *EnvironmentReconciler) writer() statuswriter.Writer[*dfaasv1.Environment, dfaasv1.EnvironmentPhase] {
+	return statuswriter.Writer[*dfaasv1.Environment, dfaasv1.EnvironmentPhase]{
+		Client: r.Client,
+		New:    func() *dfaasv1.Environment { return &dfaasv1.Environment{} },
+		SetPhase: func(env *dfaasv1.Environment, p dfaasv1.EnvironmentPhase) {
+			env.Status.Phase = p
+			if isSettledPhase(p) {
+				env.Status.ObservedGeneration = env.Generation
+			}
+		},
+		Aggregate:  func(env *dfaasv1.Environment, p dfaasv1.EnvironmentPhase, _, _ string) { stampEnvAggregate(env, p) },
+		Conditions: func(env *dfaasv1.Environment) *[]metav1.Condition { return &env.Status.Conditions },
+	}
+}
 
-	err := r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
-		latest.Status.Phase = phase
-		// Stamp observedGeneration on every *settled* outcome — Ready, Failed,
-		// and Degraded — not just Ready. It records the spec generation the
-		// controller has finished processing, so a later spec edit (generation
-		// bump) is detected as drift at the top of Reconcile and re-triggers
-		// provisioning. Without this, an Environment that failed on its very
-		// first provision kept observedGeneration == 0, the drift guard
-		// (`observedGeneration > 0`) skipped it, and editing the spec from the
-		// UI was silently ignored — wedging the Environment in Failed forever.
-		if isSettledPhase(phase) {
-			latest.Status.ObservedGeneration = latest.Generation
-		}
-		stampEnvAggregate(latest, phase)
-		return nil
+// cond stamps one Condition, best-effort (logged, never fatal).
+func (r *EnvironmentReconciler) cond(ctx context.Context, env *dfaasv1.Environment,
+	condType string, status metav1.ConditionStatus, reason, message string) {
+	r.writer().RecordBestEffort(ctx, env, envTransition{
+		Conditions: []statuswriter.Cond{{Type: condType, Status: status, Reason: reason, Message: message}},
 	})
-	return ctrl.Result{}, err
+}
+
+// phase moves the Environment to p. No requeue: every Environment phase
+// handler already returns its own RequeueAfter, and the status watch
+// re-enqueues on the write. The reconciler's scheduling policy, stated once.
+func (r *EnvironmentReconciler) phase(ctx context.Context, env *dfaasv1.Environment,
+	p dfaasv1.EnvironmentPhase) (ctrl.Result, error) {
+	return ctrl.Result{}, r.writer().Record(ctx, env, envTransition{Phase: &p})
 }
 
 // stampEnvAggregate writes the EnvCondReady aggregator on the in-memory

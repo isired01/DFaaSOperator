@@ -118,7 +118,7 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 	}
 
 	if len(unreachable) == 0 {
-		if rerr := r.resetHealthMisses(ctx, env); rerr != nil {
+		if rerr := r.writer().Reset(ctx, env, healthMissesAnnotation); rerr != nil {
 			logger.Error(rerr, "resetHealthMisses failed; non-fatal")
 		}
 		if err := r.markNodesReachable(ctx, env); err != nil {
@@ -127,7 +127,7 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 		return ctrl.Result{RequeueAfter: healthCheckInterval}, nil
 	}
 
-	count, bumpErr := r.bumpHealthMisses(ctx, env)
+	count, bumpErr := r.writer().Bump(ctx, env, healthMissesAnnotation)
 	if bumpErr != nil {
 		logger.Error(bumpErr, "bumpHealthMisses failed; continuing without budget enforcement")
 	}
@@ -141,7 +141,7 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 		logStatusErr(ctx, "mark NodesReachable=False (entering Unreachable)", r.markNodesUnreachable(ctx, env,
 			fmt.Sprintf("SSH :22 dial failed for %v after %d consecutive health checks; retrying every %s",
 				unreachable, count, unreachableRetryInterval)))
-		return r.setEnvPhase(ctx, env, dfaasv1.EnvUnreachable)
+		return r.phase(ctx, env, dfaasv1.EnvUnreachable)
 	}
 	logger.Info("Ready environment nodes unreachable; will retry",
 		"nodes", unreachable, "attempts", count)
@@ -187,10 +187,10 @@ func (r *EnvironmentReconciler) reconcileUnreachable(ctx context.Context,
 
 	// All nodes answer again. Clear both unreachable counters (no-op when zero)
 	// and pick the recovery target.
-	if rerr := r.resetHealthMisses(ctx, env); rerr != nil {
+	if rerr := r.writer().Reset(ctx, env, healthMissesAnnotation); rerr != nil {
 		logger.Error(rerr, "resetHealthMisses failed; non-fatal")
 	}
-	if rerr := r.resetSSHAttempts(ctx, env); rerr != nil {
+	if rerr := r.writer().Reset(ctx, env, sshAttemptsAnnotation); rerr != nil {
 		logger.Error(rerr, "resetSSHAttempts failed; non-fatal")
 	}
 
@@ -203,13 +203,13 @@ func (r *EnvironmentReconciler) reconcileUnreachable(ctx context.Context,
 	if wasReady {
 		logger.Info("environment reachable again; returning to Ready")
 		logStatusErr(ctx, "mark NodesReachable=True (recovered)", r.markNodesReachable(ctx, env))
-		return r.setEnvPhase(ctx, env, dfaasv1.EnvReady)
+		return r.phase(ctx, env, dfaasv1.EnvReady)
 	}
 	logger.Info("environment reachable again; resuming provisioning")
-	logStatusErr(ctx, "stamp VMsReady=True (recovered)", r.setEnvCondition(ctx, env, dfaasv1.EnvCondVMsReady,
+	r.cond(ctx, env, dfaasv1.EnvCondVMsReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonSSHReachable,
-		"nodes reachable again on :22; resuming provisioning"))
-	return r.setEnvPhase(ctx, env, dfaasv1.EnvProvisioningInfra)
+		"nodes reachable again on :22; resuming provisioning")
+	return r.phase(ctx, env, dfaasv1.EnvProvisioningInfra)
 }
 
 // markNodesReachable stamps NodesReachable=True and refreshes lastHealthCheck
@@ -257,7 +257,7 @@ func (r *EnvironmentReconciler) probeThrottle(ctx context.Context,
 
 func (r *EnvironmentReconciler) markNodesReachable(ctx context.Context,
 	env *dfaasv1.Environment) error {
-	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
+	return r.writer().Record(ctx, env, envTransition{Touch: func(latest *dfaasv1.Environment) error {
 		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
 			Type:    dfaasv1.EnvCondNodesReachable,
 			Status:  metav1.ConditionTrue,
@@ -277,14 +277,14 @@ func (r *EnvironmentReconciler) markNodesReachable(ctx context.Context,
 		now := metav1.Now()
 		latest.Status.LastHealthCheck = &now
 		return nil
-	})
+	}})
 }
 
 // markNodesUnreachable stamps NodesReachable=False with msg and refreshes
 // lastHealthCheck in a single status update.
 func (r *EnvironmentReconciler) markNodesUnreachable(ctx context.Context,
 	env *dfaasv1.Environment, msg string) error {
-	return r.atomicStatusUpdate(ctx, client.ObjectKeyFromObject(env), func(latest *dfaasv1.Environment) error {
+	return r.writer().Record(ctx, env, envTransition{Touch: func(latest *dfaasv1.Environment) error {
 		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
 			Type:    dfaasv1.EnvCondNodesReachable,
 			Status:  metav1.ConditionFalse,
@@ -302,53 +302,5 @@ func (r *EnvironmentReconciler) markNodesUnreachable(ctx context.Context,
 		now := metav1.Now()
 		latest.Status.LastHealthCheck = &now
 		return nil
-	})
-}
-
-// bumpHealthMisses increments the consecutive Ready-state unreachable counter,
-// generation-scoped (a spec edit restarts the budget). Mirrors bumpSSHAttempts
-// but on a dedicated annotation so provisioning state is never clobbered.
-func (r *EnvironmentReconciler) bumpHealthMisses(ctx context.Context,
-	env *dfaasv1.Environment) (int, error) {
-	var n int
-	err := updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
-		func(latest *dfaasv1.Environment) bool {
-			n = bumpGenCounter(latest, healthMissesAnnotation)
-			return true
-		})
-	return n, err
-}
-
-// resetHealthMisses zeroes the health-miss counter for the current generation.
-// No-op when already zero to avoid annotation churn (and a spurious re-enqueue).
-func (r *EnvironmentReconciler) resetHealthMisses(ctx context.Context,
-	env *dfaasv1.Environment) error {
-	return updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
-		func(latest *dfaasv1.Environment) bool {
-			return resetGenCounter(latest, healthMissesAnnotation)
-		})
-}
-
-// bumpSSHAttempts increments the consecutive SSH-unreachable counter,
-// generation-scoped: a stored generation different from the current one
-// (spec edit) restarts the budget at 1. Returns the count for this generation.
-func (r *EnvironmentReconciler) bumpSSHAttempts(ctx context.Context,
-	env *dfaasv1.Environment) (int, error) {
-	var n int
-	err := updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
-		func(latest *dfaasv1.Environment) bool {
-			n = bumpGenCounter(latest, sshAttemptsAnnotation)
-			return true
-		})
-	return n, err
-}
-
-// resetSSHAttempts zeroes the counter for the current generation on success.
-// No-op when already absent or zero to avoid churn.
-func (r *EnvironmentReconciler) resetSSHAttempts(ctx context.Context,
-	env *dfaasv1.Environment) error {
-	return updateWithRetry(ctx, r.Client, client.ObjectKeyFromObject(env), &dfaasv1.Environment{},
-		func(latest *dfaasv1.Environment) bool {
-			return resetGenCounter(latest, sshAttemptsAnnotation)
-		})
+	}})
 }
