@@ -65,7 +65,7 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 		tr, err := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey)
 		if err != nil {
 			logger.Error(err, "remote TestRun fetch failed", "node", ref.NodeID, "name", ref.Name)
-			res, _, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonFetchFailed)
+			res, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonFetchFailed)
 			return res, oerr
 		}
 		// Successful dispatcher round-trip — reset the budget counter.

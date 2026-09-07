@@ -315,8 +315,6 @@ spec:
                   while the Environment is Ready.
                 format: date-time
                 type: string
-              message:
-                type: string
               observedGeneration:
                 description: |-
                   ObservedGeneration is the spec.generation observed at the last

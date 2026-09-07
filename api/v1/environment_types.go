@@ -220,9 +220,6 @@ type EnvironmentStatus struct {
 	// +patchMergeKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
-
-	// +optional
-	Message string `json:"message,omitempty"`
 }
 
 // +kubebuilder:object:root=true

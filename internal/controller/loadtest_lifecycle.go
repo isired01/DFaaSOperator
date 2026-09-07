@@ -72,14 +72,15 @@ func (r *LoadTestReconciler) resetDispatchAttempts(ctx context.Context,
 // error path. Bumps the counter; if it tips the budget, transitions the
 // LoadTest to Failed and stamps K6Dispatched=False/DispatchFailed. Otherwise
 // stamps K6Dispatched=False/<subReason> (P13) and returns a RequeueAfter
-// Result. fatal=true means the caller MUST stop.
+// Result. Every path is terminal for the current reconcile: the caller
+// returns whatever this returns.
 func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
-	lt *dfaasv1.LoadTest, dispatchErr error, subReason string) (ctrl.Result, bool, error) {
+	lt *dfaasv1.LoadTest, dispatchErr error, subReason string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	count, bumpErr := r.bumpDispatchAttempts(ctx, lt)
 	if bumpErr != nil {
 		logger.Error(bumpErr, "bumpDispatchAttempts failed; continuing without budget enforcement")
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, true, nil
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	if count >= dispatchRetryBudget {
 		detail := fmt.Sprintf("remote dispatch failed %d consecutive times: %s",
@@ -88,7 +89,7 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 			metav1.ConditionFalse, dfaasv1.LTReasonDispatchFailed, detail))
 		res, err := r.setLoadTestPhaseDetail(ctx, lt, dfaasv1.LoadTestFailed,
 			dfaasv1.LTReasonDispatchFailed, detail)
-		return res, true, err
+		return res, err
 	}
 	// P13: sub-reason (ScriptMirrorFailed / StaleCleanupFailed / ApplyFailed)
 	// carries the diagnostic detail, retry-budget counter is in the message.
@@ -96,7 +97,7 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 		metav1.ConditionFalse, subReason,
 		fmt.Sprintf("attempt %d/%d: %s",
 			count, dispatchRetryBudget, condMessage(dispatchErr))))
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, true, nil
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
 // startK6 dispatches one remote TestRun per PerNodeLoad entry on its matching
@@ -267,14 +268,14 @@ func (r *LoadTestReconciler) dispatchTestRunForNode(ctx context.Context,
 	// spec.script.configMap in its own cluster, so the CM must exist there.
 	if merr := r.mirrorScriptConfigMap(ctx, lt, perNode, secretRef); merr != nil {
 		logger.Error(merr, "remote script CM mirror failed", "node", perNode.NodeID)
-		res, _, oerr := r.onDispatchError(ctx, lt, merr, dfaasv1.LTReasonScriptMirrorFailed)
+		res, oerr := r.onDispatchError(ctx, lt, merr, dfaasv1.LTReasonScriptMirrorFailed)
 		return refs, true, res, oerr
 	}
 
 	// Wipe stale TestRun from previous runs so we start with fresh status.
 	if derr := r.Dispatcher.DeleteTestRun(ctx, secretRef, remoteKey); derr != nil {
 		logger.Error(derr, "remote TestRun cleanup failed", "node", perNode.NodeID)
-		res, _, oerr := r.onDispatchError(ctx, lt, derr, dfaasv1.LTReasonStaleCleanupFailed)
+		res, oerr := r.onDispatchError(ctx, lt, derr, dfaasv1.LTReasonStaleCleanupFailed)
 		return refs, true, res, oerr
 	}
 	_, gerr := r.Dispatcher.GetTestRun(ctx, secretRef, remoteKey)
@@ -288,7 +289,7 @@ func (r *LoadTestReconciler) dispatchTestRunForNode(ctx context.Context,
 		// applying on top of it would risk racing a still-running k6 test:
 		// route it through the retry budget instead.
 		logger.Error(gerr, "remote TestRun delete-confirm poll failed", "node", perNode.NodeID)
-		res, _, oerr := r.onDispatchError(ctx, lt, gerr, dfaasv1.LTReasonStaleCleanupFailed)
+		res, oerr := r.onDispatchError(ctx, lt, gerr, dfaasv1.LTReasonStaleCleanupFailed)
 		return refs, true, res, oerr
 	}
 
@@ -300,7 +301,7 @@ func (r *LoadTestReconciler) dispatchTestRunForNode(ctx context.Context,
 		if perr := r.persistTestRuns(ctx, lt, refs); perr != nil {
 			logger.Error(perr, "persist partial TestRuns failed")
 		}
-		res, _, oerr := r.onDispatchError(ctx, lt, aerr, dfaasv1.LTReasonApplyFailed)
+		res, oerr := r.onDispatchError(ctx, lt, aerr, dfaasv1.LTReasonApplyFailed)
 		return refs, true, res, oerr
 	}
 

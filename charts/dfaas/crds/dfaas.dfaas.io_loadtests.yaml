@@ -299,8 +299,6 @@ spec:
                   ExporterJob is the in-cluster Job name created during the Exporting
                   phase.
                 type: string
-              message:
-                type: string
               phase:
                 description: LoadTestPhase tracks the lifecycle of a single load test.
                 enum:
