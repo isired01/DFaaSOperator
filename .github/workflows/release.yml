@@ -17,6 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Images are published under both v0.2.0 and 0.2.0: the chart defaults
+      # every image tag to .Chart.AppVersion, which is packaged without the v.
       - name: Compute version (strip leading v)
         run: echo "VERSION_NO_V=${VERSION#v}" >> "$GITHUB_ENV"
 
@@ -39,6 +41,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/isired01/dfaas-operator:${{ env.VERSION }}
+            ghcr.io/isired01/dfaas-operator:${{ env.VERSION_NO_V }}
             ghcr.io/isired01/dfaas-operator:latest
 
       - name: Build & push exporter image
@@ -50,6 +53,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/isired01/dfaas-exporter:${{ env.VERSION }}
+            ghcr.io/isired01/dfaas-exporter:${{ env.VERSION_NO_V }}
             ghcr.io/isired01/dfaas-exporter:latest
 
       - name: Wait for UI image to be published
