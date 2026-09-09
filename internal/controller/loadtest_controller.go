@@ -109,9 +109,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Terminal phases — no-op.
-	if lt.Status.Phase == dfaasv1.LoadTestCompleted ||
-		lt.Status.Phase == dfaasv1.LoadTestFailed ||
-		lt.Status.Phase == dfaasv1.LoadTestAborted {
+	if lt.Status.Phase.Terminal() {
 		return ctrl.Result{}, nil
 	}
 
@@ -152,8 +150,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	// Abort short-circuit. User PATCHed spec.stop=true.
 	if lt.Spec.Stop {
-		inAbortWindow := lt.Status.Phase == "" ||
-			lt.Status.Phase == dfaasv1.LoadTestPending ||
+		inAbortWindow := lt.Status.Phase.PreExecution() ||
 			lt.Status.Phase == dfaasv1.LoadTestRunning
 		if inAbortWindow {
 			return r.abortLoadTest(ctx, &lt, &env, dfaasv1.LTReasonUserAborted,
@@ -162,9 +159,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Scheduled-start branch (P9: stamps LTCondScheduled).
-	if lt.Spec.StartAt != nil &&
-		(lt.Status.Phase == "" || lt.Status.Phase == dfaasv1.LoadTestPending) &&
-		lt.Spec.Suspended {
+	if lt.Spec.StartAt != nil && lt.Status.Phase.PreExecution() && lt.Spec.Suspended {
 
 		fireT := lt.Spec.StartAt.Time
 		switch {
@@ -175,7 +170,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				"armed for "+fireT.UTC().Format(time.RFC3339))
 			return ctrl.Result{RequeueAfter: time.Until(fireT)}, nil
 
-		case env.Status.Phase != dfaasv1.EnvReady && env.Status.Phase != dfaasv1.EnvDegraded:
+		case !env.Status.Phase.Dispatchable():
 			// Fire time elapsed but the target Environment is not ready
 			// (Degraded is treated as good-enough to dispatch — only
 			// Failed / still-Provisioning hold the schedule).
@@ -213,7 +208,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Strict create-time gate.
-	if lt.Status.Phase == "" && !lt.Spec.Suspended && env.Status.Phase != dfaasv1.EnvReady && env.Status.Phase != dfaasv1.EnvDegraded {
+	if lt.Status.Phase == "" && !lt.Spec.Suspended && !env.Status.Phase.Dispatchable() {
 		return r.failLoadTest(ctx, &lt,
 			fmt.Sprintf("environment %q is %q; it must be Ready before creating a LoadTest",
 				env.Name, env.Status.Phase))
@@ -231,7 +226,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Run-once guard + suspended gate.
-	preExecution := lt.Status.Phase == "" || lt.Status.Phase == dfaasv1.LoadTestPending
+	preExecution := lt.Status.Phase.PreExecution()
 	if preExecution {
 		if lt.Spec.Suspended {
 			// Save-as-Draft: hold at Pending, dispatch nothing. PATCH
@@ -243,7 +238,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 
 		// Block while Environment is mid-flight.
-		if env.Status.Phase != dfaasv1.EnvReady && env.Status.Phase != dfaasv1.EnvDegraded {
+		if !env.Status.Phase.Dispatchable() {
 			logger.Info("waiting for environment", "env", env.Name, "phase", env.Status.Phase)
 			return r.phase(ctx, &lt, dfaasv1.LoadTestPending, "", "")
 		}
@@ -255,7 +250,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// caught here on its next reconcile and queued rather than colliding with
 	// a sibling already running on the same Environment.
 	if preExecution && !lt.Spec.Suspended &&
-		(env.Status.Phase == dfaasv1.EnvReady || env.Status.Phase == dfaasv1.EnvDegraded) {
+		env.Status.Phase.Dispatchable() {
 		proceed, res, err := r.envOccupancyGate(ctx, &lt)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -470,8 +465,7 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 		}
 		occupying := sib.Status.Phase == dfaasv1.LoadTestRunning ||
 			sib.Status.Phase == dfaasv1.LoadTestExporting ||
-			((sib.Status.Phase == "" || sib.Status.Phase == dfaasv1.LoadTestPending) &&
-				len(sib.Status.TestRuns) > 0)
+			(sib.Status.Phase.PreExecution() && len(sib.Status.TestRuns) > 0)
 		if occupying {
 			return hold(dfaasv1.LTReasonEnvBusy,
 				fmt.Sprintf("waiting: environment %q occupied by load test %q",
@@ -487,7 +481,7 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 		if sib.Spec.TargetEnvironment != lt.Spec.TargetEnvironment {
 			continue
 		}
-		if sib.Status.Phase != "" && sib.Status.Phase != dfaasv1.LoadTestPending {
+		if !sib.Status.Phase.PreExecution() {
 			continue
 		}
 		if sib.Spec.Suspended {

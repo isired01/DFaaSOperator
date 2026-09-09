@@ -37,6 +37,21 @@ const (
 	EnvUnreachable EnvironmentPhase = "Unreachable"
 )
 
+// Dispatchable reports whether a LoadTest may be created and dispatched
+// against an Environment in this phase. Degraded qualifies: it means the
+// monitoring stack is down, which can only fail the metrics export, so the
+// operator dispatches against it and the gateway must not be stricter.
+//
+// It lives here because the comparison was re-typed at four sites inside one
+// reconcile function -- three of them negated -- plus once more in the
+// gateway. Adding EnvUnreachable to the set (plausible: Unreachable is
+// explicitly non-terminal and auto-recovering) meant finding all five by eye,
+// and missing one left the create gate rejecting while the Occupancy gate
+// admitted, with no compile error and no test failure.
+func (p EnvironmentPhase) Dispatchable() bool {
+	return p == EnvReady || p == EnvDegraded
+}
+
 // Condition Types stamped on Environment.status.conditions (P15).
 const (
 	EnvCondReady               = "Ready"
