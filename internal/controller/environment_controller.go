@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/monitoring"
 	"dfaas-operator/internal/controller/statuswriter"
 	"dfaas-operator/internal/reach"
 )
@@ -52,6 +53,17 @@ type EnvironmentReconciler struct {
 	// prober() falls back to reach.TCP{}, the same convention APIReader and
 	// Clientset use here.
 	Prober reach.Prober
+	// Monitoring is the Helm monitoring stack. Nil-safe: monitoring() falls
+	// back to a real &monitoring.Manager{}, which performs real Helm installs.
+	Monitoring monitoring.Stack
+}
+
+// monitoringStack is the nil-safe accessor for Monitoring.
+func (r *EnvironmentReconciler) monitoringStack() monitoring.Stack {
+	if r.Monitoring != nil {
+		return r.Monitoring
+	}
+	return &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
 }
 
 // prober is the nil-safe accessor for Prober.

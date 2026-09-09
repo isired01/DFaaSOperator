@@ -26,7 +26,6 @@ import (
 
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/controller/ansible"
-	"dfaas-operator/internal/controller/monitoring"
 	"dfaas-operator/internal/controller/roles"
 	"dfaas-operator/internal/controller/statuswriter"
 )
@@ -58,8 +57,7 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 	if controllerutil.ContainsFinalizer(env, environmentFinalizer) {
 		logger.Info("environment deletion: cleaning up Prometheus targets")
 
-		mm := &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
-		if err := mm.CleanupTargets(ctx, env); err != nil {
+		if err := r.monitoringStack().CleanupTargets(ctx, env); err != nil {
 			logger.Error(err, "cleanup Prometheus targets failed; keeping the finalizer and retrying")
 			return ctrl.Result{}, fmt.Errorf("cleanup Prometheus targets: %w", err)
 		}
@@ -223,7 +221,7 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 	env *dfaasv1.Environment) (done bool, failed bool, err error) {
 	logger := log.FromContext(ctx)
 
-	mm := &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
+	mm := r.monitoringStack()
 	if derr := mm.Deploy(ctx); derr != nil {
 		count, bumpErr := r.writer().Bump(ctx, env, monitoringAttemptsAnnotation)
 		if bumpErr != nil {
