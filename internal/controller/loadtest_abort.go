@@ -90,18 +90,9 @@ func (r *LoadTestReconciler) teardownRemoteTestRuns(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (failed int) {
 	logger := log.FromContext(ctx)
 
-	// Union of status.testRuns and spec.perNodeLoad catches partial-dispatch
-	// races. Remote names are deterministic per node, so the union is a set
-	// of nodeIDs.
-	nodeIDs := map[string]struct{}{}
-	for _, ref := range lt.Status.TestRuns {
-		nodeIDs[ref.NodeID] = struct{}{}
-	}
-	for _, perNode := range lt.Spec.PerNodeLoad {
-		nodeIDs[perNode.NodeID] = struct{}{}
-	}
-
-	for nodeID := range nodeIDs {
+	// The union catches partial-dispatch races. Remote names are deterministic
+	// per node, so the target set is a set of nodeIDs.
+	for _, nodeID := range k6dispatch.TargetNodeIDs(lt) {
 		node, nerr := r.Dispatcher.Node(ctx, env, nodeID)
 		if nerr != nil {
 			// Unreachable by definition: no kubeconfig, no remote API to delete
@@ -182,17 +173,10 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 		}
 	}
 
-	// Poll: every TestRun in spec ∪ status must report NotFound on the
-	// remote cluster before we drop the finalizer. Mirrors the abort target
-	// set construction so a partial-dispatch ride-along is also covered.
-	nodeIDs := map[string]struct{}{}
-	for _, ref := range lt.Status.TestRuns {
-		nodeIDs[ref.NodeID] = struct{}{}
-	}
-	for _, perNode := range lt.Spec.PerNodeLoad {
-		nodeIDs[perNode.NodeID] = struct{}{}
-	}
-	for nodeID := range nodeIDs {
+	// Poll: every TestRun in the target set must report NotFound on the remote
+	// cluster before we drop the finalizer. Same set as the abort sweep, by
+	// construction rather than by agreement.
+	for _, nodeID := range k6dispatch.TargetNodeIDs(lt) {
 		node, nerr := r.Dispatcher.Node(ctx, &env, nodeID)
 		if nerr != nil {
 			// Nothing to poll on a node we cannot reach; it cannot hold up release.

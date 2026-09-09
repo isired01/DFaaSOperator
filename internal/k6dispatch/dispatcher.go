@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -108,6 +109,40 @@ var TestRunGVK = schema.GroupVersionKind{
 // TestRunName is the deterministic remote TestRun name for lt on nodeID.
 func TestRunName(lt *dfaasv1.LoadTest, nodeID string) string {
 	return fmt.Sprintf("%s-%s", lt.Name, Sanitize(nodeID))
+}
+
+// K6LogConfigMap is the Management cluster ConfigMap holding one Generator's
+// k6 end-of-test summary. One definition, because a mismatch between the two
+// sides would be invisible: captureK6Logs writes this ConfigMap, runExporter
+// asks the exporter Job to mount it, and the projection is Optional so that a
+// missing ConfigMap cannot wedge the Pod. A drifted name therefore mounts an
+// empty dir, the exporter finds no .log files and returns silently,
+// MetricsExported goes True, the LoadTest reports Completed -- and the
+// per-Generator k6 logs are gone.
+func K6LogConfigMap(lt *dfaasv1.LoadTest, nodeID string) string {
+	return fmt.Sprintf("%s-k6log-%s", lt.Name, Sanitize(nodeID))
+}
+
+// TargetNodeIDs is spec.perNodeLoad union status.testRuns, sorted. The abort
+// sweep and the deletion finalizer's NotFound poll MUST agree on this set: a
+// poll set smaller than the sweep set releases the CR while a remote TestRun is
+// still live, which is the exact gap the finalizer exists to close. Sorted
+// because both callers used to iterate a Go map, so per-node log order was
+// non-deterministic across reconciles.
+func TargetNodeIDs(lt *dfaasv1.LoadTest) []string {
+	seen := make(map[string]struct{}, len(lt.Status.TestRuns)+len(lt.Spec.PerNodeLoad))
+	for _, ref := range lt.Status.TestRuns {
+		seen[ref.NodeID] = struct{}{}
+	}
+	for _, perNode := range lt.Spec.PerNodeLoad {
+		seen[perNode.NodeID] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Sanitize lowercases and replaces non-DNS-1123 characters with "-", making a

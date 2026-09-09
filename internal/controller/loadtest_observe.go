@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/k6dispatch"
 )
 
 // exportCooldown is how long the reconciler waits, after k6 finishes, before
@@ -175,7 +176,7 @@ func (r *LoadTestReconciler) captureK6Logs(ctx context.Context,
 
 		cm := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      fmt.Sprintf("%s-k6log-%s", lt.Name, sanitize(ref.NodeID)),
+				Name:      k6dispatch.K6LogConfigMap(lt, ref.NodeID),
 				Namespace: lt.Namespace,
 			},
 		}
@@ -283,7 +284,7 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 		for _, ref := range lt.Status.TestRuns {
 			k6LogCMs = append(k6LogCMs, k6LogConfigMapRef{
 				NodeID:    ref.NodeID,
-				ConfigMap: fmt.Sprintf("%s-k6log-%s", lt.Name, sanitize(ref.NodeID)),
+				ConfigMap: k6dispatch.K6LogConfigMap(lt, ref.NodeID),
 			})
 		}
 
