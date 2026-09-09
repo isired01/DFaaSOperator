@@ -173,6 +173,17 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
+	// startAt is honoured only on a suspended LoadTest: the scheduled branch
+	// above requires Suspended, so a test carrying startAt without it falls
+	// straight through and dispatches immediately, ignoring the schedule with
+	// no diagnostic anywhere. The gateway rejects that on both create paths;
+	// a kubectl apply reaches here instead, so fail it loudly. phase == "" is
+	// create time -- the same scope the gate below uses.
+	if lt.Status.Phase == "" && lt.Spec.StartAt != nil && !lt.Spec.Suspended {
+		return r.failLoadTest(ctx, &lt,
+			"spec.startAt requires spec.suspended=true; otherwise the schedule is ignored and the test starts immediately")
+	}
+
 	// Strict create-time gate.
 	if lt.Status.Phase == "" && !lt.Spec.Suspended && env.Status.Phase != dfaasv1.EnvReady && env.Status.Phase != dfaasv1.EnvDegraded {
 		return r.failLoadTest(ctx, &lt,
