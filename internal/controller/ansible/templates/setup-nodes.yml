@@ -168,7 +168,7 @@
         cmd: >-
           curl -sfL https://get.k3s.io |
           {{ ('INSTALL_K3S_VERSION=' ~ k3s_version) if k3s_version else '' }}
-          INSTALL_K3S_EXEC="--disable traefik --disable servicelb --node-ip {{ ansible_host }}" sh -
+          INSTALL_K3S_EXEC="--disable traefik --disable servicelb" sh -
       when: not k3s_bin.stat.exists
 
     # The dfaas-agent publishes AGENT_NODE_IP to its peers as "forward requests
@@ -177,9 +177,20 @@
     # spanning sites is the site-local one (e.g. a 192.168.252.x lab VM) and is
     # unroutable from the other sites — the mesh can form and offloading still
     # fails. {{ ansible_host }} is by definition the address the operator itself
-    # reaches this node on, so it is the right thing to advertise. --node-ip
-    # above covers fresh installs; this block self-heals nodes installed before
-    # it existed.
+    # reaches this node on, so it is the right thing to advertise.
+    #
+    # This block is the ONLY place node-ip is set. It used to be passed to
+    # INSTALL_K3S_EXEC as well, on the theory that the flag covered fresh
+    # installs and this block back-filled older ones. k3s does not let one win:
+    # it MERGES the CLI flag with config.yaml and hands kubelet the pair, so a
+    # fresh install died on
+    #     failed to run Kubelet: bad --node-ip "10.0.0.1,10.0.0.1":
+    #     must contain either a single IP or a dual-stack pair of IPs
+    # and systemd restarted it forever. It stayed invisible while every node
+    # already had k3s (the install task is skipped then, so ExecStart carried no
+    # --node-ip); wiping the nodes made the fresh path the only path and the
+    # crash-loop surfaced. Setting it here covers both cases: on a fresh install
+    # the block is created, which triggers the restart below.
     - name: Ensure k3s registers the reachable address as its node IP (idempotent)
       ansible.builtin.blockinfile:
         path: /etc/rancher/k3s/config.yaml
@@ -210,7 +221,14 @@
         kind: Node
         kubeconfig: "{{ k3s_config }}"
       register: node_list
-      until: node_list.resources | length > 0
+      # `is defined` first: when the API server is not up yet k8s_info FAILS
+      # instead of returning an empty list, and the registered variable then has
+      # no `resources` key at all. Referencing it bare makes Ansible abort the
+      # task on a Jinja undefined-attribute error rather than consume a retry —
+      # the 20 attempts below were never used once, and the failure surfaced to
+      # the Environment Condition as "'dict object' has no attribute
+      # 'resources'", which says nothing about the real problem.
+      until: node_list.resources is defined and node_list.resources | length > 0
       retries: 20
       delay: 5
 
