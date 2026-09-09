@@ -128,7 +128,7 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 	// The GO signal (syncStart) served its purpose once every runner has
 	// finished — best-effort hygiene, stale objects are harmless.
 	if lt.Spec.SyncStart {
-		logStatusErr(ctx, "delete GO signal (test finished)", deleteGoSignal(ctx, lt))
+		logStatusErr(ctx, "delete GO signal (test finished)", r.syncChannel().DeleteGo(ctx, lt))
 	}
 
 	// All TestRuns done cleanly → stamp EndTime and move to Exporting.
@@ -314,7 +314,7 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 	if job.Status.Succeeded > 0 || jobConditionTrue(&job, batchv1.JobComplete) {
 		logger.Info("exporter Job succeeded")
 		// Summaries consumed by the exporter — sweep them off the filer.
-		logStatusErr(ctx, "delete k6 summaries", deleteSummaryObjects(ctx, lt))
+		logStatusErr(ctx, "delete k6 summaries", r.syncChannel().DeleteSummaries(ctx, lt))
 		r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
 			metav1.ConditionTrue, dfaasv1.LTReasonExportSucceeded,
 			"metrics exported")
@@ -327,7 +327,7 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 	// that may yet succeed (same backoff-aware pattern as the Ansible Jobs).
 	if jobConditionTrue(&job, batchv1.JobFailed) {
 		// Nothing will consume the summaries anymore — sweep them.
-		logStatusErr(ctx, "delete k6 summaries", deleteSummaryObjects(ctx, lt))
+		logStatusErr(ctx, "delete k6 summaries", r.syncChannel().DeleteSummaries(ctx, lt))
 		r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
 			metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
 			"exporter Job reported Failed")

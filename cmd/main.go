@@ -41,6 +41,7 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/controller"
 	"dfaas-operator/internal/k6dispatch"
+	"dfaas-operator/internal/syncchannel"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -175,6 +176,9 @@ func main() {
 		// Cache-bypassing reader for the single-active-test-per-Environment
 		// gate, which must not decide from a stale informer snapshot.
 		APIReader: mgr.GetAPIReader(),
+		// The filer bases are resolved here, once, from the environment --
+		// never per operation.
+		Sync: syncchannel.FromEnv(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "LoadTest")
 		os.Exit(1)

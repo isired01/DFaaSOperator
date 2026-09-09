@@ -13,6 +13,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -31,6 +32,7 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/controller/statuswriter"
 	"dfaas-operator/internal/k6dispatch"
+	"dfaas-operator/internal/syncchannel"
 )
 
 const loadTestFinalizer = "dfaas.dfaas.io/loadtest-finalizer"
@@ -54,6 +56,25 @@ type LoadTestReconciler struct {
 	// calls, so a lagging cache can show two tests an empty Environment.
 	// Nil-safe: falls back to the cached client when unset (unit tests).
 	APIReader client.Reader
+	// Sync is the authless object channel shared with the k6 VMs: the GO
+	// signal that opens the Sync barrier and the per-Generator summaries.
+	// Nil-safe -- syncChannel() falls back to one resolved from the
+	// environment, resolved once for the whole process.
+	Sync syncchannel.Channel
+}
+
+// envSyncChannel is the process-wide fallback: the bases are read from the
+// environment exactly once, never per operation.
+var envSyncChannel = sync.OnceValue(func() syncchannel.Channel {
+	return syncchannel.FromEnv()
+})
+
+// syncChannel is the nil-safe accessor for Sync.
+func (r *LoadTestReconciler) syncChannel() syncchannel.Channel {
+	if r.Sync != nil {
+		return r.Sync
+	}
+	return envSyncChannel()
 }
 
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=loadtests,verbs=get;list;watch;create;update;patch;delete

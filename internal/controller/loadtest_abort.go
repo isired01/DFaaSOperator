@@ -53,11 +53,11 @@ func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
 
 	// The GO signal (syncStart) is moot once the test is aborted — hygiene.
 	if lt.Spec.SyncStart {
-		logStatusErr(ctx, "delete GO signal (abort)", deleteGoSignal(ctx, lt))
+		logStatusErr(ctx, "delete GO signal (abort)", r.syncChannel().DeleteGo(ctx, lt))
 	}
 	// Any k6 summaries already uploaded will never be consumed — sweep them.
 	// Unconditional: DFAAS_SUMMARY_URL is injected regardless of syncStart.
-	logStatusErr(ctx, "delete k6 summaries (abort)", deleteSummaryObjects(ctx, lt))
+	logStatusErr(ctx, "delete k6 summaries (abort)", r.syncChannel().DeleteSummaries(ctx, lt))
 
 	// K6Healthy still carries the last count observed while the test was
 	// running ("0/2 finished, 0 error, 2 running"). The teardown above just
@@ -197,11 +197,11 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 
 	// Every target NotFound on its remote — safe to release.
 	if lt.Spec.SyncStart {
-		logStatusErr(ctx, "delete GO signal (loadtest deletion)", deleteGoSignal(ctx, lt))
+		logStatusErr(ctx, "delete GO signal (loadtest deletion)", r.syncChannel().DeleteGo(ctx, lt))
 	}
 	// Finalizer path is the catch-all sweep for k6 summaries: covers every
 	// exit that skipped cleanup (crash, Failed before the exporter ran, …).
-	logStatusErr(ctx, "delete k6 summaries (loadtest deletion)", deleteSummaryObjects(ctx, lt))
+	logStatusErr(ctx, "delete k6 summaries (loadtest deletion)", r.syncChannel().DeleteSummaries(ctx, lt))
 	logger.Info("all remote TestRuns reclaimed — removing loadtest finalizer")
 	return ctrl.Result{}, r.removeLTFinalizer(ctx, lt)
 }

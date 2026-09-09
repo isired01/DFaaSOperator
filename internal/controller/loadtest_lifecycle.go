@@ -79,7 +79,7 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 	// Synchronized start needs a VM-facing GO URL before anything is
 	// dispatched — fail loudly instead of parking every runner on a barrier
 	// nobody can open (e.g. `make run` without DFAAS_SYNC_PUBLIC_URL).
-	if lt.Spec.SyncStart && syncGoURL(lt) == "" {
+	if lt.Spec.SyncStart && r.syncChannel().GoURL(lt) == "" {
 		return r.failLoadTest(ctx, lt,
 			"synchronized start: cannot resolve the VM-facing GO URL — set DFAAS_SYNC_PUBLIC_URL (or run in-cluster with HOST_IP injected)")
 	}
@@ -236,9 +236,9 @@ func (r *LoadTestReconciler) dispatchOne(ctx context.Context, lt *dfaasv1.LoadTe
 // runnerEnv is what the reconciler decides about the k6 runner's environment:
 // the URLs the generated script talks to. The dispatcher only carries them.
 func (r *LoadTestReconciler) runnerEnv(lt *dfaasv1.LoadTest, nodeID string) k6dispatch.RunnerEnv {
-	env := k6dispatch.RunnerEnv{SummaryURL: summaryURL(lt, nodeID)}
+	env := k6dispatch.RunnerEnv{SummaryURL: r.syncChannel().SummaryURL(lt, nodeID)}
 	if lt.Spec.SyncStart {
-		env.SyncURL = syncGoURL(lt)
+		env.SyncURL = r.syncChannel().GoURL(lt)
 	}
 	return env
 }

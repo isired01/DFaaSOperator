@@ -13,9 +13,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
-	"os"
 	"sync/atomic"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -32,6 +29,7 @@ import (
 
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/k6dispatch/fake"
+	syncfake "dfaas-operator/internal/syncchannel/fake"
 )
 
 // These specs drive LoadTestReconciler.Reconcile — the module's actual
@@ -42,12 +40,15 @@ import (
 // deletion finalizer, and not one of Reconcile's ordering guards.
 var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 	var (
-		ctx    context.Context
-		ns     string
-		fleet  *fake.Fleet
-		r      *LoadTestReconciler
-		filer  *httptest.Server
-		filerN atomic.Int32
+		ctx   context.Context
+		ns    string
+		fleet *fake.Fleet
+		r     *LoadTestReconciler
+		// The object channel shared with the k6 VMs, recorded rather than
+		// served: every operation is named, so "GO published exactly once"
+		// is an assertion on a call list instead of a counter comparison on
+		// undifferentiated HTTP hits.
+		channel *syncfake.Channel
 	)
 	var nsCounter atomic.Int32
 
@@ -142,23 +143,11 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 
 		fleet = fake.New()
-		r = &LoadTestReconciler{Client: k8sClient, Scheme: scheme.Scheme, Dispatcher: fleet}
-
-		// The sync/summary paths talk to the SeaweedFS filer over HTTP; point
-		// them at a local server so they are fast and observable.
-		filerN.Store(0)
-		filer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			filerN.Add(1)
-			w.WriteHeader(http.StatusNoContent)
-		}))
-		os.Setenv("DFAAS_FILER_URL", filer.URL)
-		os.Setenv("DFAAS_SYNC_PUBLIC_URL", filer.URL)
-	})
-
-	AfterEach(func() {
-		filer.Close()
-		os.Unsetenv("DFAAS_FILER_URL")
-		os.Unsetenv("DFAAS_SYNC_PUBLIC_URL")
+		channel = &syncfake.Channel{Public: "http://vm-facing.test:30901"}
+		r = &LoadTestReconciler{
+			Client: k8sClient, Scheme: scheme.Scheme,
+			Dispatcher: fleet, Sync: channel,
+		}
 	})
 
 	It("dispatches one TestRun per generator, then goes Running", func() {
@@ -265,9 +254,9 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 		Expect(fresh.Status.Phase).NotTo(Equal(dfaasv1.LoadTestRunning))
 		Expect(fleet.Applied()).To(HaveLen(2))
 		for _, a := range fleet.Applied() {
-			Expect(a.Env.SyncURL).To(HavePrefix(filer.URL))
+			Expect(a.Env.SyncURL).To(HavePrefix("http://vm-facing.test:30901"))
 		}
-		goPuts := filerN.Load()
+		Expect(channel.Count("PublishGo")).To(BeZero(), "GO must not be published while a runner is still creating")
 
 		// One runner parked, one still creating: still held.
 		fleet.SetStage("gen-a", lt, "started")
@@ -280,7 +269,8 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 		fresh = reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestRunning))
 		Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
 		Expect(cond(fresh, dfaasv1.LTCondSyncReady).Reason).To(Equal(dfaasv1.LTReasonGoPublished))
-		Expect(filerN.Load()).To(BeNumerically(">", goPuts))
+		// Exactly once, and only after every TestRun reported started.
+		Expect(channel.Count("PublishGo")).To(Equal(1))
 	})
 
 	It("aborts on spec.stop: every remote TestRun deleted, phase Aborted with the user's reason", func() {

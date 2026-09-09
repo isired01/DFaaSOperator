@@ -13,10 +13,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"net"
-	"net/http"
-	"os"
-	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -50,163 +46,10 @@ const syncWaitBudget = 5 * time.Minute
 // syncPollRequeue is the reconcile cadence while waiting on the barrier.
 const syncPollRequeue = 3 * time.Second
 
-// syncFilerBase is the in-cluster SeaweedFS filer endpoint the OPERATOR
-// writes the GO object to. Distinct from the VM-facing public URL.
-const syncFilerBase = "http://seaweedfs-all-in-one.monitoring.svc.cluster.local:8888"
-
-// syncFilerNodePort is the filer's NodePort, used to build the VM-facing GO
-// URL from the management node IP.
-const syncFilerNodePort = "30901"
-
-// syncRequestTimeout caps each filer HTTP call.
-const syncRequestTimeout = 10 * time.Second
-
-// operatorFilerBase is the filer endpoint the OPERATOR ITSELF dials (GO
-// signal publish/delete, summary cleanup). In-cluster the Service DNS works;
-// with `make run` outside the cluster it does not resolve, so DFAAS_FILER_URL
-// overrides it (e.g. http://<node-ip>:30901 — the filer NodePort). Distinct
-// from syncFilerBase uses that end up inside in-cluster consumers (the
-// exporter Job), which must keep the internal DNS endpoint.
-func operatorFilerBase() string {
-	if v := strings.TrimRight(os.Getenv("DFAAS_FILER_URL"), "/"); v != "" {
-		return v
-	}
-	return syncFilerBase
-}
-
-// syncGoPath is the filer path of the GO object for one LoadTest. Lives
-// outside /buckets so it never shows up as an S3 bucket.
-func syncGoPath(lt *dfaasv1.LoadTest) string {
-	return fmt.Sprintf("/dfaas-sync/%s/%s.go", lt.Namespace, lt.Name)
-}
-
-// k6 end-of-test summaries — same authless filer channel as the GO signal.
-// Each runner's handleSummary() PUTs its summary JSON to DFAAS_SUMMARY_URL
-// (VM-facing NodePort); the dataExporter Job GETs them back via the
-// in-cluster DNS endpoint and flattens them into the metrics CSV.
-
-// summaryDirPath is the per-LoadTest filer directory holding one summary
-// object per k6 node. Outside /buckets, like the GO object.
-func summaryDirPath(lt *dfaasv1.LoadTest) string {
-	return fmt.Sprintf("/dfaas-k6-summary/%s/%s", lt.Namespace, lt.Name)
-}
-
-// summaryPath is the filer path of one node's summary object.
-func summaryPath(lt *dfaasv1.LoadTest, nodeID string) string {
-	return fmt.Sprintf("%s/%s.json", summaryDirPath(lt), sanitize(nodeID))
-}
-
-// summaryURL is the VM-facing URL injected into the runner as
-// DFAAS_SUMMARY_URL. Empty when the public base is unresolvable — the
-// generated script then skips the upload (a missing summary only degrades
-// data richness, unlike the sync barrier which must fail loudly).
-func summaryURL(lt *dfaasv1.LoadTest, nodeID string) string {
-	base := syncPublicBase()
-	if base == "" {
-		return ""
-	}
-	return base + summaryPath(lt, nodeID)
-}
-
-// summaryFilerURL is the in-cluster URL the exporter Job fetches one node's
-// summary from. Composed operator-side so the exporter never has to
-// re-implement sanitize() (drift there would 404 every fetch).
-func summaryFilerURL(lt *dfaasv1.LoadTest, nodeID string) string {
-	return syncFilerBase + summaryPath(lt, nodeID)
-}
-
-// deleteSummaryObjects best-effort removes the whole per-LoadTest summary
-// directory (one recursive filer DELETE instead of N per-node ones — also
-// sweeps files from nodes later removed from the spec). Called once the
-// exporter has consumed the summaries, and from the abort/deletion paths.
-func deleteSummaryObjects(ctx context.Context, lt *dfaasv1.LoadTest) error {
-	ctx, cancel := context.WithTimeout(ctx, syncRequestTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
-		operatorFilerBase()+summaryDirPath(lt)+"/?recursive=true", nil)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("delete k6 summaries: filer returned %s", resp.Status)
-	}
-	return nil
-}
-
-// syncPublicBase resolves the base URL the k6 VMs poll the GO object from:
-// DFAAS_SYNC_PUBLIC_URL env override (Helm-injectable, for multi-subnet labs)
-// → else http://<HOST_IP>:30901 with HOST_IP injected via the downward API
-// (status.hostIP on the manager Deployment). Empty when neither is available
-// (e.g. `make run` outside the cluster without the override) — callers must
-// fail loudly rather than dispatch a barrier nobody can open.
-func syncPublicBase() string {
-	if v := strings.TrimRight(os.Getenv("DFAAS_SYNC_PUBLIC_URL"), "/"); v != "" {
-		return v
-	}
-	if ip := os.Getenv("HOST_IP"); ip != "" {
-		return "http://" + net.JoinHostPort(ip, syncFilerNodePort)
-	}
-	return ""
-}
-
-// syncGoURL is the full VM-facing URL injected into the runner as
-// DFAAS_SYNC_URL. Empty when syncPublicBase is unresolvable.
-func syncGoURL(lt *dfaasv1.LoadTest) string {
-	base := syncPublicBase()
-	if base == "" {
-		return ""
-	}
-	return base + syncGoPath(lt)
-}
-
-// publishGoSignal PUTs the GO object on the filer. Idempotent: re-PUTting the
-// same path just rewrites the file.
-func publishGoSignal(ctx context.Context, lt *dfaasv1.LoadTest) error {
-	ctx, cancel := context.WithTimeout(ctx, syncRequestTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
-		operatorFilerBase()+syncGoPath(lt), strings.NewReader("go"))
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("put GO signal: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("put GO signal: filer returned %s", resp.Status)
-	}
-	return nil
-}
-
-// deleteGoSignal best-effort removes the GO object once the barrier is moot
-// (test finished, aborted, or deleted). Stale objects are harmless — this is
-// hygiene, so errors are only logged by callers via logStatusErr.
-func deleteGoSignal(ctx context.Context, lt *dfaasv1.LoadTest) error {
-	ctx, cancel := context.WithTimeout(ctx, syncRequestTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
-		operatorFilerBase()+syncGoPath(lt), nil)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	// Filer returns 204/202 on delete, 404 when already gone — all fine.
-	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("delete GO signal: filer returned %s", resp.Status)
-	}
-	return nil
-}
+// The filer addressing, the object layout and the HTTP calls all live in
+// internal/syncchannel now; the reconciler reaches them through
+// r.syncChannel(). What stays here is the barrier policy: how long to wait,
+// how often to poll, and what to do when a runner never parks.
 
 // awaitSyncBarrier is the post-dispatch gate for syncStart tests. It polls
 // every remote TestRun until all report stage "started" (runner up and parked
@@ -287,7 +130,7 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 		return ctrl.Result{RequeueAfter: syncPollRequeue}, nil
 	}
 
-	if err := publishGoSignal(ctx, lt); err != nil {
+	if err := r.syncChannel().PublishGo(ctx, lt); err != nil {
 		// Filer hiccup: retry on the poll cadence; the wait budget above still
 		// bounds the total time spent here.
 		logger.Error(err, "sync barrier: GO signal publish failed; retrying")

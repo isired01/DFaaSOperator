@@ -126,7 +126,7 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 	if len(k6Logs) > 0 {
 		sources := make([]k6SummarySource, 0, len(k6Logs))
 		for _, l := range k6Logs {
-			sources = append(sources, k6SummarySource{NodeID: l.NodeID, URL: summaryFilerURL(lt, l.NodeID)})
+			sources = append(sources, k6SummarySource{NodeID: l.NodeID, URL: r.syncChannel().InClusterSummaryURL(lt, l.NodeID)})
 		}
 		sourcesJSON, err := json.Marshal(sources)
 		if err != nil {

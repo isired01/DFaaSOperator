@@ -19,6 +19,8 @@ COPY api/ api/
 COPY internal/controller/ internal/controller/
 COPY internal/helm/ internal/helm/
 COPY internal/k6dispatch/ internal/k6dispatch/
+COPY internal/reach/ internal/reach/
+COPY internal/syncchannel/ internal/syncchannel/
 
 # Build
 # the GOARCH has not a default value to allow the binary be built according to the host where the command

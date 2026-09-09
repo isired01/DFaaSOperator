@@ -71,17 +71,20 @@ func TestSeaweedFSValues(t *testing.T) {
 	if !v.AllInOne.S3.Enabled || !v.AllInOne.S3.EnableAuth {
 		t.Error("allInOne.s3 must be enabled with auth, else no S3 gateway and no config Secret")
 	}
-	if v.AllInOne.S3.Port != 8333 {
-		t.Errorf("allInOne.s3.port = %d, want 8333", v.AllInOne.S3.Port)
+	if v.AllInOne.S3.Port != S3Port {
+		t.Errorf("allInOne.s3.port = %d, want %d", v.AllInOne.S3.Port, S3Port)
 	}
 	if v.AllInOne.Service.Type != "NodePort" {
 		t.Errorf("allInOne.service.type = %q, want NodePort", v.AllInOne.Service.Type)
 	}
-	if got := v.AllInOne.Service.NodePorts.S3; got != 30900 {
-		t.Errorf("S3 nodePort = %d, want 30900 (asset URL handed to k6)", got)
+	// These two are now pinned against the package's own constants, which is
+	// what every consumer builds its URLs from -- the values file and the code
+	// can finally disagree loudly instead of silently.
+	if got := v.AllInOne.Service.NodePorts.S3; got != S3NodePort {
+		t.Errorf("S3 nodePort = %d, want %d (asset URL handed to k6)", got, S3NodePort)
 	}
-	if got := v.AllInOne.Service.NodePorts.Filer; got != 30901 {
-		t.Errorf("filer nodePort = %d, want 30901 (syncStart GO signal + k6 summaries)", got)
+	if got := v.AllInOne.Service.NodePorts.Filer; got != FilerNodePort {
+		t.Errorf("filer nodePort = %d, want %d (syncStart GO signal + k6 summaries)", got, FilerNodePort)
 	}
 
 	admin := v.S3.Credentials.Admin
