@@ -17,12 +17,16 @@ The chart packages the CRDs, so `helm install` applies them for you. (`helm upgr
 
 ```bash
 helm install dfaas oci://ghcr.io/isired01/charts/dfaas \
-  --version 0.1.0 \
+  --version 2.5.1 \
   --create-namespace \
   --namespace dfaas-operator-system
 
-# Alternatively, install the chart straight from a repo checkout:
-# helm install dfaas ./charts/dfaas --create-namespace --namespace dfaas-operator-system
+# Alternatively, install the chart straight from a repo checkout. Chart.yaml ships
+# appVersion 0.0.0, and every image tag defaults to it, so pin a real one:
+# helm install dfaas ./charts/dfaas --create-namespace --namespace dfaas-operator-system \
+#   --set operator.image.tag=2.5.1 \
+#   --set operator.exporterImage.tag=2.5.1 \
+#   --set ui.image.tag=2.5.1
 ```
 
 The UI Service defaults to NodePort `30800`, so the control plane is reachable at
@@ -69,7 +73,7 @@ kubectl apply -f config/samples/dfaas_v1_loadtest.yaml
 ### Override values
 
 ```bash
-helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 0.1.0 \
+helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 2.5.1 \
   --set operator.replicas=2 \
   --set ui.ingress.enabled=true \
   --set ui.ingress.host=dfaas.mio-cluster.example

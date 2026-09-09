@@ -1,4 +1,12 @@
-{{- if .Values.ui.enabled }}
+{{- /*
+Skip the namespace Helm itself owns: with --create-namespace (the documented
+install) Helm creates the release namespace before applying any manifest, and a
+Namespace object for the same name then collides with it. Without the flag Helm
+cannot store the release secret at all, so the two failures used to leave the
+chart uninstallable either way. Namespaces other than the release one (the UI's,
+by default) are still ours to create.
+*/}}
+{{- if and .Values.ui.enabled (ne .Values.ui.namespace .Release.Namespace) }}
 apiVersion: v1
 kind: Namespace
 metadata:
