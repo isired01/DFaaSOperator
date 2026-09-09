@@ -13,7 +13,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"net"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -25,9 +24,6 @@ import (
 
 	dfaasv1 "dfaas-operator/api/v1"
 )
-
-// sshProbeTimeout caps each per-host SSH-reachability TCP dial (P6).
-const sshProbeTimeout = 2 * time.Second
 
 // sshAttemptsAnnotation persists the consecutive SSH-unreachable counter,
 // generation-scoped as "<generation>:<count>" so a spec edit restarts the
@@ -59,21 +55,6 @@ const healthMissesAnnotation = "dfaas.dfaas.io/health-misses"
 // unreachableRetryInterval is the cadence of the indefinite SSH re-probe run
 // while an Environment is in the non-terminal Unreachable phase.
 const unreachableRetryInterval = 30 * time.Second
-
-// probeSSH returns true if a TCP dial to ip:22 completes within
-// sshProbeTimeout. Cheap reachability check — does NOT verify an SSH
-// banner; that would require a real client + creds.
-func probeSSH(ip string) bool {
-	if ip == "" {
-		return false
-	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "22"), sshProbeTimeout)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
-}
 
 // reconcileReadyHealth runs the periodic SSH (:22) liveness probe while an
 // Environment is Ready. It replaces the old idle short-circuit: a node that
@@ -110,12 +91,7 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 		return ctrl.Result{RequeueAfter: wait}, nil
 	}
 
-	var unreachable []string
-	for _, n := range env.Spec.Nodes {
-		if !probeSSH(n.IPAddress) {
-			unreachable = append(unreachable, n.NodeID)
-		}
-	}
+	unreachable := r.prober().Unreachable(ctx, env)
 
 	if len(unreachable) == 0 {
 		if rerr := r.writer().Reset(ctx, env, healthMissesAnnotation); rerr != nil {
@@ -170,12 +146,7 @@ func (r *EnvironmentReconciler) reconcileUnreachable(ctx context.Context,
 		return ctrl.Result{RequeueAfter: wait}, nil
 	}
 
-	var unreachable []string
-	for _, n := range env.Spec.Nodes {
-		if !probeSSH(n.IPAddress) {
-			unreachable = append(unreachable, n.NodeID)
-		}
-	}
+	unreachable := r.prober().Unreachable(ctx, env)
 
 	if len(unreachable) > 0 {
 		logger.Info("environment still unreachable; will keep retrying",

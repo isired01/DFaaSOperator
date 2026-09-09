@@ -24,6 +24,7 @@ import (
 
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/controller/statuswriter"
+	"dfaas-operator/internal/reach"
 )
 
 const environmentFinalizer = "dfaas.dfaas.io/environment-finalizer"
@@ -47,6 +48,18 @@ type EnvironmentReconciler struct {
 	// milliseconds after the first — collapsing the health-miss budget. Nil-safe
 	// (unit tests leave it unset and fall back to the cached value).
 	APIReader client.Reader
+	// Prober answers which declared Nodes do not respond on :22. Nil-safe:
+	// prober() falls back to reach.TCP{}, the same convention APIReader and
+	// Clientset use here.
+	Prober reach.Prober
+}
+
+// prober is the nil-safe accessor for Prober.
+func (r *EnvironmentReconciler) prober() reach.Prober {
+	if r.Prober != nil {
+		return r.Prober
+	}
+	return reach.TCP{}
 }
 
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=environments,verbs=get;list;watch;create;update;patch;delete

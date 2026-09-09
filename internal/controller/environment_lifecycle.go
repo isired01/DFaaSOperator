@@ -97,12 +97,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 		return r.phase(ctx, env, dfaasv1.EnvProvisioningInfra)
 	}
 
-	var unreachable []string
-	for _, n := range env.Spec.Nodes {
-		if !probeSSH(n.IPAddress) {
-			unreachable = append(unreachable, n.NodeID)
-		}
-	}
+	unreachable := r.prober().Unreachable(ctx, env)
 	if len(unreachable) > 0 {
 		count, bumpErr := r.writer().Bump(ctx, env, sshAttemptsAnnotation)
 		if bumpErr != nil {
