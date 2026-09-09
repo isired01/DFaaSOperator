@@ -70,6 +70,13 @@ var envSyncChannel = sync.OnceValue(func() syncchannel.Channel {
 })
 
 // syncChannel is the nil-safe accessor for Sync.
+// budget builds one named Retry counter with its ceiling.
+func (r *LoadTestReconciler) budget(counter string, limit int) statuswriter.Budget[*dfaasv1.LoadTest, dfaasv1.LoadTestPhase] {
+	return statuswriter.Budget[*dfaasv1.LoadTest, dfaasv1.LoadTestPhase]{
+		Writer: r.writer(), Counter: counter, Limit: limit,
+	}
+}
+
 func (r *LoadTestReconciler) syncChannel() syncchannel.Channel {
 	if r.Sync != nil {
 		return r.Sync

@@ -97,26 +97,27 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 
 	unreachable := r.prober().Unreachable(ctx, env)
 	if len(unreachable) > 0 {
-		count, bumpErr := r.writer().Bump(ctx, env, sshAttemptsAnnotation)
+		budget := r.budget(sshAttemptsAnnotation, sshRetryBudget)
+		outcome, bumpErr := budget.Attempt(ctx, env)
 		if bumpErr != nil {
-			logger.Error(bumpErr, "bumpSSHAttempts failed; continuing without budget enforcement")
+			logger.Error(bumpErr, "bumpSSHAttempts failed; the budget cannot advance")
 		}
-		if count >= sshRetryBudget {
+		if outcome.Exhausted {
 			logger.Info("VMs not SSH-reachable after fast-retry budget; entering Unreachable (will keep retrying)",
-				"nodes", unreachable, "attempts", count)
+				"nodes", unreachable, "attempts", outcome.Count)
 			r.cond(ctx, env, dfaasv1.EnvCondVMsReady,
 				metav1.ConditionFalse, dfaasv1.EnvReasonSSHUnreachable,
 				fmt.Sprintf("SSH :22 dial failed for %v after %d fast attempts; retrying every %s",
-					unreachable, count, unreachableRetryInterval))
+					unreachable, outcome.Count, unreachableRetryInterval))
 			return r.phase(ctx, env, dfaasv1.EnvUnreachable)
 		}
-		logger.Info("VMs not SSH-reachable, retrying", "nodes", unreachable, "attempts", count)
+		logger.Info("VMs not SSH-reachable, retrying", "nodes", unreachable, "attempts", outcome.Count)
 		r.cond(ctx, env, dfaasv1.EnvCondVMsReady,
 			metav1.ConditionFalse, dfaasv1.EnvReasonSSHUnreachable,
 			fmt.Sprintf("SSH :22 dial failed for: %v", unreachable))
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
-	if rerr := r.writer().Reset(ctx, env, sshAttemptsAnnotation); rerr != nil {
+	if rerr := r.budget(sshAttemptsAnnotation, sshRetryBudget).Clear(ctx, env); rerr != nil {
 		logger.Error(rerr, "resetSSHAttempts failed; non-fatal")
 	}
 	r.cond(ctx, env, dfaasv1.EnvCondVMsReady,
@@ -223,23 +224,26 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 
 	mm := r.monitoringStack()
 	if derr := mm.Deploy(ctx); derr != nil {
-		count, bumpErr := r.writer().Bump(ctx, env, monitoringAttemptsAnnotation)
+		budget := r.budget(monitoringAttemptsAnnotation, monitoringRetryBudget)
+		outcome, bumpErr := budget.Attempt(ctx, env)
 		if bumpErr != nil {
-			logger.Error(bumpErr, "bumpMonitoringAttempts failed; continuing without budget enforcement")
+			logger.Error(bumpErr, "bumpMonitoringAttempts failed; the budget cannot advance")
 		}
-		if count >= monitoringRetryBudget {
+		if outcome.Exhausted {
 			r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 				metav1.ConditionFalse, dfaasv1.EnvReasonHelmFailed,
 				fmt.Sprintf("monitoring Helm install failed %d consecutive times: %s",
-					count, condMessage(derr)))
+					outcome.Count, condMessage(derr)))
 			return false, true, nil
 		}
 		// P7 + P14: first ever observation is Unknown; subsequent retries
 		// stay False/HelmInstalling. The sanitized message keeps
 		// LastTransitionTime stable across reconciles when the error class
-		// is the same.
+		// is the same. Outcome.First names what count == 1 meant -- and when
+		// the counter could not be written it is false, so an unknown count
+		// reads as a failure rather than as a first observation.
 		condStatus := metav1.ConditionFalse
-		if count == 1 {
+		if outcome.First {
 			condStatus = metav1.ConditionUnknown
 		}
 		r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
@@ -247,7 +251,7 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 			"monitoring Helm install in progress / retrying: "+condMessage(derr))
 		return false, false, nil
 	}
-	if rerr := r.writer().Reset(ctx, env, monitoringAttemptsAnnotation); rerr != nil {
+	if rerr := r.budget(monitoringAttemptsAnnotation, monitoringRetryBudget).Clear(ctx, env); rerr != nil {
 		logger.Error(rerr, "resetMonitoringAttempts failed; non-fatal")
 	}
 	ready, checkErr := mm.Check(ctx)

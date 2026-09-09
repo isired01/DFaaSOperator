@@ -67,7 +67,7 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 			return res, oerr
 		}
 		// Successful dispatcher round-trip — reset the budget counter.
-		if rerr := r.writer().Reset(ctx, lt, dispatchAttemptsAnnotation); rerr != nil {
+		if rerr := r.budget(dispatchAttemptsAnnotation, dispatchRetryBudget).Clear(ctx, lt); rerr != nil {
 			logger.Error(rerr, "resetDispatchAttempts failed; non-fatal")
 		}
 		updatedRefs[i].Phase = stage

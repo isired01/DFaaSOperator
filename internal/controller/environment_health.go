@@ -94,7 +94,7 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 	unreachable := r.prober().Unreachable(ctx, env)
 
 	if len(unreachable) == 0 {
-		if rerr := r.writer().Reset(ctx, env, healthMissesAnnotation); rerr != nil {
+		if rerr := r.budget(healthMissesAnnotation, healthRetryBudget).Clear(ctx, env); rerr != nil {
 			logger.Error(rerr, "resetHealthMisses failed; non-fatal")
 		}
 		if err := r.markNodesReachable(ctx, env); err != nil {
@@ -103,26 +103,29 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 		return ctrl.Result{RequeueAfter: healthCheckInterval}, nil
 	}
 
-	count, bumpErr := r.writer().Bump(ctx, env, healthMissesAnnotation)
+	budget := r.budget(healthMissesAnnotation, healthRetryBudget)
+	outcome, bumpErr := budget.Attempt(ctx, env)
 	if bumpErr != nil {
-		logger.Error(bumpErr, "bumpHealthMisses failed; continuing without budget enforcement")
+		logger.Error(bumpErr, "bumpHealthMisses failed; the budget cannot advance")
 	}
 	if r.Recorder != nil {
 		r.Recorder.Eventf(env, corev1.EventTypeWarning, dfaasv1.EnvReasonSSHUnreachable,
-			"SSH :22 unreachable for nodes %v (attempt %d/%d)", unreachable, count, healthRetryBudget)
+			"SSH :22 unreachable for nodes %v (attempt %s)", unreachable, budget.Attempts(outcome))
 	}
-	if count >= healthRetryBudget {
+	if outcome.Exhausted {
 		logger.Info("Ready environment nodes unreachable; entering Unreachable (will keep retrying)",
-			"nodes", unreachable, "attempts", count)
+			"nodes", unreachable, "attempts", outcome.Count)
 		logStatusErr(ctx, "mark NodesReachable=False (entering Unreachable)", r.markNodesUnreachable(ctx, env,
 			fmt.Sprintf("SSH :22 dial failed for %v after %d consecutive health checks; retrying every %s",
-				unreachable, count, unreachableRetryInterval)))
+				unreachable, outcome.Count, unreachableRetryInterval)))
 		return r.phase(ctx, env, dfaasv1.EnvUnreachable)
 	}
 	logger.Info("Ready environment nodes unreachable; will retry",
-		"nodes", unreachable, "attempts", count)
+		"nodes", unreachable, "attempts", outcome.Count)
+	// budget.Attempts renders "?/3" when the counter could not be written --
+	// this message used to say "attempt 0/3", which reads as a measurement.
 	logStatusErr(ctx, "mark NodesReachable=False (retrying)", r.markNodesUnreachable(ctx, env,
-		fmt.Sprintf("SSH :22 dial failed for %v (attempt %d/%d)", unreachable, count, healthRetryBudget)))
+		fmt.Sprintf("SSH :22 dial failed for %v (attempt %s)", unreachable, budget.Attempts(outcome))))
 	return ctrl.Result{RequeueAfter: healthRetryInterval}, nil
 }
 
@@ -158,10 +161,10 @@ func (r *EnvironmentReconciler) reconcileUnreachable(ctx context.Context,
 
 	// All nodes answer again. Clear both unreachable counters (no-op when zero)
 	// and pick the recovery target.
-	if rerr := r.writer().Reset(ctx, env, healthMissesAnnotation); rerr != nil {
+	if rerr := r.budget(healthMissesAnnotation, healthRetryBudget).Clear(ctx, env); rerr != nil {
 		logger.Error(rerr, "resetHealthMisses failed; non-fatal")
 	}
-	if rerr := r.writer().Reset(ctx, env, sshAttemptsAnnotation); rerr != nil {
+	if rerr := r.budget(sshAttemptsAnnotation, sshRetryBudget).Clear(ctx, env); rerr != nil {
 		logger.Error(rerr, "resetSSHAttempts failed; non-fatal")
 	}
 

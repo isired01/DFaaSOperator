@@ -211,6 +211,14 @@ func (r *EnvironmentReconciler) writer() statuswriter.Writer[*dfaasv1.Environmen
 	}
 }
 
+// budget builds one named Retry counter with its ceiling. The counters stay
+// generation-scoped (ADR-0003); Budget owns only the policy on top.
+func (r *EnvironmentReconciler) budget(counter string, limit int) statuswriter.Budget[*dfaasv1.Environment, dfaasv1.EnvironmentPhase] {
+	return statuswriter.Budget[*dfaasv1.Environment, dfaasv1.EnvironmentPhase]{
+		Writer: r.writer(), Counter: counter, Limit: limit,
+	}
+}
+
 // cond stamps one Condition, best-effort (logged, never fatal).
 func (r *EnvironmentReconciler) cond(ctx context.Context, env *dfaasv1.Environment,
 	condType string, status metav1.ConditionStatus, reason, message string) {

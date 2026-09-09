@@ -49,26 +49,29 @@ const dispatchRetryBudget = 15
 func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 	lt *dfaasv1.LoadTest, dispatchErr error, subReason string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	count, bumpErr := r.writer().Bump(ctx, lt, dispatchAttemptsAnnotation)
+	budget := r.budget(dispatchAttemptsAnnotation, dispatchRetryBudget)
+	outcome, bumpErr := budget.Attempt(ctx, lt)
 	if bumpErr != nil {
-		logger.Error(bumpErr, "bumpDispatchAttempts failed; continuing without budget enforcement")
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		// The round still happened, so it is still stamped -- this used to
+		// return here, so a persistently conflicting annotation Update left the
+		// LoadTest requeuing every 10s forever with no K6Dispatched Condition
+		// ever written and nothing but a log line to show for it.
+		logger.Error(bumpErr, "bumpDispatchAttempts failed; the budget cannot advance")
 	}
-	if count >= dispatchRetryBudget {
+
+	if outcome.Exhausted {
 		detail := fmt.Sprintf("remote dispatch failed %d consecutive times: %s",
-			count, condMessage(dispatchErr))
+			outcome.Count, condMessage(dispatchErr))
 		r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched,
 			metav1.ConditionFalse, dfaasv1.LTReasonDispatchFailed, detail)
-		res, err := r.phase(ctx, lt, dfaasv1.LoadTestFailed,
+		return r.phase(ctx, lt, dfaasv1.LoadTestFailed,
 			dfaasv1.LTReasonDispatchFailed, detail)
-		return res, err
 	}
 	// P13: sub-reason (ScriptMirrorFailed / StaleCleanupFailed / ApplyFailed)
 	// carries the diagnostic detail, retry-budget counter is in the message.
 	r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched,
 		metav1.ConditionFalse, subReason,
-		fmt.Sprintf("attempt %d/%d: %s",
-			count, dispatchRetryBudget, condMessage(dispatchErr)))
+		fmt.Sprintf("attempt %s: %s", budget.Attempts(outcome), condMessage(dispatchErr)))
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
@@ -128,7 +131,7 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 		}
 		// Successful dispatcher round-trip — reset the budget counter and
 		// surface partial progress on K6Dispatched (P9).
-		if rerr := r.writer().Reset(ctx, lt, dispatchAttemptsAnnotation); rerr != nil {
+		if rerr := r.budget(dispatchAttemptsAnnotation, dispatchRetryBudget).Clear(ctx, lt); rerr != nil {
 			log.FromContext(ctx).Error(rerr, "resetDispatchAttempts failed; non-fatal")
 		}
 		if len(refs) < len(lt.Spec.PerNodeLoad) {
