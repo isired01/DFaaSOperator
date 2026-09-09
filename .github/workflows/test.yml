@@ -1,0 +1,38 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # A CRD field that exists only in Go compiles, passes every unit test,
+      # and is then pruned by the API server at runtime. Nothing downstream can
+      # catch that, so catch it here.
+      - name: Generated artifacts are committed
+        run: |
+          make manifests generate fmt
+          git diff --exit-code
+
+      # The chart ships its own copy of the CRDs; they are what a real install
+      # applies. A stale copy prunes the field just as silently.
+      - name: Chart CRDs match config/crd/bases
+        run: |
+          for f in dfaas.dfaas.io_environments.yaml dfaas.dfaas.io_loadtests.yaml; do
+            diff -u "config/crd/bases/$f" "charts/dfaas/crds/$f"
+          done
+
+      # make test = manifests + generate + fmt + vet + envtest assets + go test
+      # over `go list ./... | grep -v /e2e`. Never run ./test/e2e here: it
+      # applies cert-manager and the prometheus-operator bundle to whatever
+      # kubeconfig context is active, with no guard.
+      - run: make test
