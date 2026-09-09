@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -17,8 +18,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithy "github.com/aws/smithy-go"
@@ -242,90 +241,99 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 
 func main() {
-	// 1. Read parameters from env vars (set by the operator).
-	promURL := os.Getenv("PROM_URL")
-	startStr := os.Getenv("START_TIME")
-	endStr := os.Getenv("END_TIME")
-	stepStr := os.Getenv("STEP")
-	expName := os.Getenv("EXP_NAME")
-	metricsJSON := os.Getenv("METRICS_JSON")
-
-	if metricsJSON == "" {
-		log.Fatalf("METRICS_JSON env var is empty")
-	}
-	var metrics []MetricEntry
-	if err := json.Unmarshal([]byte(metricsJSON), &metrics); err != nil {
-		log.Fatalf("METRICS_JSON parse error: %v", err)
-	}
-	if len(metrics) == 0 {
-		log.Fatalf("METRICS_JSON contains zero entries")
+	cfg, err := ConfigFromEnv()
+	if err != nil {
+		log.Fatalf("%v", err)
 	}
 
-	// 2. Parse times and step.
-	start, err := time.Parse(time.RFC3339, startStr)
-	if err != nil {
-		log.Fatalf("parse START_TIME %q: %v", startStr, err)
-	}
-	end, err := time.Parse(time.RFC3339, endStr)
-	if err != nil {
-		log.Fatalf("parse END_TIME %q: %v", endStr, err)
-	}
-	step, err := time.ParseDuration(stepStr)
-	if err != nil {
-		log.Fatalf("parse STEP %q: %v", stepStr, err)
-	}
+	ctx := context.Background()
 
-	// 3. Set up Prometheus client.
-	client, err := api.NewClient(api.Config{Address: promURL})
+	querier, err := newPromQuerier(cfg.PromURL)
 	if err != nil {
 		log.Fatalf("Prometheus client: %v", err)
 	}
-	promAPI := v1.NewAPI(client)
 
-	// 4. Create local (temporary) CSV file.
-	outDir := "tmp/export"
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		log.Fatalf("create directory %s: %v", outDir, err)
-	}
-	fileName := fmt.Sprintf("%s/%s_report.csv", outDir, expName)
-	file, err := os.Create(fileName)
+	sink, err := newSink(ctx, cfg.S3)
 	if err != nil {
-		log.Fatalf("create CSV file: %v", err)
+		log.Fatalf("destination: %v", err)
 	}
 
-	writer := csv.NewWriter(file)
+	rows, err := run(ctx, cfg, querier, sink)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	fmt.Printf("export complete: %d CSV rows\n", rows)
+}
+
+// newSink picks the destination. No S3 config is not an error: the CSV goes to
+// stdout between markers, recoverable with `kubectl logs`.
+func newSink(ctx context.Context, cfg S3Config) (Sink, error) {
+	if !cfg.Enabled() {
+		fmt.Println("S3 not configured. Artifacts will be dumped to stdout.")
+		return StdoutSink{Out: os.Stdout}, nil
+	}
+	return NewS3Sink(ctx, cfg)
+}
+
+// Querier is the metrics source. The concrete Prometheus client is a struct
+// with no interface, built inside main from an env var, which is why the query
+// loop and the CSV layout below were unreachable by any test.
+type Querier interface {
+	// Range runs one range query. Prometheus warnings come back separately:
+	// they are not errors, but they explain a partial or truncated result.
+	Range(ctx context.Context, query string, r PromRange) (model.Matrix, []string, error)
+}
+
+type promQuerier struct{ api v1.API }
+
+func newPromQuerier(url string) (Querier, error) {
+	client, err := api.NewClient(api.Config{Address: url})
+	if err != nil {
+		return nil, err
+	}
+	return promQuerier{api: v1.NewAPI(client)}, nil
+}
+
+func (p promQuerier) Range(ctx context.Context, query string, r PromRange) (model.Matrix, []string, error) {
+	result, warnings, err := p.api.QueryRange(ctx, query, v1.Range{Start: r.Start, End: r.End, Step: r.Step})
+	if err != nil {
+		return nil, warnings, err
+	}
+	matrix, ok := result.(model.Matrix)
+	if !ok {
+		return nil, warnings, fmt.Errorf("non-Matrix result (type=%T)", result)
+	}
+	return matrix, warnings, nil
+}
+
+// run is the whole export, with no environment, no clock and no network of its
+// own: it queries through q and stores through sink. It returns the number of
+// CSV rows written, and an error only for what must fail the exporter Job --
+// which is the metrics CSV and nothing else.
+func run(ctx context.Context, cfg Config, q Querier, sink Sink) (int, error) {
+	var csvBuf bytes.Buffer
+	writer := csv.NewWriter(&csvBuf)
 	_ = writer.Write([]string{
 		"Timestamp", "ID_Nodo", "Type", "MetricName", "Query", "Comment", "Valore", "Labels",
 	})
 
-	// 5. Pull data from Prometheus.
-	ctx := context.Background()
-	queryRange := v1.Range{Start: start, End: end, Step: step}
-
-	fmt.Printf("starting metrics export for experiment: %s\n", expName)
+	fmt.Printf("starting metrics export for experiment: %s\n", cfg.ExpName)
 	var attempted, errored, rowsWritten int
-	for _, m := range metrics {
+	for _, m := range cfg.Metrics {
 		if m.Query == "" {
 			fmt.Printf("skipping entry %q: empty query\n", m.MetricName)
 			continue
 		}
 		attempted++
 
-		result, warnings, err := promAPI.QueryRange(ctx, m.Query, queryRange)
-		if err != nil {
-			fmt.Printf("query error %s (%s): %v\n", m.MetricName, m.Query, err)
-			errored++
-			continue
-		}
+		matrix, warnings, err := q.Range(ctx, m.Query, cfg.Range)
 		// Warnings are not errors, but they explain partial or truncated
 		// results (series limits, lookback misses) during a post-mortem.
 		if len(warnings) > 0 {
 			fmt.Printf("query %s: Prometheus warnings: %s\n", m.MetricName, strings.Join(warnings, "; "))
 		}
-
-		matrix, ok := result.(model.Matrix)
-		if !ok {
-			fmt.Printf("query %s: non-Matrix result (type=%T), skipping\n", m.MetricName, result)
+		if err != nil {
+			fmt.Printf("query error %s (%s): %v\n", m.MetricName, m.Query, err)
 			errored++
 			continue
 		}
@@ -358,121 +366,93 @@ func main() {
 	// Fail loudly when the export captured nothing: a header-only CSV that
 	// uploads fine still lets the LoadTest report Completed with no data
 	// (Prometheus unreachable, all queries wrong, or the samples were lost to a
-	// restart). Exit non-zero so the exporter Job — and thus the LoadTest —
-	// fails instead of silently "succeeding" with an empty result.
+	// restart). An error here exits non-zero, so the exporter Job -- and thus
+	// the LoadTest -- fails instead of silently "succeeding" with an empty
+	// result. It used to be a log.Fatalf, testable only by spawning a
+	// subprocess.
 	if attempted > 0 && rowsWritten == 0 {
-		log.Fatalf("metrics export produced 0 data points across %d queries (%d errored); "+
-			"refusing to report success with an empty CSV — check Prometheus reachability and the queries", attempted, errored)
+		return 0, fmt.Errorf("metrics export produced 0 data points across %d queries (%d errored); "+
+			"refusing to report success with an empty CSV — check Prometheus reachability and the queries",
+			attempted, errored)
 	}
 
-	// 5b. k6 end-of-test summaries: fetch each node's handleSummary JSON from
-	// the SeaweedFS filer and flatten every metric into the same CSV, plus an
-	// __all__ aggregate row set. Unset env var (scripts generated before the
-	// feature, or no k6 nodes) → skip entirely. Never fatal: the Prometheus
-	// rows above are still valuable on partial or total summary loss.
+	// k6 end-of-test summaries: fetch each Generator's handleSummary JSON from
+	// the filer and flatten every metric into the same CSV, plus an __all__
+	// aggregate row set. No sources (scripts generated before the feature, or
+	// no Generators) skips it. Never fatal: the Prometheus rows above are still
+	// valuable on partial or total summary loss.
 	var summaryRaw map[string][]byte
-	if src := os.Getenv("K6_SUMMARY_SOURCES"); src != "" {
-		var sources []summarySource
-		if err := json.Unmarshal([]byte(src), &sources); err != nil {
-			fmt.Printf("K6_SUMMARY_SOURCES parse error: %v\n", err)
-		} else {
-			byNode, raw := fetchSummaries(ctx, sources)
-			summaryRaw = raw
-			summaryRows := 0
-			for _, nodeID := range sortedKeys(byNode) {
-				for _, row := range flattenSummaryRows(nodeID, endStr, byNode[nodeID]) {
-					_ = writer.Write(row)
-					summaryRows++
-				}
-			}
-			for _, row := range aggregateSummaryRows(endStr, byNode) {
+	if len(cfg.Summaries) > 0 {
+		byNode, raw := fetchSummaries(ctx, cfg.Summaries)
+		summaryRaw = raw
+		summaryRows := 0
+		endStr := cfg.EndTimeString()
+		for _, nodeID := range sortedKeys(byNode) {
+			for _, row := range flattenSummaryRows(nodeID, endStr, byNode[nodeID]) {
 				_ = writer.Write(row)
 				summaryRows++
 			}
-			fmt.Printf("k6 summaries: %d/%d nodes fetched, %d CSV rows\n",
-				len(byNode), len(sources), summaryRows)
 		}
+		for _, row := range aggregateSummaryRows(endStr, byNode) {
+			_ = writer.Write(row)
+			summaryRows++
+		}
+		fmt.Printf("k6 summaries: %d/%d nodes fetched, %d CSV rows\n",
+			len(byNode), len(cfg.Summaries), summaryRows)
 	}
 
-	// Close writer + file before reading / uploading.
 	writer.Flush()
 	if err := writer.Error(); err != nil {
-		log.Fatalf("CSV writer: %v", err)
-	}
-	if err := file.Close(); err != nil {
-		log.Fatalf("close CSV file: %v", err)
-	}
-	fmt.Printf("local export complete: %s\n", fileName)
-
-	// 6. Destination: S3 when S3_BUCKET_PREFIX is set, otherwise stdout. The
-	// bucket is computed once and reused by both the metrics CSV and the
-	// per-VM k6 logs.
-	bucketPrefix := os.Getenv("S3_BUCKET_PREFIX")
-	loadtestName := os.Getenv("LOADTEST_NAME")
-	s3Enabled := bucketPrefix != ""
-	var bucket string
-	if s3Enabled {
-		bucket = bucketNameFor(bucketPrefix, os.Getenv("ENV_UID"))
+		return rowsWritten, fmt.Errorf("CSV writer: %w", err)
 	}
 
-	if !s3Enabled {
-		fmt.Println("S3 not configured. Dumping CSV to stdout:")
-		dumpToStdout(fileName)
-	} else {
-		key := objectKeyFor(loadtestName)
-		if err := uploadToS3(ctx, fileName, bucket, key, "text/csv"); err != nil {
-			log.Fatalf("S3 upload: %v", err)
-		}
+	// The metrics CSV is the one artifact whose loss fails the run.
+	if err := sink.Put(ctx, Artifact{
+		Key:         objectKeyFor(cfg.LoadTestName),
+		Label:       "CSV",
+		ContentType: "text/csv",
+		Body:        bytes.NewReader(csvBuf.Bytes()),
+	}); err != nil {
+		return rowsWritten, fmt.Errorf("store metrics CSV: %w", err)
 	}
 
-	// 7. Per-VM k6 end-of-test summaries: one file per node under K6_LOG_DIR
-	// (projected from the operator's per-node ConfigMaps). Shipped the same
-	// way as metrics — S3 when configured, else stdout. A missing/empty dir
-	// (no k6 logs) is tolerated without error.
-	exportK6Logs(ctx, s3Enabled, bucket, loadtestName)
+	// Everything below is per-Generator: a failure warns and the run goes on.
+	shipK6Logs(ctx, cfg, sink)
+	shipK6Summaries(ctx, cfg, sink, summaryRaw)
 
-	// 8. Raw per-node handleSummary JSONs, verbatim: the official k6
-	// aggregates survive next to the flattened CSV rows.
-	exportK6Summaries(ctx, s3Enabled, bucket, loadtestName, summaryRaw)
+	return rowsWritten, nil
 }
 
-// exportK6Summaries ships each node's raw summary JSON: to S3 (sibling of the
-// k6 logs) when enabled, otherwise to stdout between per-node markers.
-// Per-node failures warn and continue, matching exportK6Logs.
-func exportK6Summaries(ctx context.Context, s3Enabled bool, bucket, loadtestName string, raw map[string][]byte) {
+// shipK6Summaries stores each Generator's raw handleSummary JSON, so the
+// official k6 aggregates survive next to the flattened CSV rows. Per-node
+// failures warn and continue.
+func shipK6Summaries(ctx context.Context, cfg Config, sink Sink, raw map[string][]byte) {
 	for _, nodeID := range sortedKeys(raw) {
-		if !s3Enabled {
-			fmt.Printf("----- BEGIN K6 SUMMARY %s -----\n", nodeID)
-			fmt.Println(string(raw[nodeID]))
-			fmt.Printf("----- END K6 SUMMARY %s -----\n", nodeID)
-			continue
-		}
-		path := fmt.Sprintf("tmp/export/%s-summary.json", nodeID)
-		if err := os.WriteFile(path, raw[nodeID], 0o644); err != nil {
-			fmt.Printf("k6 summary for node %s: write temp file: %v\n", nodeID, err)
-			continue
-		}
-		key := k6SummaryKeyFor(loadtestName, nodeID)
-		if err := uploadToS3(ctx, path, bucket, key, "application/json"); err != nil {
-			fmt.Printf("k6 summary S3 upload for node %s failed: %v\n", nodeID, err)
+		err := sink.Put(ctx, Artifact{
+			Key:         k6SummaryKeyFor(cfg.LoadTestName, nodeID),
+			Label:       "K6 SUMMARY " + nodeID,
+			ContentType: "application/json",
+			Body:        bytes.NewReader(raw[nodeID]),
+		})
+		if err != nil {
+			fmt.Printf("k6 summary for node %s failed: %v\n", nodeID, err)
 		}
 	}
 }
 
-// exportK6Logs reads each "<nodeID>.log" file under K6_LOG_DIR and ships it:
-// to S3 (k6ObjectKeyFor key) when S3 is enabled, otherwise to stdout between
-// per-node markers. No-op when K6_LOG_DIR is unset, missing, or empty.
-func exportK6Logs(ctx context.Context, s3Enabled bool, bucket, loadtestName string) {
-	dir := os.Getenv("K6_LOG_DIR")
-	if dir == "" {
+// shipK6Logs stores each "<nodeID>.log" under cfg.K6LogDir (projected from the
+// operator's per-node ConfigMaps). An unset, missing or empty dir is a no-op,
+// and one node's failure warns and continues -- the run already succeeded.
+func shipK6Logs(ctx context.Context, cfg Config, sink Sink) {
+	if cfg.K6LogDir == "" {
 		return
 	}
-	entries, err := os.ReadDir(dir)
+	entries, err := os.ReadDir(cfg.K6LogDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return
 		}
-		fmt.Printf("k6 log dir %q read error: %v\n", dir, err)
+		fmt.Printf("k6 log dir %q read error: %v\n", cfg.K6LogDir, err)
 		return
 	}
 
@@ -481,67 +461,27 @@ func exportK6Logs(ctx context.Context, s3Enabled bool, bucket, loadtestName stri
 			continue
 		}
 		nodeID := strings.TrimSuffix(e.Name(), ".log")
-		fullPath := dir + "/" + e.Name()
-
-		if s3Enabled {
-			key := k6ObjectKeyFor(loadtestName, nodeID)
-			if err := uploadToS3(ctx, fullPath, bucket, key, "text/plain"); err != nil {
-				fmt.Printf("k6 log S3 upload for node %s failed: %v\n", nodeID, err)
-			}
-			continue
-		}
-
-		data, rerr := os.ReadFile(fullPath)
+		data, rerr := os.ReadFile(cfg.K6LogDir + "/" + e.Name())
 		if rerr != nil {
 			fmt.Printf("read k6 log for node %s failed: %v\n", nodeID, rerr)
 			continue
 		}
-		fmt.Printf("----- BEGIN K6 %s -----\n", nodeID)
-		fmt.Print(string(data))
-		if len(data) > 0 && data[len(data)-1] != '\n' {
-			fmt.Println()
+		err := sink.Put(ctx, Artifact{
+			Key:         k6ObjectKeyFor(cfg.LoadTestName, nodeID),
+			Label:       "K6 " + nodeID,
+			ContentType: "text/plain",
+			Body:        bytes.NewReader(data),
+		})
+		if err != nil {
+			fmt.Printf("k6 log for node %s failed: %v\n", nodeID, err)
 		}
-		fmt.Printf("----- END K6 %s -----\n", nodeID)
 	}
 }
-
-// dumpToStdout reads the CSV and prints it to stdout between markers so it
-// can be recovered via `kubectl logs job/<exp>-exporter-job`.
-func dumpToStdout(fileName string) {
-	data, err := os.ReadFile(fileName)
-	if err != nil {
-		log.Fatalf("read csv: %v", err)
-	}
-	fmt.Println("----- BEGIN CSV -----")
-	fmt.Print(string(data))
-	fmt.Println("----- END CSV -----")
-}
-
-// s3UploadAttempts bounds the PutObject tries inside uploadToS3, and
-// s3RetryBackoff is the pause before the first retry (doubled each round: 2s
-// then 4s, so at most 6s of extra wall time). One flaky PutObject used to fail
-// the exporter Job and with it the whole LoadTest, even though the k6 run had
-// already succeeded. The AWS SDK retries connection-level faults on its own;
-// this outer loop also covers what it treats as terminal (e.g. a SeaweedFS
-// bucket still settling right after CreateBucket).
-const (
-	s3UploadAttempts = 3
-	s3RetryBackoff   = 2 * time.Second
-)
-
-// ensuredBuckets memoizes the HeadBucket → CreateBucket probe per bucket name:
-// every upload used to redo it (1 + 2N round trips per run, always against the
-// same bucket). Only successful probes are recorded, so a failed one is retried
-// by the next upload. The exporter is single-threaded, so a plain map suffices.
-var ensuredBuckets = map[string]bool{}
 
 // ensureBucket runs HeadBucket and, when the bucket is missing, CreateBucket.
-// Its result is memoized, so the probe costs at most one round trip per run.
+// Called once per run, from NewS3Sink -- the old per-upload memo existed only
+// because every upload redid the probe.
 func ensureBucket(ctx context.Context, client *s3.Client, bucket, region string) error {
-	if ensuredBuckets[bucket] {
-		return nil
-	}
-
 	// HeadBucket. NotFound (404 / *types.NotFound) → try to create.
 	_, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)})
 	if err != nil {
@@ -574,81 +514,6 @@ func ensureBucket(ctx context.Context, client *s3.Client, bucket, region string)
 		}
 	}
 
-	ensuredBuckets[bucket] = true
-	return nil
-}
-
-// uploadToS3 uploads the file at path to s3://bucket/key with the given
-// Content-Type. It ensures the bucket exists (once per run, see ensureBucket)
-// and then PutObjects with a bounded retry. Static creds come from
-// S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY; region from S3_REGION; optional
-// custom endpoint from S3_ENDPOINT (e.g. SeaweedFS); path-style addressing
-// toggled by S3_FORCE_PATH_STYLE.
-func uploadToS3(ctx context.Context, path, bucket, key, contentType string) error {
-	region := os.Getenv("S3_REGION")
-	endpoint := os.Getenv("S3_ENDPOINT")
-	accessKey := os.Getenv("S3_ACCESS_KEY_ID")
-	secretKey := os.Getenv("S3_SECRET_ACCESS_KEY")
-	forcePathStyle, _ := strconv.ParseBool(os.Getenv("S3_FORCE_PATH_STYLE"))
-
-	cfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(region),
-		awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
-		),
-	)
-	if err != nil {
-		return fmt.Errorf("load aws config: %w", err)
-	}
-
-	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		if endpoint != "" {
-			o.BaseEndpoint = aws.String(endpoint)
-		}
-		o.UsePathStyle = forcePathStyle
-	})
-
-	// 1. Bucket: HeadBucket → CreateBucket when missing, memoized per run.
-	if err := ensureBucket(ctx, client, bucket, region); err != nil {
-		return err
-	}
-
-	// 2. PutObject, retried up to s3UploadAttempts times. The body is rewound
-	// before every attempt because PutObject consumes the reader.
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open file: %w", err)
-	}
-	defer f.Close()
-
-	fmt.Printf("uploading to s3://%s/%s\n", bucket, key)
-	backoff := s3RetryBackoff
-	for attempt := 1; ; attempt++ {
-		if _, serr := f.Seek(0, io.SeekStart); serr != nil {
-			return fmt.Errorf("rewind file: %w", serr)
-		}
-		_, err = client.PutObject(ctx, &s3.PutObjectInput{
-			Bucket:      aws.String(bucket),
-			Key:         aws.String(key),
-			Body:        f,
-			ContentType: aws.String(contentType),
-		})
-		if err == nil {
-			break
-		}
-		if attempt == s3UploadAttempts {
-			return fmt.Errorf("put object after %d attempts: %w", s3UploadAttempts, err)
-		}
-		fmt.Printf("put object s3://%s/%s attempt %d/%d failed: %v — retrying in %s\n",
-			bucket, key, attempt, s3UploadAttempts, err, backoff)
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("put object: %w", err)
-		case <-time.After(backoff):
-		}
-		backoff *= 2
-	}
-	fmt.Printf("uploaded s3://%s/%s\n", bucket, key)
 	return nil
 }
 

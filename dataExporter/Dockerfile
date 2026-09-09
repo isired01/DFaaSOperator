@@ -6,7 +6,9 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -o exporter main.go
+# Build the package, not one file: the exporter is main.go + config.go +
+# sink.go, and naming a single file silently drops the others.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -o exporter .
 
 # Stage 2: Final Image
 FROM alpine:3.23
