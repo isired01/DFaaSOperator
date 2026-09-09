@@ -21,3 +21,10 @@ datasources:
         url: http://prometheus-server.monitoring.svc.cluster.local
         access: proxy
         isDefault: true
+
+# Grafana needs no cluster-scoped read here (every sidecar is off), and the
+# operator ServiceAccount cannot create ClusterRoles anyway. `namespaced: true`
+# drops the chart's ClusterRole + ClusterRoleBinding and keeps only the
+# namespaced Role/RoleBinding, which renders with empty rules.
+rbac:
+  namespaced: true

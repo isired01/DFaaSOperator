@@ -56,17 +56,21 @@ jobs:
             ghcr.io/isired01/dfaas-exporter:${{ env.VERSION_NO_V }}
             ghcr.io/isired01/dfaas-exporter:latest
 
+      # The UI repo builds on its own tag push, in parallel with this job. Its
+      # multi-arch build is the slow one, so give it a real window rather than
+      # the minute it used to get.
       - name: Wait for UI image to be published
         run: |
-          for i in {1..6}; do
+          for i in $(seq 1 60); do
             if docker manifest inspect "ghcr.io/isired01/dfaas-control-plane:${VERSION}" >/dev/null 2>&1; then
               echo "UI image ready"
               exit 0
             fi
-            echo "UI image not ready yet (attempt $i/6), sleeping 10s"
-            sleep 10
+            echo "UI image not ready yet (attempt $i/60), sleeping 15s"
+            sleep 15
           done
-          echo "UI image never appeared; failing release"
+          echo "UI image never appeared after 15 min; failing release."
+          echo "Did you push the tag ${VERSION} to the UI repo too?"
           exit 1
 
       - uses: azure/setup-helm@v4

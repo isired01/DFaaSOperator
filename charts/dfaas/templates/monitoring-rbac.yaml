@@ -1,0 +1,57 @@
+{{- if .Values.operator.enabled }}
+# Cluster-scoped RBAC for the monitoring stack the operator installs at runtime
+# (embedded prometheus / grafana charts, release namespace "monitoring").
+#
+# The operator's own ClusterRole grants no clusterroles/clusterrolebindings
+# verbs on purpose: a controller that can mint ClusterRoles is a controller that
+# can escalate to cluster-admin. So the chart ships the one cluster-scoped role
+# the stack actually needs, and the upstream charts are told to reuse it:
+#   - prometheus: server.useExistingClusterRoleName (suppresses its ClusterRole
+#     *and* its ClusterRoleBinding)
+#   - grafana:    rbac.namespaced=true (namespaced Role only)
+# Both live in internal/controller/monitoring/values/. The names below are
+# hard-coded, not release-derived, because those values files are compiled into
+# the operator binary — rename one, rename all three.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dfaas-prometheus-server
+  labels:
+    {{- include "dfaas.operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/metrics
+      - services
+      - endpoints
+      - pods
+      - ingresses
+      - configmaps
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "ingresses/status"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dfaas-prometheus-server
+  labels:
+    {{- include "dfaas.operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dfaas-prometheus-server
+subjects:
+  # Created by the prometheus release itself (server.fullnameOverride
+  # "prometheus-server"); the binding may legitimately predate it.
+  - kind: ServiceAccount
+    name: prometheus-server
+    namespace: monitoring
+{{- end }}

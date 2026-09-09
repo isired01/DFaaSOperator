@@ -12,6 +12,11 @@ package ansible
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -112,5 +117,86 @@ func TestEnsureLibp2pKeysPrunesFlippedNodeAndKeepsBYO(t *testing.T) {
 	}
 	if string(got.Data["byo-c"]) != "key-c" {
 		t.Error("pre-seeded BYO key for a nodeID absent from spec was pruned")
+	}
+}
+
+// testLibp2pKey returns a base64 PKCS#8 ed25519 key, the format
+// EnsureLibp2pKeys stores in the Secret and derivePeerID expects.
+func testLibp2pKey(t *testing.T) string {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519 key: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("marshal PKCS8: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(der)
+}
+
+// The bootstrap list is the federation topology for good: the agent dials it
+// once in kademlia.Initialize and its Kademlia discovery never returns a peer
+// (it announces only its pod address, the same 10.42.0.0/24 on every node). A
+// list holding only nodes[0] therefore produced a star, not a mesh — and every
+// node whose single link dropped sat at 0 peers with all Conditions green.
+// Node i must get nodes 0..i-1: each pair dialed once, no circular wait.
+func TestBuildInventoryBootstrapListIsFullMesh(t *testing.T) {
+	env := &dfaasv1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-mesh", Namespace: "default", UID: "uid-1"},
+	}
+	nodes := []dfaasv1.EnvironmentNode{
+		{NodeID: "w0", IPAddress: "100.0.0.10", Role: dfaasv1.RoleDfaasWorker, Username: "u", Password: "p"},
+		{NodeID: "w1", IPAddress: "100.0.0.11", Role: dfaasv1.RoleDfaasWorker, Username: "u", Password: "p"},
+		{NodeID: "w2", IPAddress: "100.0.0.12", Role: dfaasv1.RoleDfaasWorker, Username: "u", Password: "p"},
+	}
+	keys := map[string]string{}
+	for _, n := range nodes {
+		keys[n.NodeID] = testLibp2pKey(t)
+	}
+
+	worker, _ := roles.For(dfaasv1.RoleDfaasWorker)
+	inv, err := buildInventory(env, worker, nodes, keys)
+	if err != nil {
+		t.Fatalf("buildInventory: %v", err)
+	}
+
+	peerIDs := make([]string, len(nodes))
+	for i, n := range nodes {
+		id, err := derivePeerID(keys[n.NodeID])
+		if err != nil {
+			t.Fatalf("derivePeerID(%s): %v", n.NodeID, err)
+		}
+		peerIDs[i] = id
+	}
+
+	// One inventory line per node, in spec order.
+	lines := strings.Split(strings.TrimSpace(inv), "\n")
+	if len(lines) != len(nodes)+1 { // +1 for the [group] header
+		t.Fatalf("expected %d inventory lines, got %d:\n%s", len(nodes)+1, len(lines), inv)
+	}
+
+	for i, n := range nodes {
+		line := lines[i+1]
+		if !strings.HasPrefix(line, n.IPAddress+" ") {
+			t.Fatalf("line %d is not node %s:\n%s", i, n.NodeID, line)
+		}
+
+		var want []string
+		for j := 0; j < i; j++ {
+			want = append(want, fmt.Sprintf("/ip4/%s/tcp/%d/p2p/%s", nodes[j].IPAddress, libp2pBootstrapPort, peerIDs[j]))
+		}
+		wantAddr := "bootstrap_address='" + strings.Join(want, ",") + "'"
+		if !strings.Contains(line, wantAddr) {
+			t.Errorf("node %s: want %s\ngot: %s", n.NodeID, wantAddr, line)
+		}
+
+		// is_bootstrap gates AGENT_BOOTSTRAP_NODES and _FORCE, so the first
+		// node must stay false: it has nobody to dial and would otherwise
+		// block in init forever.
+		wantFlag := fmt.Sprintf("is_bootstrap=%t", i != 0)
+		if !strings.Contains(line, wantFlag) {
+			t.Errorf("node %s: want %s\ngot: %s", n.NodeID, wantFlag, line)
+		}
 	}
 }

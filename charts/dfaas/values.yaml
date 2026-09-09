@@ -42,8 +42,12 @@ ui:
     requests: { cpu: 50m, memory: 64Mi }
     limits:   { cpu: 300m, memory: 256Mi }
   service:
-    type: ClusterIP
+    # NodePort by default: the whole testbed is reached by node IP
+    # (prometheus 30090, grafana 30300, seaweedfs 30900/30901) and the UI is
+    # the one piece a human has to open. Set type: ClusterIP to opt out.
+    type: NodePort
     port: 8082
+    nodePort: 30800          # only honoured when type is NodePort; empty = random
   serviceAccount:
     create: true
     name: ""
@@ -61,11 +65,19 @@ ui:
     # SEAWEEDFS_ENDPOINT: ""      # override gateway→SeaweedFS dial endpoint; default: auto
                                   #   (in-cluster → seaweedfs-all-in-one.monitoring.svc…:8333, dev → <nodeIP>:30900)
     # SEAWEEDFS_PUBLIC_URL: ""    # override the asset URL handed to k6; default: <nodeIP>:30900
+    # SEAWEEDFS_FILER_PUBLIC_URL: ""
+                                  # override the base of the result links shown after a
+                                  # LoadTest; default: <nodeIP>:30901 (filer NodePort)
 
-# CRDs are NOT installed by this chart. Apply them once before creating any
-# Environment or LoadTest (see NOTES.txt / README), either from a repo checkout
-# (kubectl apply -f config/crd/bases/) or from the matching release assets.
-crds:
-  keep: true                      # informational
+# CRDs ship in the chart's crds/ directory, so `helm install` applies them for
+# you. Helm never touches them again: `helm upgrade` does NOT update a CRD, and
+# `helm uninstall` does NOT remove one. After upgrading to a chart whose schema
+# changed, apply the new definitions by hand:
+#
+#   kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_environments.yaml
+#   kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_loadtests.yaml
+#
+# (Both files are attached to every release, and live in config/crd/bases/ in a
+# repo checkout.)
 
 imagePullSecrets: []

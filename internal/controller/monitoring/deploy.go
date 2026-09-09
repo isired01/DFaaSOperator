@@ -100,11 +100,20 @@ func (m *Manager) Deploy(ctx context.Context) error {
 func (m *Manager) pruneLegacySeaweedFS(ctx context.Context) error {
 	logger := log.FromContext(ctx)
 
+	// The claim and the Secret are listed under BOTH names on purpose. The
+	// pre-Helm SeaweedFS Deployment was itself a rename of the even earlier
+	// MinIO one and kept MinIO's claim and Secret, so on any cluster that came
+	// up before that rename the live objects are `minio-pvc` / `minio-creds`
+	// and the seaweedfs-* names never existed. Pruning only the latter left a
+	// bound 10Gi claim orphaned in `monitoring` with no workload mounting it —
+	// invisible, still billed, and confusing to whoever looks next.
 	legacy := []client.Object{
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "seaweedfs", Namespace: "monitoring"}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "seaweedfs-deployment", Namespace: "monitoring"}},
 		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "seaweedfs-pvc", Namespace: "monitoring"}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "seaweedfs-creds", Namespace: "monitoring"}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "minio-pvc", Namespace: "monitoring"}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "minio-creds", Namespace: "monitoring"}},
 	}
 
 	for _, obj := range legacy {

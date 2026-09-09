@@ -11,23 +11,9 @@ The operator ships as a single Deployment that runs **two controllers** against 
 
 Prereqs: K8s ≥ 1.25, `kubectl` connected to the cluster, `helm` ≥ 3.8 (for OCI), anonymous pull from `ghcr.io` reachable from the cluster.
 
-### Step 1 — Install the CRDs
+### Step 1 — Install operator + UI via Helm
 
-The Helm chart does **not** package the CRDs, so install them once before anything else. From a repo checkout:
-
-```bash
-kubectl apply -f config/crd/bases/dfaas.dfaas.io_environments.yaml
-kubectl apply -f config/crd/bases/dfaas.dfaas.io_loadtests.yaml
-```
-
-Or, for a published release, from the release assets (replace `0.1.0` with the release you are installing):
-
-```bash
-kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v0.1.0/dfaas.dfaas.io_environments.yaml
-kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v0.1.0/dfaas.dfaas.io_loadtests.yaml
-```
-
-### Step 2 — Install operator + UI via Helm
+The chart packages the CRDs, so `helm install` applies them for you. (`helm upgrade` never does — see [Upgrade](#upgrade).)
 
 ```bash
 helm install dfaas oci://ghcr.io/isired01/charts/dfaas \
@@ -37,13 +23,14 @@ helm install dfaas oci://ghcr.io/isired01/charts/dfaas \
 
 # Alternatively, install the chart straight from a repo checkout:
 # helm install dfaas ./charts/dfaas --create-namespace --namespace dfaas-operator-system
-
-# Open the UI:
-kubectl -n dfaas-ui port-forward svc/dfaas-ui 8082:8082
-open http://localhost:8082
 ```
 
-### Step 3 — Create your first Custom Resources
+The UI Service defaults to NodePort `30800`, so the control plane is reachable at
+`http://<any-node-ip>:30800/` as soon as the pod is ready. To keep it inside the
+cluster instead, install with `--set ui.service.type=ClusterIP` and reach it through
+`kubectl -n dfaas-ui port-forward svc/dfaas-ui 8082:8082`.
+
+### Step 2 — Create your first Custom Resources
 
 Ready-made examples in [`config/samples/`](config/samples/):
 
@@ -94,8 +81,8 @@ helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 0.1.0 \
 # Upgrade ONLY operator + UI (replace <version> with the target release):
 helm upgrade dfaas oci://ghcr.io/isired01/charts/dfaas --version <version>
 
-# The chart never manages CRDs. If the new release ships modified CRDs, apply them
-# manually BEFORE the chart upgrade:
+# Helm applies CRDs on install but never on upgrade. If the new release ships
+# modified CRDs, apply them manually BEFORE the chart upgrade:
 kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_environments.yaml
 kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_loadtests.yaml
 ```

@@ -1,4 +1,5 @@
-# Override values for the official seaweedfs/seaweedfs chart (4.45.0), installed
+# Override values for the official seaweedfs/seaweedfs chart (4.45.0, vendored as
+# seaweedfs-4.45.0-dfaas1.tgz with one template patched — see assets.go), installed
 # by the operator as the in-cluster default S3 sink during the Environment
 # ProvisioningMonitoring phase. Release name "seaweedfs" in the "monitoring"
 # namespace, so seaweedfs.fullname == "seaweedfs" and the objects come out as

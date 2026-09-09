@@ -43,7 +43,18 @@ const (
 
 // Function describes one OpenFaaS function deployed on a dfaas-worker node.
 type Function struct {
+	// Name is templated by the dfaas-agent into HAProxy variable names
+	// (`var(req.rate_local_func_<name>)`), and HAProxy variable names reject
+	// hyphens. A single function called `dfaas-imgproc` therefore made HAProxy
+	// refuse the WHOLE rendered config with a 400 from its Data Plane API —
+	// "invalid syntax at char '-imgproc'" — so every worker kept serving the
+	// placeholder 503 ("Proxy is running, but the DFaaS agent is not!") while
+	// all seven Environment Conditions stayed green and the SSH probe was happy.
+	// The name is also the OpenFaaS/DNS-1123 object name, which rejects
+	// underscores, so the safe intersection is lowercase alphanumerics only.
+	// Rejecting it here turns a silent data-plane death into an apply-time error.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]+$`
 	Name string `json:"name"`
 
 	// +kubebuilder:validation:Required

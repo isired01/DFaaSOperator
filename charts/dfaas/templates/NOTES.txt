@@ -5,23 +5,24 @@ UI namespace       : {{ .Values.ui.namespace }}
 Chart version      : {{ .Chart.Version }}
 App version        : {{ .Chart.AppVersion }}
 
-IMPORTANT — CRDs are NOT installed by this chart. Apply them once before
-creating any Environment or LoadTest, either from a repo checkout:
+The CRDs (Environment, LoadTest) ship in the chart and were applied by this
+install. Helm never upgrades a CRD, so after moving to a chart whose schema
+changed, apply the new definitions yourself:
 
-  kubectl apply -f config/crd/bases/dfaas.dfaas.io_environments.yaml
-  kubectl apply -f config/crd/bases/dfaas.dfaas.io_loadtests.yaml
-
-or from the matching release assets (replace <version> with the release you installed):
-
-  kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_environments.yaml
-  kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_loadtests.yaml
+  kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v{{ .Chart.AppVersion }}/dfaas.dfaas.io_environments.yaml
+  kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v{{ .Chart.AppVersion }}/dfaas.dfaas.io_loadtests.yaml
 
 {{- if .Values.ui.enabled }}
 
 Open the UI:
+{{- if eq .Values.ui.service.type "NodePort" }}
+  http://<any-node-ip>:{{ .Values.ui.service.nodePort | default "<assigned-nodeport>" }}/
+
+  kubectl -n {{ .Values.ui.namespace }} get svc {{ include "dfaas.fullname" . }}-ui
+{{- else }}
   kubectl -n {{ .Values.ui.namespace }} port-forward svc/{{ include "dfaas.fullname" . }}-ui {{ .Values.ui.service.port }}:{{ .Values.ui.service.port }}
   open http://localhost:{{ .Values.ui.service.port }}
-
+{{- end }}
   {{- if .Values.ui.ingress.enabled }}
 
 Or via Ingress:

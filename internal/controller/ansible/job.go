@@ -180,27 +180,50 @@ func buildInventory(env *dfaasv1.Environment, spec roles.Spec,
 	case dfaasv1.RoleDfaasWorker:
 		inv = "[" + spec.Group + "]\n"
 
-		// The seed (nodes[0]) peer ID is baked into every other worker's
-		// bootstrap multiaddr, so a malformed seed key would poison the whole
-		// mesh. Fail loudly here instead of emitting an empty peer ID that only
-		// surfaces as an opaque agent dial-backoff crash-loop later.
-		firstPeerID, err := derivePeerID(libp2pKeys[nodes[0].NodeID])
-		if err != nil {
-			return "", fmt.Errorf("derive libp2p peer ID for seed node %q (check its entry in Secret %q): %w",
-				nodes[0].NodeID, env.Name+"-libp2p-keys", err)
-		}
+		// Every peer ID up front: node i's bootstrap list carries the peer IDs
+		// of nodes 0..i-1, so they must all be known before the loop emits a
+		// line. A malformed key would poison the mesh, so fail loudly here
+		// instead of emitting an empty peer ID that only surfaces as an opaque
+		// agent dial-backoff crash-loop later.
+		peerIDs := make([]string, len(nodes))
 		for i, n := range nodes {
-			privKey := libp2pKeys[n.NodeID]
-			peerID, err := derivePeerID(privKey)
+			id, err := derivePeerID(libp2pKeys[n.NodeID])
 			if err != nil {
 				return "", fmt.Errorf("derive libp2p peer ID for node %q (check its entry in Secret %q): %w",
 					n.NodeID, env.Name+"-libp2p-keys", err)
 			}
-			isBootstrap := i != 0
-			bootstrap := ""
-			if isBootstrap {
-				bootstrap = fmt.Sprintf("/ip4/%s/tcp/%d/p2p/%s", nodes[0].IPAddress, libp2pBootstrapPort, firstPeerID)
+			peerIDs[i] = id
+		}
+		for i, n := range nodes {
+			privKey := libp2pKeys[n.NodeID]
+			peerID := peerIDs[i]
+
+			// The bootstrap list IS the federation topology, permanently. The
+			// agent dials it once, in kademlia.Initialize, and the Kademlia
+			// discovery meant to complete the mesh afterwards never returns a
+			// peer: the agent announces only its pod address (10.42.0.0/24 —
+			// the SAME subnet on every single-node k3s), so a peer learned
+			// through the DHT would be undialable anyway. Measured 2026-09-09
+			// on env `lab`: the seed advertised no /ipfs/kad/1.0.0 protocol at
+			// all, every node's routing table was empty, and not one agent had
+			// ever logged "Found a new peer" — with only the seed's address in
+			// the list the result was a star (seed 4 conns, everyone else 1),
+			// decaying to 0 peers on each node whose single link dropped.
+			//
+			// So list nodes 0..i-1 for node i: every pair is dialed exactly
+			// once (a full mesh), and no node ever waits on a node that is
+			// waiting on it, which matters because AGENT_BOOTSTRAP_FORCE
+			// blocks Initialize until every listed peer answers. Comma
+			// separated: the agent parses the env var with viper into
+			// []string, which splits on commas. Verified live: node l3 given
+			// all four addresses reached 4/4 peers in 400ms.
+			var addrs []string
+			for j := 0; j < i; j++ {
+				addrs = append(addrs, fmt.Sprintf("/ip4/%s/tcp/%d/p2p/%s",
+					nodes[j].IPAddress, libp2pBootstrapPort, peerIDs[j]))
 			}
+			isBootstrap := i != 0
+			bootstrap := strings.Join(addrs, ",")
 			fnJSON, _ := json.Marshal(n.Functions)
 			inv += fmt.Sprintf(
 				"%s ansible_user=%s ansible_password=%s node_specific_functions='%s' "+
