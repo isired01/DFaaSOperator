@@ -36,3 +36,15 @@ jobs:
       # applies cert-manager and the prometheus-operator bundle to whatever
       # kubeconfig context is active, with no guard.
       - run: make test
+
+      # A Dockerfile is source no Go check reads. Two real breakages got past
+      # everything above: the operator image omitted internal/reach and
+      # internal/syncchannel from its COPY list, and the exporter compiled
+      # `go build main.go` after main.go was split into three files. Both built
+      # a green branch that shipped nothing. Native arch only, no push -- this
+      # gate is about whether the build succeeds, not about the artifact.
+      - name: Images build
+        run: |
+          docker build -t dfaas-operator:ci .
+          docker build -t dfaas-exporter:ci dataExporter
+          docker build -t dfaas-imgproc:ci imageFunction

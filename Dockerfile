@@ -13,21 +13,21 @@ COPY go.sum go.sum
 # and so that source changes don't invalidate our downloaded layer
 RUN go mod download
 
-# Copy the go source
-COPY cmd/main.go cmd/main.go
+# Copy the go source. Whole directories, never a file list: this COPY block
+# used to name each internal/ package, so adding internal/reach and
+# internal/syncchannel built fine locally and failed only here, at docker
+# build, after every Go check had passed. The UI image already does it this
+# way.
+COPY cmd/ cmd/
 COPY api/ api/
-COPY internal/controller/ internal/controller/
-COPY internal/helm/ internal/helm/
-COPY internal/k6dispatch/ internal/k6dispatch/
-COPY internal/reach/ internal/reach/
-COPY internal/syncchannel/ internal/syncchannel/
+COPY internal/ internal/
 
 # Build
 # the GOARCH has not a default value to allow the binary be built according to the host where the command
 # was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager ./cmd
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
