@@ -23,6 +23,19 @@ master:
   enabled: false
 volume:
   enabled: false
+  # The all-in-one pod renders -volume.max from the FIRST entry of this list
+  # (all-in-one-deployment.yaml), and nothing else in it: the pod always stores
+  # under -dir=/data on the chart's PVC, so name and type here are inert.
+  # The chart default is maxVolumes: 0, "auto-configure", which on the 10Gi PVC
+  # settles on 21 volumes. Every S3 bucket is a SeaweedFS collection that claims
+  # 7 volumes and never gives them back, so the fourth Environment ever created
+  # finds Free: 0 and every metrics export dies with a 500 InternalError.
+  # Volumes are allocated lazily and grow to volumeSizeLimitMB, so a high cap
+  # costs nothing until it is used; real disk stays the limit.
+  dataDirs:
+    - name: data1
+      type: persistentVolumeClaim
+      maxVolumes: 200
 filer:
   enabled: false
 

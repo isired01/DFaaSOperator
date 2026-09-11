@@ -452,6 +452,14 @@
             AGENT_RUNTIMEAPI_PORT: "30666"
             AGENT_DATAPLANEAPI_HOST: "{{ ansible_host }}"
             AGENT_DATAPLANEAPI_PORT: "30555"
+            # The agent PUSHES the rendered haproxy.cfg through the Data
+            # Plane API, which authenticates against the "dataplaneapi"
+            # userlist in haproxy-values.yaml. Without these two the push
+            # answers 401, HAProxy keeps its bare config, every function
+            # backend is missing, and the node serves 503 while the agent
+            # dies on the first weight check ("No such backend.").
+            AGENT_DATAPLANEAPI_USER: "admin"
+            AGENT_DATAPLANEAPI_PASSWORD: "admin"
             # Port a node uses to reach a NEIGHBOUR's HAProxy. The default 80
             # is the cluster-internal port: from outside the NodePort is
             # required. randomstrategy.go carries a FIXME on exactly this.
