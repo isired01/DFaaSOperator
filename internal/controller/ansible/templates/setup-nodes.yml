@@ -443,6 +443,29 @@
             # state for a node that cannot federate.
             AGENT_BOOTSTRAP_FORCE: "{{ 'true' if is_bootstrap | bool else 'false' }}"
             AGENT_STRATEGY: "{{ balancing_strategy }}"
+            # The newer agent dropped its hardwired addresses and wants them
+            # from configuration. Use the node's own NodePorts instead of the
+            # Service DNS, which only resolves inside the cluster and under a
+            # namespace the agent does not know (haproxy lives in
+            # haproxy-controller, not in default).
+            AGENT_RUNTIMEAPI_HOST: "{{ ansible_host }}"
+            AGENT_RUNTIMEAPI_PORT: "30666"
+            AGENT_DATAPLANEAPI_HOST: "{{ ansible_host }}"
+            AGENT_DATAPLANEAPI_PORT: "30555"
+            # Port a node uses to reach a NEIGHBOUR's HAProxy. The default 80
+            # is the cluster-internal port: from outside the NodePort is
+            # required. randomstrategy.go carries a FIXME on exactly this.
+            AGENT_HAPROXY_PORT: "30080"
+            # The random template always emits "server rejector": if the host
+            # does not resolve, HAProxy refuses to load the configuration. With
+            # REJECT=false it stays at weight 0 and receives nothing, so a
+            # valid address is enough.
+            AGENT_REJECTOR_HOST: "{{ ansible_host }}"
+            AGENT_REJECTOR_PORT: "30080"
+            AGENT_RANDOM_REJECT: "false"
+            # -1 = seed from the clock. Do not leave it implicit: Viper applies
+            # no default, and an unset variable reads as 0, i.e. a fixed seed.
+            AGENT_RANDOM_SEED: "-1"
           forecaster:
             enabled: false
       register: agent_helm

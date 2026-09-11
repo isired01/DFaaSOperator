@@ -139,7 +139,7 @@ type EnvironmentNode struct {
 	// dfaas-agent (AGENT_STRATEGY env var). Typos that look like
 	// "alllocal" silently fall back to recalcstrategy and crash on
 	// missing dfaas.maxrate, so the enum guard is the safety net.
-	// +kubebuilder:validation:Enum=staticstrategy;nodemarginstrategy;recalcstrategy;alllocalstrategy;rlagentstrategy
+	// +kubebuilder:validation:Enum=staticstrategy;nodemarginstrategy;recalcstrategy;alllocalstrategy;rlagentstrategy;randomstrategy
 	// +optional
 	BalancingStrategy BalancingStrategy `json:"balancingStrategy,omitempty"`
 

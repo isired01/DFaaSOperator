@@ -80,6 +80,7 @@ spec:
                       - recalcstrategy
                       - alllocalstrategy
                       - rlagentstrategy
+                      - randomstrategy
                       type: string
                     capacity:
                       description: NodeCapacity expresses the relative CPU/RAM budget

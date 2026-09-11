@@ -39,6 +39,7 @@ const (
 	RecalcStrategy     BalancingStrategy = "recalcstrategy"
 	AllLocalStrategy   BalancingStrategy = "alllocalstrategy"
 	RLAgentStrategy    BalancingStrategy = "rlagentstrategy"
+	RandomStrategy     BalancingStrategy = "randomstrategy"
 )
 
 // Function describes one OpenFaaS function deployed on a dfaas-worker node.
