@@ -28,16 +28,31 @@ import (
 	"dfaas-operator/internal/k6dispatch"
 )
 
+// federationInterval is how often the management Prometheus pulls worker
+// metrics through /federate: the prometheus chart's default
+// global.scrape_interval, 1m, which
+// internal/controller/monitoring/values/prometheus-values.yaml does not
+// override. Both constants below derive from it, so raising the interval in
+// that file means raising it here and nowhere else.
+const federationInterval = time.Minute
+
+// exportTailWindow extends the export query past the LoadTest's EndTime.
+// Federation gives the mgmt instance one sample per node per interval, and
+// each node is pulled at its own offset, so the last sample *inside* the k6
+// window can be up to one full interval older than EndTime — and no amount of
+// waiting adds samples to a window that has already closed. A smoke test on
+// 2026-09-11 measured the effect directly: with k6 stopping at 17:43:29 the
+// last exported sample was 17:42:31 for one node and 17:43:16 for another, so
+// the same run gave a different tail, and a different sample count, per node.
+// Extending the window by one interval puts at least one sample at or after
+// EndTime for every node. The extra samples are flat: k6 has stopped, and
+// every metric here is a counter.
+const exportTailWindow = federationInterval
+
 // exportCooldown is how long the reconciler waits, after k6 finishes, before
-// creating the exporter Job. It matches the management Prometheus federation
-// interval (the prometheus chart's default global.scrape_interval, 1m): the
-// mgmt instance pulls worker metrics through /federate rather than scraping
-// them directly, so the last samples of a run land up to one interval after
-// the run ends. Waiting one full period guarantees at least one federation
-// pull covering EndTime. The query window itself is unchanged — see the call
-// site in runExporter. Raise this if global.scrape_interval is ever raised in
-// internal/controller/monitoring/values/prometheus-values.yaml.
-const exportCooldown = time.Minute
+// creating the exporter Job. It covers the widened window: one interval for
+// the last in-window pull, one more for the pull that lands after EndTime.
+const exportCooldown = federationInterval + exportTailWindow
 
 // observeK6 polls every remote TestRun. When all have reached a terminal
 // stage (finished/stopped) it transitions to Exporting; on any error it
@@ -288,7 +303,10 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 			})
 		}
 
-		newJob, err := r.createExporterJob(lt, env, lt.Status.StartTime.Time, lt.Status.EndTime.Time, s3SecretName, k6LogCMs)
+		newJob, err := r.createExporterJob(lt, env, lt.Status.StartTime.Time,
+			// One federation interval past the end, so every node has a
+			// sample at or after EndTime. See exportTailWindow.
+			lt.Status.EndTime.Time.Add(exportTailWindow), s3SecretName, k6LogCMs)
 		if err != nil {
 			r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
 				metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
