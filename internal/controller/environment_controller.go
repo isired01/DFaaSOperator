@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/ansible"
 	"dfaas-operator/internal/controller/monitoring"
 	"dfaas-operator/internal/controller/statuswriter"
 	"dfaas-operator/internal/reach"
@@ -99,6 +100,18 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	if added, err := ensureFinalizer(ctx, r.Client, &env, environmentFinalizer); added || err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// Seed the provisioning snapshot for an Environment that settled before this
+	// operator version started recording one. A settled Environment is, by the
+	// FSM's own invariant, installed exactly as spec.nodes describes, so the
+	// spec is a faithful record — and without this seed the FIRST node removal
+	// after an operator upgrade has nothing to diff against and silently leaves
+	// a live machine running k3s and the dfaas-agent. Never clobbers: a real
+	// snapshot knows more than the current spec does.
+	if env.Status.ObservedGeneration > 0 && env.Status.ObservedGeneration == env.Generation {
+		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
+		logStatusErr(ctx, "seed provisioning snapshot", am.SaveSnapshotIfAbsent(ctx, &env))
 	}
 
 	if env.Status.Phase == dfaasv1.EnvReady &&
