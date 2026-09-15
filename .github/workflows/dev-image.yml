@@ -7,7 +7,11 @@ name: dev image
 # None of that belongs to a throwaway build of one image.
 on:
   push:
-    branches-ignore: [main]
+    # Every branch, main included: this project commits straight to main, so
+    # excluding it would leave :dev frozen at whatever branch last touched it.
+    # Branches only, never tags — a v* tag is release.yml's job, and letting it
+    # run here too would overwrite :dev with a release build.
+    branches: ['**']
   workflow_dispatch:
 
 permissions:
