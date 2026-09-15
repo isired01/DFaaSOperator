@@ -20,18 +20,17 @@ import "testing"
 // enum without deciding which set it belongs to fails here.
 
 func TestEnvironmentPhaseDispatchable(t *testing.T) {
-	// Degraded is dispatchable on purpose: it means the monitoring stack is
-	// down, which can only fail the metrics export. The operator dispatches
-	// against it, so the gateway must not be stricter.
+	// Ready only. Degraded (infra up, monitoring down) used to qualify; it was
+	// dropped because no reconcile path ever produced it. The gateway mirrors
+	// this set, so it must not be looser either.
 	dispatchable := map[EnvironmentPhase]bool{
-		EnvReady:    true,
-		EnvDegraded: true,
+		EnvReady: true,
 	}
 
 	// Every phase the enum declares, so a new one has to be classified here.
 	all := []EnvironmentPhase{
 		"", EnvIdle, EnvProvisioningVMs, EnvProvisioningInfra,
-		EnvProvisioningMonitoring, EnvReady, EnvDegraded, EnvFailed, EnvUnreachable,
+		EnvProvisioningMonitoring, EnvReady, EnvFailed, EnvUnreachable,
 	}
 	for _, p := range all {
 		if got, want := p.Dispatchable(), dispatchable[p]; got != want {

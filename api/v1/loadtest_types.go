@@ -112,7 +112,6 @@ const (
 	LTReasonEnvNotFound = "EnvNotFound"
 	LTReasonEnvFound    = "EnvFound"
 	LTReasonEnvFailed   = "EnvFailed"
-	LTReasonEnvDegraded = "EnvDegraded"
 	// Queue-gate reasons (FIFO serialization on a shared Environment).
 	LTReasonEnvBusy      = "EnvBusy"
 	LTReasonQueuedBehind = "QueuedBehind"

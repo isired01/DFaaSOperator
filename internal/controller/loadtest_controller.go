@@ -130,18 +130,12 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	// P9: env exists — stamp EnvironmentLinked. EnvDegraded is advisory:
-	// LoadTests against a degraded env are permitted, so we mark True with
-	// reason=EnvDegraded so consumers know to expect missing metrics later.
+	// P9: env exists — stamp EnvironmentLinked.
 	switch env.Status.Phase {
 	case dfaasv1.EnvFailed:
 		r.cond(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
 			metav1.ConditionFalse, dfaasv1.LTReasonEnvFailed,
 			fmt.Sprintf("environment %q is in phase Failed", env.Name))
-	case dfaasv1.EnvDegraded:
-		r.cond(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
-			metav1.ConditionTrue, dfaasv1.LTReasonEnvDegraded,
-			fmt.Sprintf("environment %q is Degraded — monitoring unavailable, exporter step may fail", env.Name))
 	default:
 		r.cond(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
 			metav1.ConditionTrue, dfaasv1.LTReasonEnvFound,
@@ -171,9 +165,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			return ctrl.Result{RequeueAfter: time.Until(fireT)}, nil
 
 		case !env.Status.Phase.Dispatchable():
-			// Fire time elapsed but the target Environment is not ready
-			// (Degraded is treated as good-enough to dispatch — only
-			// Failed / still-Provisioning hold the schedule).
+			// Fire time elapsed but the target Environment is not Ready.
 			r.cond(ctx, &lt, dfaasv1.LTCondScheduled,
 				metav1.ConditionTrue, dfaasv1.LTReasonScheduledDelayedEnvNot,
 				fmt.Sprintf("schedule fired at %s; waiting for env %s phase=%s",

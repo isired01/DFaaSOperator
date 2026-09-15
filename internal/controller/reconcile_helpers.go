@@ -55,7 +55,7 @@ func ensureFinalizer(ctx context.Context, c client.Client,
 // edit (generation bump) is detected as drift. Keeping the set in one place
 // means the phase writer and the drift guard cannot disagree on what "settled" means.
 func isSettledPhase(p dfaasv1.EnvironmentPhase) bool {
-	return p == dfaasv1.EnvReady || p == dfaasv1.EnvFailed || p == dfaasv1.EnvDegraded
+	return p == dfaasv1.EnvReady || p == dfaasv1.EnvFailed
 }
 
 // Transition aliases for the two CRs. See statuswriter for the contract.

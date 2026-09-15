@@ -357,7 +357,6 @@ spec:
                 - ProvisioningInfra
                 - ProvisioningMonitoring
                 - Ready
-                - Degraded
                 - Failed
                 - Unreachable
                 type: string
