@@ -186,7 +186,12 @@ GOLANGCI_LINT = $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.3.0
 CONTROLLER_TOOLS_VERSION ?= v0.20.1
-ENVTEST_VERSION ?= release-0.17
+# release-0.17 fetches kubebuilder-tools from the retired GCS bucket, which now
+# answers 401 for every version: make test then runs with KUBEBUILDER_ASSETS=""
+# and every envtest spec dies in BeforeSuite on `exec: "etcd" not found`.
+# release-0.19 reads the current release index. Unrelated to controller-runtime's
+# own version in go.mod -- setup-envtest is a standalone tool.
+ENVTEST_VERSION ?= release-0.19
 GOLANGCI_LINT_VERSION ?= v2.13.2
 
 .PHONY: kustomize
