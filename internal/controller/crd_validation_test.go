@@ -31,6 +31,12 @@ func validationNode(nodeID, ip string) dfaasv1.EnvironmentNode {
 		Capacity:  dfaasv1.CapacityLow,
 		Username:  "ubuntu",
 		Password:  "ubuntu",
+		// A dfaas-worker with no functions is rejected at admission, so the
+		// minimal VALID worker carries one.
+		Functions: []dfaasv1.Function{{
+			Name: "figlet", Image: "ghcr.io/openfaas/figlet:latest",
+			ExecTimeout: 5, MaxInflight: 400, TimeoutMs: 6000, MaxRate: 100,
+		}},
 	}
 }
 
@@ -54,6 +60,50 @@ var _ = Describe("Environment CRD validation", func() {
 		Expect(err).To(HaveOccurred())
 		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "expected an admission rejection, got %v", err)
 		Expect(err.Error()).To(ContainSubstring("Duplicate value"))
+	})
+
+	// A dfaas-worker with no functions serves nothing, and the inventory turns
+	// its nil list into the JSON literal `null` rather than `[]`: the prune task
+	// then runs `null | map(attribute='name')` over a four-character string and
+	// the whole playbook dies, leaving the Environment in Failed. Rejecting it
+	// at admission is both the honest rule and the fix.
+	It("rejects a dfaas-worker with no functions", func() {
+		node := validationNode("worker-1", "10.0.0.1")
+		node.Functions = nil
+		env := &dfaasv1.Environment{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "nofunc-", Namespace: "default"},
+			Spec:       dfaasv1.EnvironmentSpec{Nodes: []dfaasv1.EnvironmentNode{node}},
+		}
+		err := k8sClient.Create(ctx, env)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "expected an admission rejection, got %v", err)
+		Expect(err.Error()).To(ContainSubstring("at least one function"))
+	})
+
+	It("rejects a dfaas-worker with an empty function list", func() {
+		node := validationNode("worker-1", "10.0.0.1")
+		node.Functions = []dfaasv1.Function{}
+		env := &dfaasv1.Environment{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "emptyfunc-", Namespace: "default"},
+			Spec:       dfaasv1.EnvironmentSpec{Nodes: []dfaasv1.EnvironmentNode{node}},
+		}
+		err := k8sClient.Create(ctx, env)
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "expected an admission rejection, got %v", err)
+	})
+
+	// The rule is scoped to the worker role: a generator runs k6, not OpenFaaS,
+	// and buildInventory emits no function var for it at all.
+	It("accepts a k6-load-generator with no functions", func() {
+		gen := validationNode("gen-1", "10.0.0.9")
+		gen.Role = dfaasv1.RoleK6LoadGenerator
+		gen.Functions = nil
+		env := &dfaasv1.Environment{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "genonly-", Namespace: "default"},
+			Spec:       dfaasv1.EnvironmentSpec{Nodes: []dfaasv1.EnvironmentNode{gen}},
+		}
+		Expect(k8sClient.Create(ctx, env)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, env)).To(Succeed())
 	})
 
 	It("accepts distinct nodeIDs", func() {

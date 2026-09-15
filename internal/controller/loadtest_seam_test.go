@@ -56,7 +56,11 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 		env := &dfaasv1.Environment{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: dfaasv1.EnvironmentSpec{Nodes: []dfaasv1.EnvironmentNode{
-				{NodeID: "worker", IPAddress: "10.0.0.1", Role: dfaasv1.RoleDfaasWorker, Capacity: "LOW", Username: "u", Password: "p"},
+				{NodeID: "worker", IPAddress: "10.0.0.1", Role: dfaasv1.RoleDfaasWorker, Capacity: "LOW",
+					Username: "u", Password: "p",
+					// A dfaas-worker with no functions is rejected at admission.
+					Functions: []dfaasv1.Function{{Name: "figlet", Image: "ghcr.io/openfaas/figlet:latest",
+						ExecTimeout: 5, MaxInflight: 400, TimeoutMs: 6000, MaxRate: 100}}},
 			}},
 		}
 		for i, id := range k6Nodes {

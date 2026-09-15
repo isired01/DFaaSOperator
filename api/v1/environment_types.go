@@ -101,6 +101,16 @@ const (
 )
 
 // EnvironmentNode declares one machine in the federation.
+//
+// A dfaas-worker must declare at least one function. A worker with none serves
+// nothing, and the empty list is worse than useless downstream: buildInventory
+// marshals a nil slice to the JSON literal `null`, not `[]`, so the inventory
+// carries node_specific_functions='null' and the playbook's prune task runs
+// `null | map(attribute='name')` over a four-character string — the play dies
+// and the Environment lands in Failed with the function still deployed.
+// Scoped to the role: a k6-load-generator runs k6, not OpenFaaS, and the
+// inventory emits no function var for it at all.
+// +kubebuilder:validation:XValidation:rule="self.role != 'dfaas-worker' || (has(self.functions) && size(self.functions) > 0)",message="a dfaas-worker node must declare at least one function"
 type EnvironmentNode struct {
 	// NodeID must be DNS-1123 compatible (lowercase): it is embedded in
 	// Kubernetes object names (kubeconfig Secret <env>-<nodeID>-kubeconfig,
