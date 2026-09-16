@@ -13,7 +13,7 @@ package v1
 import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 // EnvironmentPhase tracks the infrastructure lifecycle.
-// +kubebuilder:validation:Enum=Idle;ProvisioningVMs;ProvisioningInfra;ProvisioningMonitoring;Ready;Degraded;Failed;Unreachable
+// +kubebuilder:validation:Enum=Idle;ProvisioningVMs;ProvisioningInfra;ProvisioningMonitoring;Ready;Failed;Unreachable
 type EnvironmentPhase string
 
 const (
@@ -22,11 +22,7 @@ const (
 	EnvProvisioningInfra      EnvironmentPhase = "ProvisioningInfra"
 	EnvProvisioningMonitoring EnvironmentPhase = "ProvisioningMonitoring"
 	EnvReady                  EnvironmentPhase = "Ready"
-	// EnvDegraded marks an Environment whose dfaas/k6 infra is up but whose
-	// monitoring stack failed terminally. LoadTests are still permitted; the
-	// dataExporter step will surface the monitoring failure later.
-	EnvDegraded EnvironmentPhase = "Degraded"
-	EnvFailed   EnvironmentPhase = "Failed"
+	EnvFailed                 EnvironmentPhase = "Failed"
 	// EnvUnreachable is a NON-terminal state for an Environment whose nodes
 	// stopped answering SSH (:22) — during provisioning after the fast
 	// sshRetryBudget, or while Ready after healthRetryBudget. Unlike Failed it
@@ -38,9 +34,10 @@ const (
 )
 
 // Dispatchable reports whether a LoadTest may be created and dispatched
-// against an Environment in this phase. Degraded qualifies: it means the
-// monitoring stack is down, which can only fail the metrics export, so the
-// operator dispatches against it and the gateway must not be stricter.
+// against an Environment in this phase: Ready only. A Degraded phase (infra
+// up, monitoring down) once qualified too; it was dropped because no reconcile
+// path ever produced it and a test without metrics is worthless to the user.
+// The gateway mirrors this set and must not be looser.
 //
 // It lives here because the comparison was re-typed at four sites inside one
 // reconcile function -- three of them negated -- plus once more in the
@@ -49,7 +46,7 @@ const (
 // and missing one left the create gate rejecting while the Occupancy gate
 // admitted, with no compile error and no test failure.
 func (p EnvironmentPhase) Dispatchable() bool {
-	return p == EnvReady || p == EnvDegraded
+	return p == EnvReady
 }
 
 // Condition Types stamped on Environment.status.conditions (P15).
@@ -83,7 +80,6 @@ const (
 	EnvReasonPodsRunning        = "PodsRunning"
 	EnvReasonInfraReady         = "InfraReady"
 	EnvReasonInfraFailed        = "InfraFailed"
-	EnvReasonDegraded           = "Degraded"
 	EnvReasonUpdating           = "Updating"
 	EnvReasonSpecChanged        = "SpecChanged"
 	EnvReasonInitializing       = "Initializing"

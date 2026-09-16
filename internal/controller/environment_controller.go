@@ -146,12 +146,11 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// Non-terminal: nodes stopped answering SSH. Re-probe indefinitely and
 		// auto-recover when they return (→ Ready or → ProvisioningInfra).
 		return r.reconcileUnreachable(ctx, &env)
-	case dfaasv1.EnvDegraded, dfaasv1.EnvFailed:
-		// Settled but not Ready. Degraded = infra up, monitoring broken (tests
-		// still permitted); Failed = provisioning failed (terminal). Neither
-		// auto-retries — that would loop forever against a persistently broken
-		// chart / OCI registry. Recovery is a spec edit (drift block above)
-		// or delete+recreate.
+	case dfaasv1.EnvFailed:
+		// Settled but not Ready: provisioning failed (terminal). No auto-retry
+		// — that would loop forever against a persistently broken chart / OCI
+		// registry. Recovery is a spec edit (drift block above) or
+		// delete+recreate.
 		if env.Status.ObservedGeneration == 0 {
 			// Settled without ever stamping observedGeneration (failed before
 			// reaching Ready, or pre-dates the settle-time stamp). Record the
@@ -203,7 +202,7 @@ func (r *EnvironmentReconciler) handleGenerationDrift(ctx context.Context,
 }
 
 // writer is the one way this reconciler persists Environment status. On a
-// settled phase (Ready, Failed, Degraded) SetPhase also stamps
+// settled phase (Ready, Failed) SetPhase also stamps
 // observedGeneration: it records the spec generation the controller has
 // finished processing, so a later spec edit is detected as drift at the top
 // of Reconcile. Without it an Environment that failed on its first provision
@@ -260,10 +259,6 @@ func stampEnvAggregate(env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase)
 		status = metav1.ConditionTrue
 		reason = dfaasv1.EnvReasonAllSubsystemsReady
 		message = "infrastructure + monitoring up"
-	case dfaasv1.EnvDegraded:
-		status = metav1.ConditionFalse
-		reason = dfaasv1.EnvReasonDegraded
-		message = "infrastructure up, monitoring stack unavailable; LoadTests are still permitted"
 	case dfaasv1.EnvFailed:
 		status = metav1.ConditionFalse
 		reason = dfaasv1.EnvReasonFailed
