@@ -33,83 +33,12 @@ func summaryFixture() map[string]k6Summary {
 	}
 }
 
-// rowsToMap indexes rows by "<ID_Nodo>/<MetricName>" → Valore.
-func rowsToMap(rows [][]string) map[string]string {
-	out := map[string]string{}
-	for _, r := range rows {
-		out[r[1]+"/"+r[3]] = r[6]
-	}
-	return out
-}
-
 func TestNormalizeStat(t *testing.T) {
 	cases := map[string]string{"p(95)": "p95", "p(99.9)": "p99.9", "avg": "avg"}
 	for in, want := range cases {
 		if got := normalizeStat(in); got != want {
 			t.Errorf("normalizeStat(%q) = %q, want %q", in, got, want)
 		}
-	}
-}
-
-func TestFlattenSummaryRows(t *testing.T) {
-	rows := flattenSummaryRows("node-1", "2026-08-28T10:00:00Z", summaryFixture()["node-1"])
-	m := rowsToMap(rows)
-	if m["node-1/http_req_duration_p95"] != "120" {
-		t.Errorf("p95 row = %q, want 120", m["node-1/http_req_duration_p95"])
-	}
-	if m["node-1/http_reqs_count"] != "100" {
-		t.Errorf("count row = %q, want 100", m["node-1/http_reqs_count"])
-	}
-	// fixed columns
-	r := rows[0]
-	if r[0] != "2026-08-28T10:00:00Z" || r[2] != "k6" || r[4] != "handleSummary" {
-		t.Errorf("row layout wrong: %v", r)
-	}
-}
-
-func TestAggregateSummaryRows(t *testing.T) {
-	rows := aggregateSummaryRows("2026-08-28T10:00:00Z", summaryFixture())
-	m := rowsToMap(rows)
-
-	// counter: sum of counts, per-second rate omitted
-	if m["__all__/http_reqs_count"] != "400" {
-		t.Errorf("http_reqs_count = %q, want 400", m["__all__/http_reqs_count"])
-	}
-	if _, ok := m["__all__/http_reqs_rate"]; ok {
-		t.Error("counter rate must be omitted from __all__")
-	}
-	// rate: recomputed from summed passes/fails = 70/400
-	if m["__all__/http_req_failed_rate"] != "0.175" {
-		t.Errorf("http_req_failed_rate = %q, want 0.175", m["__all__/http_req_failed_rate"])
-	}
-	// trend: min-of-min / max-of-max, percentiles and avg omitted
-	if m["__all__/http_req_duration_min"] != "5" || m["__all__/http_req_duration_max"] != "400" {
-		t.Errorf("trend min/max wrong: %v / %v",
-			m["__all__/http_req_duration_min"], m["__all__/http_req_duration_max"])
-	}
-	for _, banned := range []string{"http_req_duration_p95", "http_req_duration_avg", "vus_value"} {
-		if _, ok := m["__all__/"+banned]; ok {
-			t.Errorf("%s must be omitted from __all__", banned)
-		}
-	}
-	// gauge min/max
-	if m["__all__/vus_min"] != "1" || m["__all__/vus_max"] != "6" {
-		t.Errorf("gauge min/max wrong: %v / %v", m["__all__/vus_min"], m["__all__/vus_max"])
-	}
-}
-
-func TestAggregateZeroDenominator(t *testing.T) {
-	byNode := map[string]k6Summary{
-		"node-1": {Metrics: map[string]k6SummaryMetric{
-			"checks": {Type: "rate", Values: map[string]float64{"rate": 0, "passes": 0, "fails": 0}},
-		}},
-	}
-	m := rowsToMap(aggregateSummaryRows("2026-08-28T10:00:00Z", byNode))
-	if _, ok := m["__all__/checks_rate"]; ok {
-		t.Error("rate with zero denominator must be omitted")
-	}
-	if m["__all__/checks_passes"] != "0" {
-		t.Errorf("passes = %q, want 0", m["__all__/checks_passes"])
 	}
 }
 
@@ -187,7 +116,7 @@ func oneSeries() model.Matrix {
 	}}
 }
 
-func TestRunWritesTheEightColumnCSV(t *testing.T) {
+func TestRunStoresTheThreeCSVs(t *testing.T) {
 	sink := &fakeSink{}
 	rows, err := run(context.Background(), testConfig(), &cannedQuerier{matrix: oneSeries()}, sink)
 	if err != nil {
@@ -197,60 +126,56 @@ func TestRunWritesTheEightColumnCSV(t *testing.T) {
 		t.Errorf("rows = %d, want 2", rows)
 	}
 
-	body, ok := sink.bodies["CSV"]
-	if !ok {
-		t.Fatalf("no CSV artifact stored; got %v", sink.labels())
+	// The status CSV is stored first: it is the one artifact that has to
+	// survive an export that fails on the next line.
+	if got := sink.labels(); len(got) < 3 || got[0] != "QUERY STATUS" {
+		t.Fatalf("stored %v, want QUERY STATUS first", got)
 	}
-	records, err := csv.NewReader(strings.NewReader(body)).ReadAll()
-	if err != nil {
-		t.Fatalf("parse CSV: %v", err)
+	for _, want := range []string{"QUERY STATUS", "CSV", "K6 CSV"} {
+		if _, ok := sink.bodies[want]; !ok {
+			t.Errorf("no %q artifact; got %v", want, sink.labels())
+		}
 	}
-	if len(records) != 3 { // header + two samples
-		t.Fatalf("want header + 2 rows, got %d records", len(records))
+
+	keys := map[string]string{}
+	for _, a := range sink.got {
+		keys[a.Label] = a.Key
 	}
-	wantHeader := []string{
-		"Timestamp", "ID_Nodo", "Type", "MetricName", "Query", "Comment", "Valore", "Labels",
+	want := map[string]string{
+		"QUERY STATUS": "metrics/lt-sample/query-status-20260909T120000Z.csv",
+		"CSV":          "metrics/lt-sample/20260909T120000Z.csv",
+		"K6 CSV":       "k6/lt-sample/summary-20260909T120000Z.csv",
 	}
-	if !reflect.DeepEqual(records[0], wantHeader) {
-		t.Errorf("header = %v, want %v", records[0], wantHeader)
+	for label, wantKey := range want {
+		if keys[label] != wantKey {
+			t.Errorf("%s key = %q, want %q", label, keys[label], wantKey)
+		}
 	}
-	if got := len(records[1]); got != 8 {
-		t.Errorf("row has %d columns, want 8", got)
+
+	records := parseCSV(t, []byte(sink.bodies["CSV"]))
+	if got := column(t, records, 1, "node_id"); got != "w1" {
+		t.Errorf("node_id = %q, want w1", got)
 	}
-	// The columns the operator and the thesis read back by position.
-	if records[1][1] != "w1" {
-		t.Errorf("ID_Nodo = %q, want the series' node_id", records[1][1])
-	}
-	if records[1][2] != "raw" || records[1][3] != "cpu" {
-		t.Errorf("Type/MetricName = %q/%q, want raw/cpu", records[1][2], records[1][3])
-	}
-	if records[1][5] != "cpu time" {
-		t.Errorf("Comment = %q, want the entry's comment", records[1][5])
-	}
-	if records[1][6] != "1.5" {
-		t.Errorf("Valore = %q, want 1.5", records[1][6])
-	}
-	if !strings.Contains(records[1][7], "node_id") {
-		t.Errorf("Labels = %q, want the full label set", records[1][7])
-	}
-	// The CSV object key, which the UI turns into a results link.
-	if key := sink.got[0].Key; !strings.HasPrefix(key, "metrics/lt-sample/") || !strings.HasSuffix(key, ".csv") {
-		t.Errorf("key = %q, want metrics/<loadtest>/<ts>.csv", key)
+	if got := column(t, records, 1, "query_name"); got != "cpu" {
+		t.Errorf("query_name = %q, want cpu", got)
 	}
 }
 
-// A series with no node_id label still has to land somewhere identifiable.
-func TestRunLabelsUnknownNode(t *testing.T) {
+// Every entry of spec.metricsExport.metrics gets a row in the status CSV,
+// including one the exporter never ran.
+func TestRunReportsASkippedQueryInTheStatusCSV(t *testing.T) {
+	cfg := testConfig()
+	cfg.Metrics = append(cfg.Metrics, MetricEntry{Type: "raw", MetricName: "nothing", Query: ""})
 	sink := &fakeSink{}
-	matrix := model.Matrix{{
-		Metric: model.Metric{"job": "dfaas"},
-		Values: []model.SamplePair{{Timestamp: model.Time(1757419200000), Value: 1}},
-	}}
-	if _, err := run(context.Background(), testConfig(), &cannedQuerier{matrix: matrix}, sink); err != nil {
+	if _, err := run(context.Background(), cfg, &cannedQuerier{matrix: oneSeries()}, sink); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if !strings.Contains(sink.bodies["CSV"], ",unknown,") {
-		t.Errorf("a series with no node_id must be recorded as \"unknown\":\n%s", sink.bodies["CSV"])
+	records := parseCSV(t, []byte(sink.bodies["QUERY STATUS"]))
+	if len(records) != 3 {
+		t.Fatalf("want header + one row per configured metric, got %d", len(records))
+	}
+	if got := column(t, records, 2, "error"); got == "" {
+		t.Error("an entry with an empty query must say why it produced nothing")
 	}
 }
 
@@ -268,9 +193,12 @@ func TestRunRefusesAnEmptyExport(t *testing.T) {
 	if !strings.Contains(err.Error(), "0 data points") {
 		t.Errorf("error should say what went wrong: %v", err)
 	}
-	// And nothing was stored: an empty CSV must not reach the object store.
-	if len(sink.got) != 0 {
-		t.Errorf("stored %v despite an empty export", sink.labels())
+	// The status CSV is stored anyway -- it is what names the query that
+	// failed, and the Job's logs leave with its pod. The metrics CSV is not:
+	// an empty file beside a Failed LoadTest reads like a successful run that
+	// measured nothing.
+	if got := sink.labels(); len(got) != 1 || got[0] != "QUERY STATUS" {
+		t.Errorf("stored %v, want only the query status CSV", got)
 	}
 }
 
@@ -362,8 +290,8 @@ func TestRunToleratesAMissingLogDir(t *testing.T) {
 	if _, err := run(context.Background(), cfg, &cannedQuerier{matrix: oneSeries()}, sink); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if got := sink.labels(); len(got) != 1 || got[0] != "CSV" {
-		t.Errorf("stored %v, want only the CSV", got)
+	if got := sink.labels(); len(got) != 3 {
+		t.Errorf("stored %v, want the three CSVs and no k6 log", got)
 	}
 }
 
@@ -502,18 +430,424 @@ func TestBucketNameFor(t *testing.T) {
 	}
 }
 
-// The three key builders, whose layout the UI turns into browsable links.
+// The key builders, whose layout the UI turns into browsable links. Every
+// artifact of one run shares the stamp, so a retried exporter Job overwrites
+// its own objects instead of leaving near-identical copies minutes apart.
+func TestConfigStampIsTheWindowEnd(t *testing.T) {
+	if got := testConfig().Stamp(); got != "20260909T120000Z" {
+		t.Errorf("Stamp() = %q, want END_TIME in compact UTC", got)
+	}
+}
+
 func TestObjectKeyLayout(t *testing.T) {
-	if got := objectKeyFor("lt-sample"); !strings.HasPrefix(got, "metrics/lt-sample/") ||
-		!strings.HasSuffix(got, ".csv") {
-		t.Errorf("objectKeyFor = %q, want metrics/<loadtest>/<ts>.csv", got)
+	const stamp = "20260909T120000Z"
+	cases := []struct{ got, want string }{
+		{objectKeyFor("lt-sample", stamp), "metrics/lt-sample/20260909T120000Z.csv"},
+		{queryStatusKeyFor("lt-sample", stamp), "metrics/lt-sample/query-status-20260909T120000Z.csv"},
+		{k6SummaryCSVKeyFor("lt-sample", stamp), "k6/lt-sample/summary-20260909T120000Z.csv"},
+		{k6ObjectKeyFor("lt-sample", "gen-a", stamp), "k6/lt-sample/gen-a-20260909T120000Z.log"},
+		{k6SummaryKeyFor("lt-sample", "gen-a", stamp), "k6/lt-sample/gen-a-summary-20260909T120000Z.json"},
 	}
-	if got := k6ObjectKeyFor("lt-sample", "gen-a"); !strings.HasPrefix(got, "k6/lt-sample/gen-a-") ||
-		!strings.HasSuffix(got, ".log") {
-		t.Errorf("k6ObjectKeyFor = %q, want k6/<loadtest>/<nodeID>-<ts>.log", got)
+	for _, c := range cases {
+		if c.got != c.want {
+			t.Errorf("key = %q, want %q", c.got, c.want)
+		}
 	}
-	if got := k6SummaryKeyFor("lt-sample", "gen-a"); !strings.HasPrefix(got, "k6/lt-sample/gen-a-summary-") ||
-		!strings.HasSuffix(got, ".json") {
-		t.Errorf("k6SummaryKeyFor = %q, want k6/<loadtest>/<nodeID>-summary-<ts>.json", got)
+}
+
+// --- CSV A: the wide Prometheus layout ------------------------------------
+//
+// Every label of every series becomes a column: the old layout promoted
+// node_id and crushed the rest into one cell as {__name__="x", job="y"},
+// which needs a regex before pandas can group by anything.
+
+// parseCSV is the check every CSV test starts with: valid CSV, header first.
+func parseCSV(t *testing.T, body []byte) [][]string {
+	t.Helper()
+	records, err := csv.NewReader(bytes.NewReader(body)).ReadAll()
+	if err != nil {
+		t.Fatalf("parse CSV: %v\n%s", err, body)
+	}
+	if len(records) == 0 {
+		t.Fatal("CSV has no header")
+	}
+	return records
+}
+
+// column returns one row's value for a named column.
+func column(t *testing.T, records [][]string, row int, name string) string {
+	t.Helper()
+	for i, h := range records[0] {
+		if h == name {
+			return records[row][i]
+		}
+	}
+	t.Fatalf("no column %q in header %v", name, records[0])
+	return ""
+}
+
+func seriesWith(labels model.Metric, values ...float64) *model.SampleStream {
+	s := &model.SampleStream{Metric: labels}
+	for i, v := range values {
+		s.Values = append(s.Values, model.SamplePair{
+			Timestamp: model.Time(1757419200000 + int64(i)*15000),
+			Value:     model.SampleValue(v),
+		})
+	}
+	return s
+}
+
+func TestMetricsCSVPutsEveryLabelInItsOwnColumn(t *testing.T) {
+	results := []queryResult{{
+		entry:  MetricEntry{Type: "raw", MetricName: "cpu", Query: "node_cpu_seconds_total", Comment: "cpu time"},
+		matrix: model.Matrix{seriesWith(model.Metric{"__name__": "node_cpu_seconds_total", "node_id": "w1", "job": "dfaas"}, 1.5, 2.5)},
+	}}
+	body, rows := buildMetricsCSV("lt-sample", results)
+	if rows != 2 {
+		t.Errorf("rows = %d, want one per sample", rows)
+	}
+	records := parseCSV(t, body)
+
+	want := []string{
+		"timestamp", "node_id", "value", "loadtest",
+		"query_name", "query_type", "query_expr", "query_comment",
+		"__name__", "job",
+	}
+	if !reflect.DeepEqual(records[0], want) {
+		t.Fatalf("header = %v, want %v", records[0], want)
+	}
+	if got := column(t, records, 1, "node_id"); got != "w1" {
+		t.Errorf("node_id = %q, want w1", got)
+	}
+	if got := column(t, records, 1, "job"); got != "dfaas" {
+		t.Errorf("job = %q, want dfaas", got)
+	}
+	if got := column(t, records, 1, "value"); got != "1.5" {
+		t.Errorf("value = %q, want 1.5", got)
+	}
+	if got := column(t, records, 1, "loadtest"); got != "lt-sample" {
+		t.Errorf("loadtest = %q, want lt-sample", got)
+	}
+	if got := column(t, records, 1, "query_comment"); got != "cpu time" {
+		t.Errorf("query_comment = %q, want the entry's comment", got)
+	}
+	if got := column(t, records, 1, "timestamp"); got != "2025-09-09T12:00:00Z" {
+		t.Errorf("timestamp = %q, want RFC3339 UTC", got)
+	}
+}
+
+// Two queries with different label sets share one header: the union, with an
+// empty cell where a series does not carry that label.
+func TestMetricsCSVUnionsLabelsAcrossQueries(t *testing.T) {
+	results := []queryResult{
+		{
+			entry:  MetricEntry{Type: "raw", MetricName: "cpu", Query: "cpu"},
+			matrix: model.Matrix{seriesWith(model.Metric{"node_id": "w1", "job": "dfaas"}, 1)},
+		},
+		{
+			entry:  MetricEntry{Type: "custom-promql", MetricName: "invocations", Query: "rate(x[1m])"},
+			matrix: model.Matrix{seriesWith(model.Metric{"node_id": "w2", "function_name": "figlet"}, 2)},
+		},
+	}
+	records := parseCSV(t, mustBody(buildMetricsCSV("lt-sample", results)))
+	if len(records) != 3 {
+		t.Fatalf("want header + 2 rows, got %d", len(records))
+	}
+	for _, name := range []string{"job", "function_name"} {
+		found := false
+		for _, h := range records[0] {
+			if h == name {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("header %v is missing %q", records[0], name)
+		}
+	}
+	if got := column(t, records, 1, "function_name"); got != "" {
+		t.Errorf("a series without function_name must leave the cell empty, got %q", got)
+	}
+	if got := column(t, records, 2, "job"); got != "" {
+		t.Errorf("a series without job must leave the cell empty, got %q", got)
+	}
+	if got := column(t, records, 2, "function_name"); got != "figlet" {
+		t.Errorf("function_name = %q, want figlet", got)
+	}
+}
+
+// A label named like a fixed column would produce two columns with the same
+// name, which read_csv silently renames to value.1 -- three wrong plots later
+// you find out.
+func TestMetricsCSVSuffixesALabelThatCollidesWithAFixedColumn(t *testing.T) {
+	results := []queryResult{{
+		entry:  MetricEntry{Type: "raw", MetricName: "odd", Query: "odd"},
+		matrix: model.Matrix{seriesWith(model.Metric{"node_id": "w1", "value": "42", "loadtest": "other"}, 7)},
+	}}
+	records := parseCSV(t, mustBody(buildMetricsCSV("lt-sample", results)))
+	seen := map[string]int{}
+	for _, h := range records[0] {
+		seen[h]++
+	}
+	for h, n := range seen {
+		if n > 1 {
+			t.Errorf("column %q appears %d times in %v", h, n, records[0])
+		}
+	}
+	if got := column(t, records, 1, "value"); got != "7" {
+		t.Errorf("value = %q, want the sample value", got)
+	}
+	if got := column(t, records, 1, "value_label"); got != "42" {
+		t.Errorf("value_label = %q, want the label's value", got)
+	}
+	if got := column(t, records, 1, "loadtest_label"); got != "other" {
+		t.Errorf("loadtest_label = %q, want the label's value", got)
+	}
+}
+
+// No node_id leaves the cell empty (NaN in pandas), which is filterable --
+// the old "unknown" string was not.
+func TestMetricsCSVLeavesAMissingNodeIDEmpty(t *testing.T) {
+	results := []queryResult{{
+		entry:  MetricEntry{Type: "raw", MetricName: "cpu", Query: "cpu"},
+		matrix: model.Matrix{seriesWith(model.Metric{"job": "dfaas"}, 1)},
+	}}
+	records := parseCSV(t, mustBody(buildMetricsCSV("lt-sample", results)))
+	if got := column(t, records, 1, "node_id"); got != "" {
+		t.Errorf("node_id = %q, want an empty cell", got)
+	}
+}
+
+// A query that errored contributes no rows but must not break the header.
+func TestMetricsCSVIgnoresFailedQueries(t *testing.T) {
+	results := []queryResult{
+		{entry: MetricEntry{Type: "raw", MetricName: "gone", Query: "gone"}, err: errors.New("unreachable")},
+		{
+			entry:  MetricEntry{Type: "raw", MetricName: "cpu", Query: "cpu"},
+			matrix: model.Matrix{seriesWith(model.Metric{"node_id": "w1"}, 1)},
+		},
+	}
+	body, rows := buildMetricsCSV("lt-sample", results)
+	if rows != 1 {
+		t.Errorf("rows = %d, want only the successful query's sample", rows)
+	}
+	records := parseCSV(t, body)
+	if len(records) != 2 {
+		t.Fatalf("want header + 1 row, got %d", len(records))
+	}
+}
+
+func mustBody(body []byte, _ int) []byte { return body }
+
+// --- CSV B: one row per query, whatever happened ---------------------------
+//
+// A query with a typo returns zero series and nothing else says so: the metric
+// is simply absent from every plot. This file is where "did all my queries
+// work?" gets an answer that survives the Job's pod.
+
+func TestQueryStatusCSVReportsEveryQuery(t *testing.T) {
+	results := []queryResult{
+		{
+			entry:    MetricEntry{Type: "raw", MetricName: "cpu", Query: "node_cpu_seconds_total"},
+			matrix:   model.Matrix{seriesWith(model.Metric{"node_id": "w1"}, 1, 2, 3)},
+			warnings: []string{"series limit hit"},
+		},
+		{
+			entry: MetricEntry{Type: "raw", MetricName: "gone", Query: "typo_metric"},
+		},
+		{
+			entry: MetricEntry{Type: "custom-promql", MetricName: "broken", Query: "rate("},
+			err:   errors.New("parse error at char 5"),
+		},
+	}
+	records := parseCSV(t, buildQueryStatusCSV("lt-sample", results))
+
+	want := []string{"loadtest", "query_name", "query_type", "query_expr", "series", "samples", "warnings", "error"}
+	if !reflect.DeepEqual(records[0], want) {
+		t.Fatalf("header = %v, want %v", records[0], want)
+	}
+	if len(records) != 4 {
+		t.Fatalf("want header + one row per query, got %d records", len(records))
+	}
+
+	if got := column(t, records, 1, "series"); got != "1" {
+		t.Errorf("series = %q, want 1", got)
+	}
+	if got := column(t, records, 1, "samples"); got != "3" {
+		t.Errorf("samples = %q, want 3", got)
+	}
+	if got := column(t, records, 1, "warnings"); got != "series limit hit" {
+		t.Errorf("warnings = %q, want the Prometheus warning", got)
+	}
+	if got := column(t, records, 1, "error"); got != "" {
+		t.Errorf("error = %q, want empty on a query that worked", got)
+	}
+	// The silent one: no error, no data.
+	if got := column(t, records, 2, "series"); got != "0" {
+		t.Errorf("a query that matched nothing must report series=0, got %q", got)
+	}
+	if got := column(t, records, 3, "error"); got != "parse error at char 5" {
+		t.Errorf("error = %q, want the query's error", got)
+	}
+	if got := column(t, records, 3, "query_expr"); got != "rate(" {
+		t.Errorf("query_expr = %q, want the PromQL as sent", got)
+	}
+}
+
+// --- CSV C: the k6 summaries, long ----------------------------------------
+//
+// One row per (node, metric, stat), with the k6 type the old layout discarded
+// and without the END_TIME the old rows wore as if it were an instant of
+// measurement. The whole-window aggregates have no timestamp; they have a
+// window, and it is in the columns.
+
+func k6TestConfig() Config {
+	cfg := testConfig()
+	cfg.EnvName = "bari"
+	cfg.Summaries = []summarySource{
+		{NodeID: "node-1", URL: "http://filer/node-1"},
+		{NodeID: "node-2", URL: "http://filer/node-2"},
+	}
+	return cfg
+}
+
+// k6Cell indexes "<node>/<metric>/<stat>" → the named column.
+func k6Cell(t *testing.T, records [][]string, key, col string) string {
+	t.Helper()
+	at := map[string]int{}
+	for i, h := range records[0] {
+		at[h] = i
+	}
+	for i, r := range records[1:] {
+		if r[at["node_id"]]+"/"+r[at["metric"]]+"/"+r[at["stat"]] == key {
+			return column(t, records, i+1, col)
+		}
+	}
+	t.Fatalf("no row %q in %v", key, records)
+	return ""
+}
+
+func TestK6CSVIsLongAndKeepsTheK6Type(t *testing.T) {
+	records := parseCSV(t, buildK6CSV(k6TestConfig(), summaryFixture(), nil))
+
+	want := []string{
+		"loadtest", "environment", "window_start", "window_end",
+		"node_id", "metric", "metric_type", "stat", "value", "note",
+	}
+	if !reflect.DeepEqual(records[0], want) {
+		t.Fatalf("header = %v, want %v", records[0], want)
+	}
+	if got := k6Cell(t, records, "node-1/http_req_duration/p95", "value"); got != "120" {
+		t.Errorf("p95 = %q, want 120", got)
+	}
+	if got := k6Cell(t, records, "node-1/http_req_duration/p95", "metric_type"); got != "trend" {
+		t.Errorf("metric_type = %q, want trend -- the k6 type the CSV used to drop", got)
+	}
+	if got := k6Cell(t, records, "node-2/http_reqs/count", "value"); got != "300" {
+		t.Errorf("count = %q, want 300", got)
+	}
+	if got := k6Cell(t, records, "node-1/http_reqs/count", "window_end"); got != "2026-09-09T12:00:00Z" {
+		t.Errorf("window_end = %q, want the end of the test window", got)
+	}
+	if got := k6Cell(t, records, "node-1/http_reqs/count", "window_start"); got != "2026-09-09T11:59:00Z" {
+		t.Errorf("window_start = %q, want the start of the test window", got)
+	}
+	if got := k6Cell(t, records, "node-1/http_reqs/count", "environment"); got != "bari" {
+		t.Errorf("environment = %q, want the Environment name", got)
+	}
+	// The cross-node aggregate is gone: pandas does it in one groupby, and
+	// "__all__" inside node_id double-counted every ungrouped sum.
+	for _, r := range records {
+		for _, cell := range r {
+			if cell == "__all__" {
+				t.Errorf("no row may carry __all__: %v", r)
+			}
+		}
+	}
+}
+
+// Every expected Generator gets a meta row, so a node that never answered is
+// present with 0 instead of simply absent.
+func TestK6CSVMarksEveryExpectedNode(t *testing.T) {
+	byNode := map[string]k6Summary{"node-1": summaryFixture()["node-1"]}
+	notes := map[string]string{"node-2": "connection refused"}
+	records := parseCSV(t, buildK6CSV(k6TestConfig(), byNode, notes))
+
+	if got := k6Cell(t, records, "node-1/dfaas_summary_fetched/value", "value"); got != "1" {
+		t.Errorf("a node that answered must be marked 1, got %q", got)
+	}
+	if got := k6Cell(t, records, "node-1/dfaas_summary_fetched/value", "note"); got != "" {
+		t.Errorf("note = %q, want empty for a node that answered", got)
+	}
+	if got := k6Cell(t, records, "node-2/dfaas_summary_fetched/value", "value"); got != "0" {
+		t.Errorf("a node that never answered must be marked 0, got %q", got)
+	}
+	if got := k6Cell(t, records, "node-2/dfaas_summary_fetched/value", "note"); got != "connection refused" {
+		t.Errorf("note = %q, want the failure reason", got)
+	}
+	if got := k6Cell(t, records, "node-1/dfaas_summary_fetched/value", "metric_type"); got != "meta" {
+		t.Errorf("metric_type = %q, want meta so the row filters out of any analysis", got)
+	}
+	// The data rows are the answering node's only.
+	for _, r := range records[1:] {
+		if r[4] == "node-2" && r[6] != "meta" {
+			t.Errorf("node-2 produced no summary, so it can have no data row: %v", r)
+		}
+	}
+}
+
+func TestK6CSVWithNoGeneratorsIsHeaderOnly(t *testing.T) {
+	cfg := testConfig()
+	cfg.Summaries = nil
+	records := parseCSV(t, buildK6CSV(cfg, nil, nil))
+	if len(records) != 1 {
+		t.Errorf("want header only, got %d records: %v", len(records), records)
+	}
+}
+
+// Suffixing a colliding label can collide again: a series carrying both
+// "value" (renamed to value_label) and a label literally named "value_label"
+// used to write both into one column, and Go's randomized map iteration picked
+// the winner per row -- the same export, run twice, disagreed. A synthesized
+// label from label_replace() in a custom-promql entry is enough to hit it.
+func TestMetricsCSVKeepsTwiceCollidingLabelsApart(t *testing.T) {
+	results := []queryResult{{
+		entry: MetricEntry{Type: "custom-promql", MetricName: "odd", Query: "label_replace(x, ...)"},
+		matrix: model.Matrix{seriesWith(model.Metric{
+			"node_id": "w1", "value": "labelA", "value_label": "labelB",
+		}, 7)},
+	}}
+
+	first := parseCSV(t, mustBody(buildMetricsCSV("lt-sample", results)))
+	if got := column(t, first, 1, "value"); got != "7" {
+		t.Errorf("value = %q, want the sample value", got)
+	}
+	seen := map[string]int{}
+	for _, h := range first[0] {
+		seen[h]++
+	}
+	for h, n := range seen {
+		if n > 1 {
+			t.Errorf("column %q appears %d times in %v", h, n, first[0])
+		}
+	}
+	// Both labels must survive, in different columns, with their own values.
+	values := map[string]bool{}
+	for i, h := range first[0] {
+		if strings.HasPrefix(h, "value_label") {
+			values[first[1][i]] = true
+		}
+	}
+	for _, want := range []string{"labelA", "labelB"} {
+		if !values[want] {
+			t.Errorf("label value %q was dropped; header %v, row %v", want, first[0], first[1])
+		}
+	}
+
+	// And the mapping is stable: same input, same bytes, every time.
+	base := mustBody(buildMetricsCSV("lt-sample", results))
+	for i := 0; i < 20; i++ {
+		if again := mustBody(buildMetricsCSV("lt-sample", results)); !bytes.Equal(base, again) {
+			t.Fatalf("buildMetricsCSV is not deterministic:\n%s\nvs\n%s", base, again)
+		}
 	}
 }

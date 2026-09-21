@@ -46,6 +46,9 @@ type Config struct {
 	Metrics      []MetricEntry
 	ExpName      string
 	LoadTestName string
+	// EnvName is the Environment the test ran against. It labels the k6 CSV,
+	// whose rows carry no Prometheus labels to say where they came from.
+	EnvName string
 	// Summaries are the per-Generator filer URLs. Empty means the k6 summary
 	// step is skipped entirely -- scripts generated before the feature, or a
 	// LoadTest with no Generators.
@@ -64,6 +67,7 @@ func ConfigFromEnv() (Config, error) {
 		PromURL:      os.Getenv("PROM_URL"),
 		ExpName:      os.Getenv("EXP_NAME"),
 		LoadTestName: os.Getenv("LOADTEST_NAME"),
+		EnvName:      os.Getenv("ENV_NAME"),
 		K6LogDir:     os.Getenv("K6_LOG_DIR"),
 		S3: S3Config{
 			BucketPrefix: os.Getenv("S3_BUCKET_PREFIX"),
@@ -123,8 +127,19 @@ func parseRange(startStr, endStr, stepStr string) (PromRange, error) {
 	return PromRange{Start: start, End: end, Step: step}, nil
 }
 
-// EndTimeString is the timestamp stamped on every k6 summary row. The old code
-// carried the raw END_TIME string around for this; it is the same value.
+// StartTimeString and EndTimeString are the test window, written onto every
+// k6 summary row: those rows aggregate the whole window and have no instant of
+// their own.
+func (c Config) StartTimeString() string {
+	return c.Range.Start.UTC().Format(time.RFC3339)
+}
+
 func (c Config) EndTimeString() string {
-	return c.Range.End.Format(time.RFC3339)
+	return c.Range.End.UTC().Format(time.RFC3339)
+}
+
+// Stamp identifies one export in every object key. It is the end of the test
+// window, not the clock: the same run always produces the same keys.
+func (c Config) Stamp() string {
+	return c.Range.End.UTC().Format("20060102T150405Z")
 }

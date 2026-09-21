@@ -274,7 +274,7 @@ kubectl apply -f config/samples/dfaas_v1_loadtest.yaml
 
 ## 📊 Metrics export
 
-During the `Exporting` phase, the LoadTestReconciler creates `<lt>-exporter-<uid8>-g<generation>-job` running the `dfaas-exporter` image. It pulls metrics from the management-cluster Prometheus over `[startTime, endTime]` (entries come from `spec.metricsExport.metrics`) and writes them to a CSV.
+During the `Exporting` phase, the LoadTestReconciler creates `<lt>-exporter-<uid8>-g<generation>-job` running the `dfaas-exporter` image. It pulls metrics from the management-cluster Prometheus over `[startTime, endTime]` (entries come from `spec.metricsExport.metrics`) and writes three CSVs.
 
 **Export cool-down — 1 minute.** Entering `Exporting` does not create the Job immediately: the reconciler holds until one minute has elapsed since `status.endTime`, reporting `MetricsExported=Unknown (reason=ExportCooldown)` with a countdown while it waits. This is not padding. The management Prometheus does not scrape the workers directly — it **federates** from each worker's own Prometheus at the chart-default `global.scrape_interval` of **1m** (the per-VM Prometheus scrapes at 5s, but that is only the first hop). Querying the instant k6 stops therefore truncates the CSV by up to a full federation period, and by a *different* amount on every run depending where `endTime` falls in the cycle — which silently makes the tails of two otherwise-identical runs incomparable. The wait guarantees at least one federation pull covering the end of the run.
 
@@ -287,9 +287,19 @@ The destination is decided on the **Environment**, not the LoadTest: every LoadT
 | `s3ConfigRef` **unset** | Exports to the built-in `seaweedfs-default` config (in-cluster SeaweedFS) — **zero S3 setup required**. Only if that default Secret has been deleted does the exporter fall back to a stdout dump between `----- BEGIN CSV -----` / `----- END CSV -----` markers. |
 | `s3ConfigRef` **set**   | Exporter `HeadBucket` → `CreateBucket` (when missing) → `PutObject` against the registered endpoint. Bucket name is derived from the Environment. A **missing** explicitly-referenced Secret fails the LoadTest (loud, since it was asked for).                    |
 
-**Bucket per environment.** The exporter computes the bucket name deterministically from the Environment name + the first 6 hex chars of the Environment UID, yielding a name like `my-env-a1b2c3` that satisfies S3's 3–63 char DNS rule and avoids global-namespace collisions. The bucket is created on the first LoadTest export and reused for every subsequent one in that Environment. Object key per upload: `metrics/<loadtest-name>/<UTC RFC3339-compact>.csv`.
+**Bucket per environment.** The exporter computes the bucket name deterministically from the Environment name + the first 6 hex chars of the Environment UID, yielding a name like `my-env-a1b2c3` that satisfies S3's 3–63 char DNS rule and avoids global-namespace collisions. The bucket is created on the first LoadTest export and reused for every subsequent one in that Environment.
 
-**Per-VM k6 logs.** Alongside the metrics CSV, the exporter also ships each k6 runner's end-of-test summary to the same S3 sink under `k6/<loadtest>/<nodeID>-<UTC>.log` (captured per k6-load-generator node during `Exporting`); with no S3 sink these are dumped between per-node stdout markers instead.
+**What one export writes.** Five objects, all stamped with the same `<stamp>` — the end of the test window in compact UTC, not the clock — so a retried Job overwrites its own objects and the files of one run pair by name:
+
+| Key | Contents |
+| --- | --- |
+| `metrics/<loadtest>/<stamp>.csv` | one row per (series, sample); **every Prometheus label is its own column**, the union across the run, empty where a series lacks it |
+| `metrics/<loadtest>/query-status-<stamp>.csv` | one row per entry of `spec.metricsExport.metrics`: series and samples returned, Prometheus warnings, error. A query that matches nothing is otherwise invisible |
+| `k6/<loadtest>/summary-<stamp>.csv` | the k6 end-of-test summaries, long: `node_id, metric, metric_type, stat, value`, plus one `dfaas_summary_fetched` row per expected Generator (`1`/`0` and the failure reason) |
+| `k6/<loadtest>/<nodeID>-summary-<stamp>.json` | each Generator's raw `handleSummary` JSON, verbatim |
+| `k6/<loadtest>/<nodeID>-<stamp>.log` | each k6 runner's captured output |
+
+Only the metrics CSV is fatal: it fails the Job when every query came back empty, and the query-status CSV is uploaded first so that failure still leaves the diagnosis behind. Everything k6 warns and continues — the summary CSV is written even with no Generators at all, header only. With no S3 sink each object is dumped between its own stdout markers instead.
 
 At LoadTest export time the operator mirrors the referenced Secret into the LoadTest namespace (cross-namespace Secret mounts are not supported by Kubernetes — the mirror is required). The mirror carries **no OwnerRef**: it is a shared, reusable artifact that any LoadTest against any Environment may consume, so it is not cascade-deleted with a single LoadTest. Orphans are labelled `dfaas.io/s3-config=true` for later cleanup.
 

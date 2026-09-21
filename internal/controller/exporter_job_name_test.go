@@ -3,8 +3,10 @@ package controller
 import (
 	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 
@@ -69,5 +71,42 @@ func TestExporterJobNameStaysUniquePerGeneration(t *testing.T) {
 func TestBoundedJobNameKeepsShortNamesVerbatim(t *testing.T) {
 	if got, want := ansible.BoundedJobName("env", "-infra-vms-abcd1234-g1-job"), "env-infra-vms-abcd1234-g1-job"; got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// The exporter writes the LoadTest and Environment names into every CSV row,
+// so a run keeps its identity when ten of them are concatenated for analysis.
+// Both used to be set only inside the S3 block, which left them empty on the
+// stdout path -- and left the object keys built from an empty LoadTest name.
+func TestExporterJobNamesTheRunWithoutS3(t *testing.T) {
+	sch := runtime.NewScheme()
+	if err := dfaasv1.AddToScheme(sch); err != nil {
+		t.Fatal(err)
+	}
+	r := &LoadTestReconciler{Scheme: sch}
+	lt := &dfaasv1.LoadTest{
+		ObjectMeta: metav1.ObjectMeta{Name: "lt-sample", Namespace: "default", UID: types.UID("1"), Generation: 1},
+		Spec: dfaasv1.LoadTestSpec{
+			MetricsExport: dfaasv1.MetricsExportSpec{
+				Metrics: []dfaasv1.MetricExportEntry{{Type: dfaasv1.MetricTypeRaw, Query: "up"}},
+			},
+		},
+	}
+	env := &dfaasv1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "bari", Namespace: "default", UID: types.UID("2")}}
+
+	// No S3 config Secret: the stdout path, where these used to go missing.
+	job, err := r.createExporterJob(lt, env, time.Now().Add(-time.Minute), time.Now(), "", nil)
+	if err != nil {
+		t.Fatalf("createExporterJob: %v", err)
+	}
+	got := map[string]string{}
+	for _, e := range job.Spec.Template.Spec.Containers[0].Env {
+		got[e.Name] = e.Value
+	}
+	if got["LOADTEST_NAME"] != "lt-sample" {
+		t.Errorf("LOADTEST_NAME = %q, want the LoadTest name", got["LOADTEST_NAME"])
+	}
+	if got["ENV_NAME"] != "bari" {
+		t.Errorf("ENV_NAME = %q, want the Environment name", got["ENV_NAME"])
 	}
 }

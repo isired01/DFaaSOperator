@@ -57,42 +57,45 @@ type k6Summary struct {
 	Metrics map[string]k6SummaryMetric `json:"metrics"`
 }
 
-// summaryAllNodes is the ID_Nodo value of the cross-node aggregate rows.
-const summaryAllNodes = "__all__"
-
 // fetchSummaries GETs each node's summary JSON from the filer (10s timeout
 // each). Per-node fetch or parse failures warn and skip — the Prometheus
-// metrics are still valuable, so this path is never fatal. Returns parsed
-// summaries and the raw bytes (for the verbatim S3 upload), both keyed by
-// nodeID.
-func fetchSummaries(ctx context.Context, sources []summarySource) (map[string]k6Summary, map[string][]byte) {
+// metrics are still valuable, so this path is never fatal. Returns the parsed
+// summaries, the raw bytes (for the verbatim S3 upload) and, per node that
+// produced nothing, the reason: it becomes the note on that node's roster row,
+// which is the only place it survives the Job's pod.
+func fetchSummaries(ctx context.Context, sources []summarySource) (map[string]k6Summary, map[string][]byte, map[string]string) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	parsed := make(map[string]k6Summary)
 	raw := make(map[string][]byte)
+	notes := make(map[string]string)
+	fail := func(nodeID, reason string) {
+		fmt.Printf("k6 summary for node %s: %s\n", nodeID, reason)
+		notes[nodeID] = reason
+	}
 	for _, src := range sources {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, src.URL, nil)
 		if err != nil {
-			fmt.Printf("k6 summary for node %s: build request: %v\n", src.NodeID, err)
+			fail(src.NodeID, fmt.Sprintf("build request: %v", err))
 			continue
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			fmt.Printf("k6 summary for node %s: fetch %s: %v\n", src.NodeID, src.URL, err)
+			fail(src.NodeID, fmt.Sprintf("fetch %s: %v", src.URL, err))
 			continue
 		}
 		body, rerr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("k6 summary for node %s: %s returned %s\n", src.NodeID, src.URL, resp.Status)
+			fail(src.NodeID, fmt.Sprintf("%s returned %s", src.URL, resp.Status))
 			continue
 		}
 		if rerr != nil {
-			fmt.Printf("k6 summary for node %s: read body: %v\n", src.NodeID, rerr)
+			fail(src.NodeID, fmt.Sprintf("read body: %v", rerr))
 			continue
 		}
 		var s k6Summary
 		if err := json.Unmarshal(body, &s); err != nil {
-			fmt.Printf("k6 summary for node %s: parse error: %v\n", src.NodeID, err)
+			fail(src.NodeID, fmt.Sprintf("parse error: %v", err))
 			continue
 		}
 		if len(s.Metrics) == 0 {
@@ -101,13 +104,13 @@ func fetchSummaries(ctx context.Context, sources []summarySource) (map[string]k6
 			if len(snippet) > 200 {
 				snippet = snippet[:200]
 			}
-			fmt.Printf("k6 summary for node %s: no metrics parsed; first bytes: %s\n", src.NodeID, snippet)
+			fail(src.NodeID, fmt.Sprintf("no metrics parsed; first bytes: %s", snippet))
 			continue
 		}
 		parsed[src.NodeID] = s
 		raw[src.NodeID] = body
 	}
-	return parsed, raw
+	return parsed, raw, notes
 }
 
 // normalizeStat makes k6 stat names CSV/analysis friendly: p(95) → p95.
@@ -115,119 +118,204 @@ func normalizeStat(stat string) string {
 	return strings.NewReplacer("(", "", ")", "").Replace(stat)
 }
 
-// summaryRow builds one CSV row in the existing 8-column layout. Query is the
-// fixed marker "handleSummary" so k6 rows are trivially filterable.
-func summaryRow(endTime, nodeID, metric, stat string, v float64) []string {
-	return []string{
-		endTime, nodeID, "k6",
-		metric + "_" + normalizeStat(stat),
-		"handleSummary", "",
-		strconv.FormatFloat(v, 'g', -1, 64), "",
-	}
+// queryResult is one metric entry's outcome, kept whole rather than written
+// as it arrives: the CSV header is the union of every series' label set, so
+// nothing can be written until the last query has answered.
+type queryResult struct {
+	entry    MetricEntry
+	matrix   model.Matrix
+	warnings []string
+	err      error
 }
 
-// flattenSummaryRows converts one node's summary into CSV rows, every metric
-// and every stat, deterministically ordered.
-func flattenSummaryRows(nodeID, endTime string, s k6Summary) [][]string {
-	var rows [][]string
-	for _, metric := range sortedKeys(s.Metrics) {
-		vals := s.Metrics[metric].Values
-		stats := make([]string, 0, len(vals))
-		for st := range vals {
-			stats = append(stats, st)
-		}
-		sort.Strings(stats)
-		for _, st := range stats {
-			rows = append(rows, summaryRow(endTime, nodeID, metric, st, vals[st]))
-		}
+// series and samples are what CSV B reports for this entry.
+func (r queryResult) series() int { return len(r.matrix) }
+
+func (r queryResult) samples() int {
+	n := 0
+	for _, s := range r.matrix {
+		n += len(s.Values)
 	}
-	return rows
+	return n
 }
 
-// aggregateSummaryRows computes the __all__ rows across nodes. Only
-// mathematically valid cross-node aggregations are emitted:
-//   - counter: count = sum (per-second rate omitted — windows may differ)
-//   - rate:    passes/fails = sum, rate recomputed as passes/(passes+fails)
-//   - gauge/trend: min = min-of-min, max = max-of-max
+// metricsFixedColumns lead every row of the metrics CSV. node_id is a label
+// like any other -- it is hoisted here only because it is the one every
+// analysis groups by, and the alphabetical block would bury it.
+var metricsFixedColumns = []string{
+	"timestamp", "node_id", "value", "loadtest",
+	"query_name", "query_type", "query_expr", "query_comment",
+}
+
+const nodeIDLabel = "node_id"
+
+// labelColumns assigns every label of the run its own CSV column, once, for
+// the whole export. A label named like a fixed column cannot keep its name --
+// pandas renames a duplicate header to "value.1" without a word -- so it takes
+// a "_label" suffix; and because that suffixed name can itself already belong
+// to another label on the same series, the suffix is applied until the name is
+// free. Deciding this per row instead would let Go's randomized map iteration
+// pick which of two labels lands in the shared column, so the same export run
+// twice disagreed with itself, silently.
 //
-// avg/med/value and all percentiles are deliberately omitted: averaging
-// per-node percentiles is statistically invalid.
-func aggregateSummaryRows(endTime string, byNode map[string]k6Summary) [][]string {
-	if len(byNode) == 0 {
-		return nil
+// names must be sorted: the assignment is what the header is built from.
+func labelColumns(names []string) map[string]string {
+	claimed := make(map[string]bool, len(metricsFixedColumns))
+	for _, fixed := range metricsFixedColumns {
+		claimed[fixed] = true
 	}
-	// metric name → per-node entries (deterministic node order).
-	type acc struct {
-		typ  string
-		vals []map[string]float64
-	}
-	metrics := make(map[string]*acc)
-	for _, nodeID := range sortedKeys(byNode) {
-		for name, m := range byNode[nodeID].Metrics {
-			a := metrics[name]
-			if a == nil {
-				a = &acc{typ: m.Type}
-				metrics[name] = a
-			}
-			a.vals = append(a.vals, m.Values)
+	// node_id is a label; the fixed column IS its column.
+	delete(claimed, nodeIDLabel)
+
+	cols := make(map[string]string, len(names))
+	for _, name := range names {
+		col := name
+		for claimed[col] {
+			col += "_label"
 		}
+		claimed[col] = true
+		cols[name] = col
+	}
+	return cols
+}
+
+// buildMetricsCSV renders CSV A: one row per (series, sample), one column per
+// label seen anywhere in the run. Returns the bytes and the number of data
+// rows, which is what decides whether the export counts as empty.
+func buildMetricsCSV(loadtest string, results []queryResult) ([]byte, int) {
+	seen := map[string]bool{}
+	for _, r := range results {
+		for _, s := range r.matrix {
+			for name := range s.Metric {
+				seen[string(name)] = true
+			}
+		}
+	}
+	cols := labelColumns(sortedKeys(seen))
+
+	extra := make([]string, 0, len(cols))
+	for name, col := range cols {
+		if name != nodeIDLabel {
+			extra = append(extra, col)
+		}
+	}
+	sort.Strings(extra)
+
+	header := append([]string{}, metricsFixedColumns...)
+	header = append(header, extra...)
+	at := make(map[string]int, len(header))
+	for i, h := range header {
+		at[h] = i
 	}
 
-	sum := func(vals []map[string]float64, stat string) (float64, bool) {
-		total, seen := 0.0, false
-		for _, v := range vals {
-			if x, ok := v[stat]; ok {
-				total += x
-				seen = true
+	var buf bytes.Buffer
+	// The writer is backed by a bytes.Buffer, whose Write never fails, so the
+	// per-row errors below are unreachable rather than ignored. Point any of
+	// these builders at a real io.Writer and they need an error path.
+	w := csv.NewWriter(&buf)
+	_ = w.Write(header)
+
+	rows := 0
+	for _, r := range results {
+		for _, s := range r.matrix {
+			for _, pair := range s.Values {
+				row := make([]string, len(header))
+				row[at["timestamp"]] = pair.Timestamp.Time().UTC().Format(time.RFC3339)
+				row[at["value"]] = pair.Value.String()
+				row[at["loadtest"]] = loadtest
+				row[at["query_name"]] = r.entry.MetricName
+				row[at["query_type"]] = r.entry.Type
+				row[at["query_expr"]] = r.entry.Query
+				row[at["query_comment"]] = r.entry.Comment
+				for name, value := range s.Metric {
+					row[at[cols[string(name)]]] = string(value)
+				}
+				_ = w.Write(row)
+				rows++
 			}
 		}
-		return total, seen
 	}
-	extreme := func(vals []map[string]float64, stat string, wantMax bool) (float64, bool) {
-		best, seen := 0.0, false
-		for _, v := range vals {
-			x, ok := v[stat]
-			if !ok {
-				continue
-			}
-			if !seen || (wantMax && x > best) || (!wantMax && x < best) {
-				best = x
-			}
-			seen = true
+	w.Flush()
+	return buf.Bytes(), rows
+}
+
+// buildQueryStatusCSV renders CSV B: the outcome of every entry in
+// spec.metricsExport.metrics, including the ones that worked. Without it a
+// query that matches nothing is indistinguishable from a metric the workers
+// never emitted, and both are invisible until a figure comes out empty.
+func buildQueryStatusCSV(loadtest string, results []queryResult) []byte {
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+	_ = w.Write([]string{
+		"loadtest", "query_name", "query_type", "query_expr",
+		"series", "samples", "warnings", "error",
+	})
+	for _, r := range results {
+		errMsg := ""
+		if r.err != nil {
+			errMsg = r.err.Error()
 		}
-		return best, seen
+		_ = w.Write([]string{
+			loadtest, r.entry.MetricName, r.entry.Type, r.entry.Query,
+			strconv.Itoa(r.series()), strconv.Itoa(r.samples()),
+			strings.Join(r.warnings, "; "), errMsg,
+		})
+	}
+	w.Flush()
+	return buf.Bytes()
+}
+
+// k6MetaMetric marks the roster rows of CSV C: one per Generator the operator
+// told us to expect, value 1 when its summary arrived and 0 when it did not.
+// Without it a node that never answered is simply absent from the file, which
+// reads exactly like a node that ran and measured nothing.
+const k6MetaMetric = "dfaas_summary_fetched"
+
+// buildK6CSV renders CSV C. Metric and stat are separate columns (so
+// df[df.stat=="p95"] works across every metric), the k6 type is kept, and the
+// window replaces the END_TIME the old rows wore as a pseudo-timestamp.
+func buildK6CSV(cfg Config, byNode map[string]k6Summary, notes map[string]string) []byte {
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+	_ = w.Write([]string{
+		"loadtest", "environment", "window_start", "window_end",
+		"node_id", "metric", "metric_type", "stat", "value", "note",
+	})
+
+	prefix := []string{cfg.LoadTestName, cfg.EnvName, cfg.StartTimeString(), cfg.EndTimeString()}
+	row := func(nodeID, metric, metricType, stat, value, note string) []string {
+		return append(append([]string{}, prefix...), nodeID, metric, metricType, stat, value, note)
 	}
 
-	var rows [][]string
-	for _, name := range sortedKeys(metrics) {
-		a := metrics[name]
-		switch a.typ {
-		case "counter":
-			if v, ok := sum(a.vals, "count"); ok {
-				rows = append(rows, summaryRow(endTime, summaryAllNodes, name, "count", v))
-			}
-		case "rate":
-			passes, okP := sum(a.vals, "passes")
-			fails, okF := sum(a.vals, "fails")
-			if okP {
-				rows = append(rows, summaryRow(endTime, summaryAllNodes, name, "passes", passes))
-			}
-			if okF {
-				rows = append(rows, summaryRow(endTime, summaryAllNodes, name, "fails", fails))
-			}
-			if okP && okF && passes+fails > 0 {
-				rows = append(rows, summaryRow(endTime, summaryAllNodes, name, "rate", passes/(passes+fails)))
-			}
-		case "gauge", "trend":
-			if v, ok := extreme(a.vals, "min", false); ok {
-				rows = append(rows, summaryRow(endTime, summaryAllNodes, name, "min", v))
-			}
-			if v, ok := extreme(a.vals, "max", true); ok {
-				rows = append(rows, summaryRow(endTime, summaryAllNodes, name, "max", v))
+	// Every node we expected, plus any that answered without being expected.
+	expected := map[string]bool{}
+	for _, src := range cfg.Summaries {
+		expected[src.NodeID] = true
+	}
+	for nodeID := range byNode {
+		expected[nodeID] = true
+	}
+
+	for _, nodeID := range sortedKeys(expected) {
+		summary, fetched := byNode[nodeID]
+		mark := "0"
+		if fetched {
+			mark = "1"
+		}
+		_ = w.Write(row(nodeID, k6MetaMetric, "meta", "value", mark, notes[nodeID]))
+		if !fetched {
+			continue
+		}
+		for _, metric := range sortedKeys(summary.Metrics) {
+			m := summary.Metrics[metric]
+			for _, stat := range sortedKeys(m.Values) {
+				_ = w.Write(row(nodeID, metric, m.Type, normalizeStat(stat),
+					strconv.FormatFloat(m.Values[stat], 'g', -1, 64), ""))
 			}
 		}
 	}
-	return rows
+	w.Flush()
+	return buf.Bytes()
 }
 
 // sortedKeys returns the map's keys in sorted order (deterministic CSV).
@@ -308,20 +396,20 @@ func (p promQuerier) Range(ctx context.Context, query string, r PromRange) (mode
 
 // run is the whole export, with no environment, no clock and no network of its
 // own: it queries through q and stores through sink. It returns the number of
-// CSV rows written, and an error only for what must fail the exporter Job --
+// metrics rows written, and an error only for what must fail the exporter Job —
 // which is the metrics CSV and nothing else.
+//
+// Order matters: the per-query status CSV goes out before the empty-export
+// check, because that is the run where it is worth the most.
 func run(ctx context.Context, cfg Config, q Querier, sink Sink) (int, error) {
-	var csvBuf bytes.Buffer
-	writer := csv.NewWriter(&csvBuf)
-	_ = writer.Write([]string{
-		"Timestamp", "ID_Nodo", "Type", "MetricName", "Query", "Comment", "Valore", "Labels",
-	})
-
 	fmt.Printf("starting metrics export for experiment: %s\n", cfg.ExpName)
-	var attempted, errored, rowsWritten int
+
+	results := make([]queryResult, 0, len(cfg.Metrics))
+	var attempted, errored int
 	for _, m := range cfg.Metrics {
 		if m.Query == "" {
 			fmt.Printf("skipping entry %q: empty query\n", m.MetricName)
+			results = append(results, queryResult{entry: m, err: errors.New("empty query: nothing was run")})
 			continue
 		}
 		attempted++
@@ -335,88 +423,62 @@ func run(ctx context.Context, cfg Config, q Querier, sink Sink) (int, error) {
 		if err != nil {
 			fmt.Printf("query error %s (%s): %v\n", m.MetricName, m.Query, err)
 			errored++
-			continue
 		}
-
-		for _, series := range matrix {
-			nodeID := string(series.Metric["node_id"])
-			if nodeID == "" {
-				nodeID = "unknown"
-			}
-			allLabels := series.Metric.String()
-
-			for _, pair := range series.Values {
-				_ = writer.Write([]string{
-					pair.Timestamp.Time().Format(time.RFC3339),
-					nodeID,
-					m.Type,
-					m.MetricName,
-					m.Query,
-					m.Comment,
-					pair.Value.String(),
-					allLabels,
-				})
-				rowsWritten++
-			}
-		}
+		results = append(results, queryResult{entry: m, matrix: matrix, warnings: warnings, err: err})
 	}
 	if attempted > 0 && errored > 0 {
 		fmt.Printf("metrics export: %d/%d queries failed\n", errored, attempted)
 	}
+
+	// CSV B first, and never fatal: it is what names the query that failed on
+	// the run where the next check ends the Job.
+	if err := sink.Put(ctx, Artifact{
+		Key:         queryStatusKeyFor(cfg.LoadTestName, cfg.Stamp()),
+		Label:       "QUERY STATUS",
+		ContentType: "text/csv",
+		Body:        bytes.NewReader(buildQueryStatusCSV(cfg.LoadTestName, results)),
+	}); err != nil {
+		fmt.Printf("store query status CSV failed: %v\n", err)
+	}
+
+	metricsCSV, rowsWritten := buildMetricsCSV(cfg.LoadTestName, results)
+
 	// Fail loudly when the export captured nothing: a header-only CSV that
 	// uploads fine still lets the LoadTest report Completed with no data
 	// (Prometheus unreachable, all queries wrong, or the samples were lost to a
 	// restart). An error here exits non-zero, so the exporter Job -- and thus
 	// the LoadTest -- fails instead of silently "succeeding" with an empty
-	// result. It used to be a log.Fatalf, testable only by spawning a
-	// subprocess.
+	// result.
 	if attempted > 0 && rowsWritten == 0 {
 		return 0, fmt.Errorf("metrics export produced 0 data points across %d queries (%d errored); "+
 			"refusing to report success with an empty CSV — check Prometheus reachability and the queries",
 			attempted, errored)
 	}
 
-	// k6 end-of-test summaries: fetch each Generator's handleSummary JSON from
-	// the filer and flatten every metric into the same CSV, plus an __all__
-	// aggregate row set. No sources (scripts generated before the feature, or
-	// no Generators) skips it. Never fatal: the Prometheus rows above are still
-	// valuable on partial or total summary loss.
-	var summaryRaw map[string][]byte
-	if len(cfg.Summaries) > 0 {
-		byNode, raw := fetchSummaries(ctx, cfg.Summaries)
-		summaryRaw = raw
-		summaryRows := 0
-		endStr := cfg.EndTimeString()
-		for _, nodeID := range sortedKeys(byNode) {
-			for _, row := range flattenSummaryRows(nodeID, endStr, byNode[nodeID]) {
-				_ = writer.Write(row)
-				summaryRows++
-			}
-		}
-		for _, row := range aggregateSummaryRows(endStr, byNode) {
-			_ = writer.Write(row)
-			summaryRows++
-		}
-		fmt.Printf("k6 summaries: %d/%d nodes fetched, %d CSV rows\n",
-			len(byNode), len(cfg.Summaries), summaryRows)
-	}
-
-	writer.Flush()
-	if err := writer.Error(); err != nil {
-		return rowsWritten, fmt.Errorf("CSV writer: %w", err)
-	}
-
 	// The metrics CSV is the one artifact whose loss fails the run.
 	if err := sink.Put(ctx, Artifact{
-		Key:         objectKeyFor(cfg.LoadTestName),
+		Key:         objectKeyFor(cfg.LoadTestName, cfg.Stamp()),
 		Label:       "CSV",
 		ContentType: "text/csv",
-		Body:        bytes.NewReader(csvBuf.Bytes()),
+		Body:        bytes.NewReader(metricsCSV),
 	}); err != nil {
 		return rowsWritten, fmt.Errorf("store metrics CSV: %w", err)
 	}
 
 	// Everything below is per-Generator: a failure warns and the run goes on.
+	// CSV C is written even with no Generators at all — a header-only file
+	// keeps a glob honest, while an absent one looks like a lost upload.
+	byNode, summaryRaw, notes := fetchSummaries(ctx, cfg.Summaries)
+	fmt.Printf("k6 summaries: %d/%d nodes fetched\n", len(byNode), len(cfg.Summaries))
+	if err := sink.Put(ctx, Artifact{
+		Key:         k6SummaryCSVKeyFor(cfg.LoadTestName, cfg.Stamp()),
+		Label:       "K6 CSV",
+		ContentType: "text/csv",
+		Body:        bytes.NewReader(buildK6CSV(cfg, byNode, notes)),
+	}); err != nil {
+		fmt.Printf("store k6 summary CSV failed: %v\n", err)
+	}
+
 	shipK6Logs(ctx, cfg, sink)
 	shipK6Summaries(ctx, cfg, sink, summaryRaw)
 
@@ -429,7 +491,7 @@ func run(ctx context.Context, cfg Config, q Querier, sink Sink) (int, error) {
 func shipK6Summaries(ctx context.Context, cfg Config, sink Sink, raw map[string][]byte) {
 	for _, nodeID := range sortedKeys(raw) {
 		err := sink.Put(ctx, Artifact{
-			Key:         k6SummaryKeyFor(cfg.LoadTestName, nodeID),
+			Key:         k6SummaryKeyFor(cfg.LoadTestName, nodeID, cfg.Stamp()),
 			Label:       "K6 SUMMARY " + nodeID,
 			ContentType: "application/json",
 			Body:        bytes.NewReader(raw[nodeID]),
@@ -467,7 +529,7 @@ func shipK6Logs(ctx context.Context, cfg Config, sink Sink) {
 			continue
 		}
 		err := sink.Put(ctx, Artifact{
-			Key:         k6ObjectKeyFor(cfg.LoadTestName, nodeID),
+			Key:         k6ObjectKeyFor(cfg.LoadTestName, nodeID, cfg.Stamp()),
 			Label:       "K6 " + nodeID,
 			ContentType: "text/plain",
 			Body:        bytes.NewReader(data),
@@ -620,31 +682,37 @@ func bucketNameFor(envName, envUID string) string {
 	return name + "-" + suffix
 }
 
-// objectKeyFor builds the S3 object key for a single LoadTest CSV:
-// metrics/<loadtestName>/<UTC RFC3339-compact>.csv. The compact timestamp
-// is filename-safe and sortable.
-func objectKeyFor(loadtestName string) string {
-	return fmt.Sprintf("metrics/%s/%s.csv",
-		loadtestName,
-		time.Now().UTC().Format("20060102T150405Z"))
+// The object keys of one export. Every one of them takes the run's stamp
+// rather than reading the clock: the stamp is the end of the test window, so a
+// retried exporter Job rewrites the same objects instead of leaving a second
+// near-identical set, and the CSVs, the raw summaries and the logs of one run
+// are trivially paired by filename.
+
+// objectKeyFor is the metrics CSV: metrics/<loadtestName>/<stamp>.csv.
+func objectKeyFor(loadtestName, stamp string) string {
+	return fmt.Sprintf("metrics/%s/%s.csv", loadtestName, stamp)
 }
 
-// k6ObjectKeyFor builds the S3 object key for one VM's k6 end-of-test summary:
-// k6/<loadtestName>/<nodeID>-<UTC RFC3339-compact>.log. Sits in a sibling "k6/"
-// prefix to the metrics CSVs so per-test artifacts group together.
-func k6ObjectKeyFor(loadtestName, nodeID string) string {
-	return fmt.Sprintf("k6/%s/%s-%s.log",
-		loadtestName,
-		nodeID,
-		time.Now().UTC().Format("20060102T150405Z"))
+// queryStatusKeyFor is the per-query outcome CSV, sibling of the metrics one:
+// metrics/<loadtestName>/query-status-<stamp>.csv.
+func queryStatusKeyFor(loadtestName, stamp string) string {
+	return fmt.Sprintf("metrics/%s/query-status-%s.csv", loadtestName, stamp)
 }
 
-// k6SummaryKeyFor builds the S3 object key for one node's raw handleSummary
-// JSON: k6/<loadtestName>/<nodeID>-summary-<UTC RFC3339-compact>.json —
-// sibling of the k6ObjectKeyFor log keys.
-func k6SummaryKeyFor(loadtestName, nodeID string) string {
-	return fmt.Sprintf("k6/%s/%s-summary-%s.json",
-		loadtestName,
-		nodeID,
-		time.Now().UTC().Format("20060102T150405Z"))
+// k6SummaryCSVKeyFor is the flattened k6 summary of every Generator:
+// k6/<loadtestName>/summary-<stamp>.csv.
+func k6SummaryCSVKeyFor(loadtestName, stamp string) string {
+	return fmt.Sprintf("k6/%s/summary-%s.csv", loadtestName, stamp)
+}
+
+// k6ObjectKeyFor is one VM's captured k6 output:
+// k6/<loadtestName>/<nodeID>-<stamp>.log.
+func k6ObjectKeyFor(loadtestName, nodeID, stamp string) string {
+	return fmt.Sprintf("k6/%s/%s-%s.log", loadtestName, nodeID, stamp)
+}
+
+// k6SummaryKeyFor is one node's raw handleSummary JSON, kept verbatim next to
+// the flattened CSV: k6/<loadtestName>/<nodeID>-summary-<stamp>.json.
+func k6SummaryKeyFor(loadtestName, nodeID, stamp string) string {
+	return fmt.Sprintf("k6/%s/%s-summary-%s.json", loadtestName, nodeID, stamp)
 }

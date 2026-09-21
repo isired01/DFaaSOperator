@@ -118,6 +118,13 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 		{Name: "END_TIME", Value: endTime.UTC().Format(time.RFC3339)},
 		{Name: "STEP", Value: step},
 		{Name: "EXP_NAME", Value: lt.Name},
+		// Both name the run inside every CSV row and in the object keys, so
+		// they belong to the base block: on the stdout path (no S3 config)
+		// they used to be empty, which left the keys built from an empty
+		// LoadTest name and the k6 CSV unable to say which Environment it
+		// measured.
+		{Name: "LOADTEST_NAME", Value: lt.Name},
+		{Name: "ENV_NAME", Value: env.Name},
 	}
 
 	// k6 end-of-test summaries: one filer URL per node, fetched by the
@@ -177,7 +184,6 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 			// the exporter. S3_BUCKET_PREFIX is the dispatch signal.
 			corev1.EnvVar{Name: "S3_BUCKET_PREFIX", Value: env.Name},
 			corev1.EnvVar{Name: "ENV_UID", Value: string(env.UID)},
-			corev1.EnvVar{Name: "LOADTEST_NAME", Value: lt.Name},
 		)
 	}
 
