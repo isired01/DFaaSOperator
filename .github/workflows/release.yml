@@ -15,25 +15,25 @@ jobs:
     env:
       VERSION: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Images are published under both v0.2.0 and 0.2.0: the chart defaults
       # every image tag to .Chart.AppVersion, which is packaged without the v.
       - name: Compute version (strip leading v)
         run: echo "VERSION_NO_V=${VERSION#v}" >> "$GITHUB_ENV"
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
 
       - name: Login to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & push operator image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -45,7 +45,7 @@ jobs:
             ghcr.io/isired01/dfaas-operator:latest
 
       - name: Build & push exporter image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: dataExporter
           file: dataExporter/Dockerfile
@@ -73,7 +73,7 @@ jobs:
           echo "Did you push the tag ${VERSION} to the UI repo too?"
           exit 1
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: v3.15.4
 
@@ -101,7 +101,7 @@ jobs:
           helm push "dist/dfaas-${VERSION_NO_V}.tgz" oci://ghcr.io/isired01/charts
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/dfaas-${{ env.VERSION_NO_V }}.tgz
