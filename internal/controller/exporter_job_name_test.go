@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -108,5 +109,34 @@ func TestExporterJobNamesTheRunWithoutS3(t *testing.T) {
 	}
 	if got["ENV_NAME"] != "bari" {
 		t.Errorf("ENV_NAME = %q, want the Environment name", got["ENV_NAME"])
+	}
+}
+
+// The exporter image is a moving tag: a merge to main republishes
+// ghcr.io/isired01/dfaas-exporter:latest. With the default IfNotPresent, a
+// node that already holds a layer for that tag reuses it, so a LoadTest can
+// export with a build from weeks ago and nothing says so.
+func TestExporterJobAlwaysPullsItsImage(t *testing.T) {
+	sch := runtime.NewScheme()
+	if err := dfaasv1.AddToScheme(sch); err != nil {
+		t.Fatal(err)
+	}
+	r := &LoadTestReconciler{Scheme: sch}
+	lt := &dfaasv1.LoadTest{
+		ObjectMeta: metav1.ObjectMeta{Name: "lt-sample", Namespace: "default", UID: types.UID("1"), Generation: 1},
+		Spec: dfaasv1.LoadTestSpec{
+			MetricsExport: dfaasv1.MetricsExportSpec{
+				Metrics: []dfaasv1.MetricExportEntry{{Type: dfaasv1.MetricTypeRaw, Query: "up"}},
+			},
+		},
+	}
+	env := &dfaasv1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "bari", Namespace: "default", UID: types.UID("2")}}
+
+	job, err := r.createExporterJob(lt, env, time.Now().Add(-time.Minute), time.Now(), "", nil)
+	if err != nil {
+		t.Fatalf("createExporterJob: %v", err)
+	}
+	if got := job.Spec.Template.Spec.Containers[0].ImagePullPolicy; got != corev1.PullAlways {
+		t.Errorf("ImagePullPolicy = %q, want %q", got, corev1.PullAlways)
 	}
 }

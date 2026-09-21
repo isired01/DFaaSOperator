@@ -241,10 +241,16 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:         "exporter",
-							Image:        exporterImage(),
-							Env:          envVars,
-							VolumeMounts: volumeMounts,
+							Name:  "exporter",
+							Image: exporterImage(),
+							// The default tag is a moving one: a merge to main
+							// republishes :latest. Under IfNotPresent a node that
+							// already holds a layer for that tag reuses it, so a
+							// LoadTest exports with a weeks-old build and nothing
+							// says so -- the CSV just keeps the old shape.
+							ImagePullPolicy: corev1.PullAlways,
+							Env:             envVars,
+							VolumeMounts:    volumeMounts,
 						},
 					},
 					Volumes: volumes,
