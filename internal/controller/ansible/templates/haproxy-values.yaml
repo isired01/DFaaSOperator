@@ -102,10 +102,21 @@ service:
 
   # We do not intend to expose the Prometheus port, but Kubernetes will still
   # map it to a random node port regardless.
+  # Every published port is pinned, including the ones nothing consumes. An
+  # unpinned port gets a random number from the NodePort range, and the range
+  # contains 31600 -- the FIXED port of the dfaas-agent's kademlia Service,
+  # which the operator writes into every other node's bootstrap multiaddr
+  # (libp2pBootstrapPort in internal/controller/ansible/job.go). When HAProxy
+  # drew 31600 first, installing the agent failed with "provided port is
+  # already allocated" and the node never provisioned. It is a lottery: on one
+  # worker it happened, on its twin it did not.
   nodePorts:
     http: 30080
     dataplaneapi: 30555
     runtimeapi: 30666
+    https: 30443
+    prometheus: 30405
+    stat: 31024
 
 # Required to enable Data Plane API sending UNIX signals to the HAProxy master
 # node running on the main container.

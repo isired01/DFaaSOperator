@@ -321,6 +321,39 @@
     # Wait on the Deployment's availableReplicas directly: deterministic, self-
     # scaling to slow image pulls, and correct on re-runs. The HTTP probe that
     # follows is then only a thin guard for NodePort endpoint propagation.
+    # BEFORE the reachability block, not after it. The chart is installed with
+    # prometheus.create=false (we run our own in the monitoring namespace), so
+    # the gateway keeps its default host "prometheus", which does not resolve
+    # from the openfaas namespace. The gateway then PANICS on /system/functions
+    # -- a nil dereference on the data the failed query did not return -- and
+    # that endpoint is exactly what the block below waits for.
+    #
+    # The panic needs a function to be deployed to trigger, which is why this
+    # ordering survived so long: a first run on a fresh node has none, passes
+    # the wait, and gets here. Every retry after a run that DID deploy one is
+    # then stuck forever. Observed on a two-worker Environment where one node
+    # provisioned and the other burned all four Job attempts on it.
+    - name: "Fix Prometheus host in Gateway"
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ k3s_config }}"
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: gateway
+            namespace: openfaas
+          spec:
+            template:
+              spec:
+                containers:
+                  - name: gateway
+                    env:
+                      - name: faas_prometheus_host
+                        value: "prometheus.monitoring.svc.cluster.local"
+                      - name: faas_prometheus_port
+                        value: "9090"
+
     - name: "Ensure OpenFaaS gateway is reachable"
       block:
         - name: "Wait for OpenFaaS gateway Deployment to be Available"
@@ -498,27 +531,6 @@
                 annotations:
                   kubectl.kubernetes.io/restartedAt: "{{ lookup('pipe', 'date -u +%FT%TZ') }}"
       when: agent_helm is changed
-
-    - name: "Fix Prometheus host in Gateway"
-      kubernetes.core.k8s:
-        state: present
-        kubeconfig: "{{ k3s_config }}"
-        definition:
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: gateway
-            namespace: openfaas
-          spec:
-            template:
-              spec:
-                containers:
-                  - name: gateway
-                    env:
-                      - name: faas_prometheus_host
-                        value: "prometheus.monitoring.svc.cluster.local"
-                      - name: faas_prometheus_port
-                        value: "9090"
 
     # Recorded LAST. A play that dies mid-way therefore leaves either the
     # previous role on disk or no marker at all (if the wipe already ran), so
