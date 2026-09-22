@@ -18,7 +18,12 @@ datasources:
     datasources:
       - name: Prometheus
         type: prometheus
-        url: http://prometheus-server.monitoring.svc.cluster.local
+        # The port is not optional: prometheus-values.yaml sets
+        # server.service.servicePort to 9090, so without it Grafana queries
+        # port 80 and every panel is empty with no error on the panel itself --
+        # only the datasource health check says "i/o timeout". Pinned against
+        # that file by datasource_test.go.
+        url: http://prometheus-server.monitoring.svc.cluster.local:9090
         access: proxy
         isDefault: true
 
