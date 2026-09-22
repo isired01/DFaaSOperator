@@ -29,12 +29,11 @@ import (
 )
 
 // federationInterval is how often the management Prometheus pulls worker
-// metrics through /federate: the prometheus chart's default
-// global.scrape_interval, 1m, which
-// internal/controller/monitoring/values/prometheus-values.yaml does not
-// override. Both constants below derive from it, so raising the interval in
-// that file means raising it here and nowhere else.
-const federationInterval = time.Minute
+// metrics through /federate: server.global.scrape_interval in
+// internal/controller/monitoring/values/prometheus-values.yaml. Both constants
+// below derive from it, so changing the interval in that file means changing it
+// here -- and federation_interval_test.go fails when the two disagree.
+const federationInterval = 15 * time.Second
 
 // exportTailWindow extends the export query past the LoadTest's EndTime.
 // Federation gives the mgmt instance one sample per node per interval, and
