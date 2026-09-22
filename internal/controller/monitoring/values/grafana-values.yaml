@@ -22,6 +22,23 @@ datasources:
         access: proxy
         isDefault: true
 
+# File-based dashboard provisioning. Grafana runs without a PVC, so anything
+# created through its API or UI is lost at the next restart; a provider reading
+# from a mounted ConfigMap rebuilds the dashboards on every start. The provider
+# name "dfaas" must match the key Deploy() writes under `dashboards`.
+dashboardProviders:
+  dashboardproviders.yaml:
+    apiVersion: 1
+    providers:
+      - name: dfaas
+        orgId: 1
+        folder: dFaaS
+        type: file
+        disableDeletion: false
+        allowUiUpdates: true
+        options:
+          path: /var/lib/grafana/dashboards/dfaas
+
 # Grafana needs no cluster-scoped read here (every sidecar is off), and the
 # operator ServiceAccount cannot create ClusterRoles anyway. `namespaced: true`
 # drops the chart's ClusterRole + ClusterRoleBinding and keeps only the

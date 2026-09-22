@@ -49,6 +49,15 @@ func (m *Manager) Deploy(ctx context.Context) error {
 	if err := sigsyaml.Unmarshal(grafanaValuesYAML, &grafValues); err != nil {
 		return fmt.Errorf("parse grafana values: %w", err)
 	}
+	// The dashboard JSON is kept as its own file -- editable, diffable, pinned
+	// by a test -- and handed to the chart here instead of being pasted into
+	// the values YAML as a 600-line string. The provider that mounts it is
+	// declared in grafana-values.yaml; the two names must match.
+	grafValues["dashboards"] = map[string]interface{}{
+		"dfaas": map[string]interface{}{
+			liveDashboardUID: map[string]interface{}{"json": string(liveDashboardJSON)},
+		},
+	}
 	if _, err := helm.InstallOrUpgradeFromArchive(
 		ctx, log, "grafana",
 		bytes.NewReader(grafanaChartTGZ),

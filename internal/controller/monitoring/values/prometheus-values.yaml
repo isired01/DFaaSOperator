@@ -26,6 +26,18 @@ configmapReload:
 
 server:
   fullnameOverride: "prometheus-server"
+  global:
+    # How often the management Prometheus federates every worker. The chart
+    # default is 1m, which on a five-minute load test gives five points per
+    # series -- a dashboard that moves once a minute, and a CSV whose shape
+    # depends on where the run fell in the cycle. 15s is four points a minute
+    # and still leaves the chart's 10s scrape_timeout valid.
+    #
+    # It is pinned against federationInterval in
+    # internal/controller/loadtest_observe.go by a test: the export cool-down
+    # derives from this number, so the two move together or the CSV loses its
+    # tail again.
+    scrape_interval: 15s
   # The operator ServiceAccount deliberately has no clusterroles/clusterrolebindings
   # verbs, so it cannot let this chart create its own cluster-scoped RBAC. The dfaas
   # chart ships that ClusterRole + ClusterRoleBinding instead
