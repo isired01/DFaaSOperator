@@ -89,10 +89,14 @@ const (
 	LTReasonExportSucceeded        = "ExportSucceeded"
 	LTReasonJobFailed              = "JobFailed"
 	LTReasonExportSkipped          = "Skipped"
-	// LTReasonRunnersReclaimed restamps K6Healthy after an abort tore the
-	// remote TestRuns down. Without it the condition keeps the last observed
-	// running count ("2 running") on a test whose runners are already gone.
-	LTReasonRunnersReclaimed   = "RunnersReclaimed"
+	// LTReasonRunnersReclaimed restamps K6Healthy when a run end confirmed
+	// every remote TestRun absent. Without it the condition keeps the last
+	// observed running count ("2 running") on a test whose runners are gone.
+	LTReasonRunnersReclaimed = "RunnersReclaimed"
+	// LTReasonRunnersUnreclaimed: a run end could not delete a TestRun this
+	// run applied, so its runner may still be sending load. Occupancy holds
+	// the Environment on it and the operator keeps retrying the delete.
+	LTReasonRunnersUnreclaimed = "RunnersUnreclaimed"
 	LTReasonS3ConfigMissing    = "S3ConfigMissing"
 	LTReasonUserAborted        = "UserAborted"
 	LTReasonCompleted          = "Completed"

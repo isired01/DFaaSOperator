@@ -55,6 +55,36 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 	logger := log.FromContext(ctx)
 
 	if controllerutil.ContainsFinalizer(env, environmentFinalizer) {
+		// Drain the LoadTests this Environment owns that may still have work on
+		// the generators, before the kubeconfig Secrets below are pruned: their
+		// finalizers need those Secrets to reach the remote k3s. At most one
+		// test per Environment can have live or held runners (Occupancy), so
+		// the wait is about one teardown pass plus the deletion budget.
+		// ponytail: kubectl delete --cascade=foreground lets GC delete the
+		// Secrets in parallel and defeats this ordering; background (the
+		// default, and what the gateway uses) keeps it.
+		var lts dfaasv1.LoadTestList
+		if err := r.List(ctx, &lts, client.InNamespace(env.Namespace)); err != nil {
+			return ctrl.Result{}, fmt.Errorf("list loadtests: %w", err)
+		}
+		draining := 0
+		for i := range lts.Items {
+			lt := &lts.Items[i]
+			if !hasOwnerRef(lt, env) || (lt.Status.Phase.Terminal() && !runnersUnreclaimed(lt)) {
+				continue
+			}
+			if lt.DeletionTimestamp.IsZero() {
+				if err := r.Delete(ctx, lt); client.IgnoreNotFound(err) != nil {
+					return ctrl.Result{}, fmt.Errorf("delete loadtest %s: %w", lt.Name, err)
+				}
+			}
+			draining++
+		}
+		if draining > 0 {
+			logger.Info("environment deletion: waiting for its load tests to reclaim their runners", "count", draining)
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
+
 		logger.Info("environment deletion: cleaning up Prometheus targets")
 
 		if err := r.monitoringStack().CleanupTargets(ctx, env); err != nil {

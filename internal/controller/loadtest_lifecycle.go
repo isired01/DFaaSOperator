@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/statuswriter"
 	"dfaas-operator/internal/k6dispatch"
 )
 
@@ -41,8 +42,9 @@ const dispatchAttemptsAnnotation = "dfaas.dfaas.io/dispatch-attempts"
 const dispatchRetryBudget = 15
 
 // onDispatchError centralises the retry-budget bookkeeping on a dispatcher
-// error path. Bumps the counter; if it tips the budget, transitions the
-// LoadTest to Failed and stamps K6Dispatched=False/DispatchFailed. Otherwise
+// error path. Bumps the counter; if it tips the budget, ends the run as Failed
+// with K6Dispatched=False/DispatchFailed, and endRun deletes the TestRuns the
+// other generators already run. Otherwise
 // stamps K6Dispatched=False/<subReason> (P13) and returns a RequeueAfter
 // Result. Every path is terminal for the current reconcile: the caller
 // returns whatever this returns.
@@ -62,10 +64,10 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 	if outcome.Exhausted {
 		detail := fmt.Sprintf("remote dispatch failed %d consecutive times: %s",
 			outcome.Count, condMessage(dispatchErr))
-		r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched,
-			metav1.ConditionFalse, dfaasv1.LTReasonDispatchFailed, detail)
-		return r.phase(ctx, lt, dfaasv1.LoadTestFailed,
-			dfaasv1.LTReasonDispatchFailed, detail)
+		// endRun reclaims the TestRuns the other generators already run.
+		return r.endRun(ctx, lt, dfaasv1.LoadTestFailed, dfaasv1.LTReasonDispatchFailed, detail,
+			statuswriter.Cond{Type: dfaasv1.LTCondK6Dispatched, Status: metav1.ConditionFalse,
+				Reason: dfaasv1.LTReasonDispatchFailed, Message: detail})
 	}
 	// P13: sub-reason (ScriptMirrorFailed / StaleCleanupFailed / ApplyFailed)
 	// carries the diagnostic detail, retry-budget counter is in the message.

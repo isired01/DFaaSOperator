@@ -108,8 +108,12 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	// Terminal phases — no-op.
+	// Terminal phases — no-op, unless the run end left a runner it applied
+	// undeleted: keep re-sweeping it, since Occupancy holds the Environment.
 	if lt.Status.Phase.Terminal() {
+		if runnersUnreclaimed(&lt) {
+			return r.retryReclaim(ctx, &lt)
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -118,14 +122,11 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	envKey := types.NamespacedName{Name: lt.Spec.TargetEnvironment, Namespace: lt.Namespace}
 	if err := r.Get(ctx, envKey, &env); err != nil {
 		if apierrors.IsNotFound(err) {
-			// P9: surface link state on EnvironmentLinked before failing.
-			r.cond(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
-				metav1.ConditionFalse, dfaasv1.LTReasonEnvNotFound,
-				fmt.Sprintf("environment %q not found in namespace %s",
-					lt.Spec.TargetEnvironment, lt.Namespace))
-			return r.failLoadTest(ctx, &lt,
-				fmt.Sprintf("environment %q not found in namespace %s",
-					lt.Spec.TargetEnvironment, lt.Namespace))
+			// P9: surface link state on EnvironmentLinked, in the same write.
+			msg := fmt.Sprintf("environment %q not found in namespace %s",
+				lt.Spec.TargetEnvironment, lt.Namespace)
+			return r.failLoadTest(ctx, &lt, msg, statuswriter.Cond{Type: dfaasv1.LTCondEnvironmentLinked,
+				Status: metav1.ConditionFalse, Reason: dfaasv1.LTReasonEnvNotFound, Message: msg})
 		}
 		return ctrl.Result{}, err
 	}
@@ -147,9 +148,17 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		inAbortWindow := lt.Status.Phase.PreExecution() ||
 			lt.Status.Phase == dfaasv1.LoadTestRunning
 		if inAbortWindow {
-			return r.abortLoadTest(ctx, &lt, &env, dfaasv1.LTReasonUserAborted,
-				"The test was manually aborted from the UI. Remote worker resources have been reclaimed.")
+			return r.abortLoadTest(ctx, &lt, dfaasv1.LTReasonUserAborted,
+				"The test was manually aborted from the UI.")
 		}
+	}
+
+	// An Environment being deleted dispatches nothing new: its finalizer is
+	// draining the tests it owns before it prunes their kubeconfig Secrets.
+	// ponytail: a test created meanwhile never gets an OwnerRef and ends
+	// Failed/EnvNotFound once the Environment is gone.
+	if !env.DeletionTimestamp.IsZero() && lt.Status.Phase.PreExecution() {
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 	}
 
 	// Park every suspended test (draft or scheduled) at Pending on its first
@@ -323,15 +332,13 @@ func stampLTAggregate(lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase, reasonO
 	})
 }
 
-// failLoadTest moves the LoadTest to Failed, carrying the caller's specific
-// message onto the Ready aggregator. Callers wanting a richer reason should
-// stamp a sub-condition before calling failLoadTest (the aggregator overwrites
-// only Ready).
+// failLoadTest ends the run as Failed, carrying the caller's message onto the
+// Ready aggregator. Pass diagnostics as conds so they land in the same write;
+// endRun reclaims whatever the run may still have live.
 func (r *LoadTestReconciler) failLoadTest(ctx context.Context,
-	lt *dfaasv1.LoadTest, message string) (ctrl.Result, error) {
+	lt *dfaasv1.LoadTest, message string, conds ...statuswriter.Cond) (ctrl.Result, error) {
 
-	return r.phase(ctx, lt, dfaasv1.LoadTestFailed,
-		dfaasv1.LTReasonFailed, message)
+	return r.endRun(ctx, lt, dfaasv1.LoadTestFailed, dfaasv1.LTReasonFailed, message, conds...)
 }
 
 // writer is the one way this reconciler persists LoadTest status. Stateless;
@@ -365,14 +372,21 @@ func (r *LoadTestReconciler) condErr(ctx context.Context, lt *dfaasv1.LoadTest,
 	})
 }
 
-// phase moves the LoadTest to p and requeues immediately so the next phase
-// handler runs without waiting for the watch. reason/message override the
-// Ready aggregator's generic text (empty = generic). This is the reconciler's
-// scheduling policy, stated once here; the writer itself never decides requeue.
+// phase moves the LoadTest to p, with conds stamped in the same write, and
+// requeues immediately so the next phase handler runs without waiting for the
+// watch. reason/message override the Ready aggregator's generic text (empty =
+// generic). After a terminal write it does not requeue: an immediate pass would
+// read the pre-terminal cached copy and stamp in-progress Conditions onto an
+// ended test; the write's own watch event arrives once the cache holds it.
+// This is the reconciler's scheduling policy, stated once here; the writer
+// itself never decides requeue.
 func (r *LoadTestReconciler) phase(ctx context.Context, lt *dfaasv1.LoadTest,
-	p dfaasv1.LoadTestPhase, reason, message string) (ctrl.Result, error) {
-	if err := r.writer().Record(ctx, lt, ltTransition{Phase: &p, Reason: reason, Message: message}); err != nil {
+	p dfaasv1.LoadTestPhase, reason, message string, conds ...statuswriter.Cond) (ctrl.Result, error) {
+	if err := r.writer().Record(ctx, lt, ltTransition{Phase: &p, Reason: reason, Message: message, Conditions: conds}); err != nil {
 		return ctrl.Result{}, err
+	}
+	if p.Terminal() {
+		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{Requeue: true}, nil
 }
@@ -463,6 +477,12 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 		sib := &list.Items[i]
 		if sib.Name == lt.Name || sib.Spec.TargetEnvironment != lt.Spec.TargetEnvironment {
 			continue
+		}
+		if runnersUnreclaimed(sib) {
+			return hold(dfaasv1.LTReasonEnvBusy,
+				fmt.Sprintf("waiting: load test %q has ended but a runner it applied on the generators "+
+					"could not be deleted; the operator keeps retrying — delete that test to release environment %q",
+					sib.Name, lt.Spec.TargetEnvironment))
 		}
 		occupying := sib.Status.Phase == dfaasv1.LoadTestRunning ||
 			sib.Status.Phase == dfaasv1.LoadTestExporting ||

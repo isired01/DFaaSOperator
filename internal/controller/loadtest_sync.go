@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/statuswriter"
 )
 
 // Synchronized start (spec.syncStart) — the GO-signal barrier.
@@ -39,7 +40,7 @@ import (
 
 // syncWaitBudget caps how long the reconciler waits for all runners to reach
 // stage "started" after the dispatch completes. Past it the whole test is
-// aborted (remote TestRuns deleted) and marked Failed — a partially
+// marked Failed and its remote TestRuns deleted by the run end — a partially
 // synchronized run is invalid experimental data.
 const syncWaitBudget = 5 * time.Minute
 
@@ -55,8 +56,9 @@ const syncPollRequeue = 3 * time.Second
 // every remote TestRun until all report stage "started" (runner up and parked
 // on the script barrier), then publishes the GO signal and finishes the
 // dispatch (StartTime + phase Running). Failure policy per user decision:
-// any TestRun in stage "error", or the syncWaitBudget expiring, tears down
-// every remote TestRun and fails the LoadTest.
+// any TestRun in stage "error", or the syncWaitBudget expiring, fails the
+// LoadTest; the run end (endRun) deletes every remote TestRun in that same
+// pass, so an unreachable generator no longer blocks the Failed transition.
 func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -71,12 +73,9 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 			// waiting on a runner nobody can poll.
 			logger.Info("sync barrier: node unusable; aborting all",
 				"node", ref.NodeID, "cause", nerr.Error())
-			if failed := r.teardownRemoteTestRuns(ctx, lt, env); failed > 0 {
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-			}
-			r.cond(ctx, lt, dfaasv1.LTCondSyncReady,
-				metav1.ConditionFalse, dfaasv1.LTReasonSyncTimeout, nerr.Error())
-			return r.failLoadTest(ctx, lt, "synchronized start: "+nerr.Error())
+			return r.failLoadTest(ctx, lt, "synchronized start: "+nerr.Error(), statuswriter.Cond{
+				Type: dfaasv1.LTCondSyncReady, Status: metav1.ConditionFalse,
+				Reason: dfaasv1.LTReasonSyncTimeout, Message: nerr.Error()})
 		}
 		stage, err := node.Stage(ctx, lt)
 		if err != nil {
@@ -93,14 +92,11 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 		case "error":
 			logger.Info("sync barrier: TestRun errored while waiting; aborting all",
 				"node", ref.NodeID)
-			if failed := r.teardownRemoteTestRuns(ctx, lt, env); failed > 0 {
-				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-			}
-			r.cond(ctx, lt, dfaasv1.LTCondSyncReady,
-				metav1.ConditionFalse, dfaasv1.LTReasonSyncTimeout,
-				fmt.Sprintf("runner on node %q reported stage=error before the GO signal", ref.NodeID))
 			return r.failLoadTest(ctx, lt,
-				fmt.Sprintf("synchronized start: runner on node %q errored before the GO signal", ref.NodeID))
+				fmt.Sprintf("synchronized start: runner on node %q errored before the GO signal", ref.NodeID),
+				statuswriter.Cond{Type: dfaasv1.LTCondSyncReady, Status: metav1.ConditionFalse,
+					Reason:  dfaasv1.LTReasonSyncTimeout,
+					Message: fmt.Sprintf("runner on node %q reported stage=error before the GO signal", ref.NodeID)})
 		}
 	}
 
@@ -114,14 +110,11 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 				time.Since(cond.LastTransitionTime.Time) > syncWaitBudget {
 				logger.Info("sync barrier: wait budget exhausted; aborting all",
 					"started", started, "total", total)
-				if failed := r.teardownRemoteTestRuns(ctx, lt, env); failed > 0 {
-					return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-				}
-				r.cond(ctx, lt, dfaasv1.LTCondSyncReady,
-					metav1.ConditionFalse, dfaasv1.LTReasonSyncTimeout,
-					fmt.Sprintf("only %d/%d runners started within %s", started, total, syncWaitBudget))
 				return r.failLoadTest(ctx, lt,
-					fmt.Sprintf("synchronized start: only %d/%d runners started within %s", started, total, syncWaitBudget))
+					fmt.Sprintf("synchronized start: only %d/%d runners started within %s", started, total, syncWaitBudget),
+					statuswriter.Cond{Type: dfaasv1.LTCondSyncReady, Status: metav1.ConditionFalse,
+						Reason:  dfaasv1.LTReasonSyncTimeout,
+						Message: fmt.Sprintf("only %d/%d runners started within %s", started, total, syncWaitBudget)})
 			}
 		}
 		r.cond(ctx, lt, dfaasv1.LTCondSyncReady,

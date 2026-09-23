@@ -75,6 +75,7 @@ func (r *EnvironmentReconciler) prober() reach.Prober {
 	return reach.TCP{}
 }
 
+//+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=loadtests,verbs=get;list;watch;delete
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=environments,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=environments/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=dfaas.dfaas.io,resources=environments/finalizers,verbs=update
