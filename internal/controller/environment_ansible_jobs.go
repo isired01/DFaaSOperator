@@ -278,38 +278,64 @@ func patchJobTTL(ctx context.Context, c client.Client, job *batchv1.Job, ttlSec 
 	}
 }
 
-// cleanupStaleGenJobs deletes Ansible Jobs for env whose generation label
-// does not match env.Generation. Idempotent — no-op if no stale Jobs.
-// Used on generation drift to abort old-gen Ansible runs before starting
-// the new one (avoids two Ansible playbooks racing on the same VMs).
+// cleanupStaleGenJobs deletes the Ansible Jobs of older generations (with
+// Foreground propagation, so a Job outlives its pods) and, best-effort, their
+// inventory Secrets, which hold node credentials. It returns the names of the
+// older-generation Jobs that still exist: ProvisioningInfra waits until none
+// does, so two generations of playbooks never run on the same machines. The
+// Job List reads uncached when APIReader is wired: the Job informer is not
+// ordered with the Environment one, and a missed Job here is a concurrent run.
+// Only the List error is returned.
 func (r *EnvironmentReconciler) cleanupStaleGenJobs(ctx context.Context,
-	env *dfaasv1.Environment) error {
+	env *dfaasv1.Environment) ([]string, error) {
 	logger := log.FromContext(ctx)
-
-	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs,
+	selector := []client.ListOption{
 		client.InNamespace(env.Namespace),
 		client.MatchingLabels{ansible.LabelEnvironment: env.Name},
-	); err != nil {
-		return fmt.Errorf("list jobs: %w", err)
+	}
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	var jobs batchv1.JobList
+	if err := reader.List(ctx, &jobs, selector...); err != nil {
+		return nil, fmt.Errorf("list jobs: %w", err)
 	}
 
 	currentGen := fmt.Sprintf("%d", env.Generation)
-	propagation := metav1.DeletePropagationBackground
+	stale := func(labels map[string]string) bool {
+		g := labels[ansible.LabelGeneration]
+		return g != "" && g != currentGen
+	}
+	propagation := metav1.DeletePropagationForeground
+	var older []string
 	for i := range jobs.Items {
 		j := &jobs.Items[i]
-		if j.Labels[ansible.LabelGeneration] == currentGen {
+		if !stale(j.Labels) {
 			continue
 		}
-		logger.Info("deleting stale-gen Ansible Job",
-			"job", j.Name,
-			"staleGen", j.Labels[ansible.LabelGeneration],
-			"currentGen", currentGen)
-		if err := r.Delete(ctx, j, &client.DeleteOptions{
-			PropagationPolicy: &propagation,
-		}); err != nil && !apierrors.IsNotFound(err) {
+		older = append(older, j.Name)
+		if !j.DeletionTimestamp.IsZero() {
+			continue
+		}
+		logger.Info("deleting stale-gen Ansible Job", "job", j.Name,
+			"staleGen", j.Labels[ansible.LabelGeneration], "currentGen", currentGen)
+		if err := r.Delete(ctx, j, &client.DeleteOptions{PropagationPolicy: &propagation}); err != nil &&
+			!apierrors.IsNotFound(err) {
 			logger.Error(err, "delete stale Job", "job", j.Name)
 		}
 	}
-	return nil
+
+	var secrets corev1.SecretList
+	if err := r.List(ctx, &secrets, selector...); err != nil {
+		logStatusErr(ctx, "list stale-gen inventory Secrets", err)
+		return older, nil
+	}
+	for i := range secrets.Items {
+		sec := &secrets.Items[i]
+		if stale(sec.Labels) {
+			logStatusErr(ctx, "delete stale-gen inventory Secret", client.IgnoreNotFound(r.Delete(ctx, sec)))
+		}
+	}
+	return older, nil
 }

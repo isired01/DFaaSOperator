@@ -47,9 +47,11 @@ func (p LoadTestPhase) Terminal() bool {
 }
 
 // PreExecution reports whether the LoadTest has not started running yet --
-// unreconciled ("") or held at Pending. It is the window in which the
-// create-time gates, the draft hold and the scheduled branch apply, and the
-// scope the API server would need a CEL transition rule to express.
+// not yet admitted ("") or held at Pending. The create-time gates run only at
+// "" (admission writes Pending before anything remote happens); the draft
+// hold, the scheduled branch and the Environment wait apply to the whole
+// window. It is the scope the API server would need a CEL transition rule to
+// express.
 func (p LoadTestPhase) PreExecution() bool {
 	return p == "" || p == LoadTestPending
 }
@@ -74,7 +76,6 @@ const (
 	LTReasonScheduledArmed         = "ScheduledArmed"
 	LTReasonScheduledFired         = "ScheduledFired"
 	LTReasonScheduledDelayedEnvNot = "ScheduledDelayedEnvNotReady"
-	LTReasonNotScheduled           = "NotScheduled"
 	LTReasonInFlight               = "InFlight"
 	LTReasonAllDispatched          = "AllDispatched"
 	LTReasonDispatchFailed         = "DispatchFailed"
@@ -83,16 +84,19 @@ const (
 	LTReasonPartialFailure         = "PartialFailure"
 	LTReasonAllFailed              = "AllFailed"
 	LTReasonRunning                = "Running"
-	LTReasonK6Running              = "K6Running"
 	LTReasonExportCooldown         = "ExportCooldown"
 	LTReasonExporterRunning        = "ExporterRunning"
 	LTReasonExportSucceeded        = "ExportSucceeded"
 	LTReasonJobFailed              = "JobFailed"
 	LTReasonExportSkipped          = "Skipped"
-	// LTReasonRunnersReclaimed restamps K6Healthy after an abort tore the
-	// remote TestRuns down. Without it the condition keeps the last observed
-	// running count ("2 running") on a test whose runners are already gone.
-	LTReasonRunnersReclaimed   = "RunnersReclaimed"
+	// LTReasonRunnersReclaimed restamps K6Healthy when a run end confirmed
+	// every remote TestRun absent. Without it the condition keeps the last
+	// observed running count ("2 running") on a test whose runners are gone.
+	LTReasonRunnersReclaimed = "RunnersReclaimed"
+	// LTReasonRunnersUnreclaimed: a run end could not delete a TestRun this
+	// run applied, so its runner may still be sending load. Occupancy holds
+	// the Environment on it and the operator keeps retrying the delete.
+	LTReasonRunnersUnreclaimed = "RunnersUnreclaimed"
 	LTReasonS3ConfigMissing    = "S3ConfigMissing"
 	LTReasonUserAborted        = "UserAborted"
 	LTReasonCompleted          = "Completed"
@@ -104,11 +108,11 @@ const (
 	LTReasonGoPublished        = "GoPublished"
 	LTReasonSyncTimeout        = "SyncTimeout"
 	LTReasonApplyFailed        = "ApplyFailed"
-	// LTReasonFetchFailed marks a failed READ of a remote TestRun (status
-	// poll), as opposed to ApplyFailed which marks a failed write. Reusing
-	// ApplyFailed for both made a dead k6 node read like a rejected manifest.
+	// LTReasonFetchFailed marks an observe round in which some generator could
+	// not report its TestRun's stage (K6Healthy=Unknown, "attempt n/15"), as
+	// opposed to ApplyFailed which marks a failed write. Reusing ApplyFailed
+	// for both made a dead k6 node read like a rejected manifest.
 	LTReasonFetchFailed = "FetchFailed"
-	LTReasonPostStart   = "PostStart"
 	LTReasonEnvNotFound = "EnvNotFound"
 	LTReasonEnvFound    = "EnvFound"
 	LTReasonEnvFailed   = "EnvFailed"

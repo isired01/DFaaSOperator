@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/statuswriter"
 	"dfaas-operator/internal/k6dispatch"
 )
 
@@ -55,46 +56,53 @@ const exportCooldown = federationInterval + exportTailWindow
 
 // observeK6 polls every remote TestRun. When all have reached a terminal
 // stage (finished/stopped) it transitions to Exporting; on any error it
-// fails the LoadTest.
+// fails the LoadTest, and endRun deletes whatever may still be running.
 func (r *LoadTestReconciler) observeK6(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	allDone := true
-	var errorCount, finishedCount int
-	updatedRefs := make([]dfaasv1.TestRunRef, len(lt.Status.TestRuns))
-	copy(updatedRefs, lt.Status.TestRuns)
-
-	for i, ref := range lt.Status.TestRuns {
-		node, nerr := r.Dispatcher.Node(ctx, env, ref.NodeID)
-		if nerr != nil {
-			// A node that vanished mid-test can neither be polled nor released:
-			// fail on the spot instead of waiting out a budget it cannot satisfy.
-			return r.failLoadTest(ctx, lt, nerr.Error())
-		}
-		stage, err := node.Stage(ctx, lt)
-		if err != nil {
-			// ErrNotFound included: a TestRun that disappeared under a running
-			// test is a fetch failure, routed through the retry budget.
-			logger.Error(err, "remote TestRun fetch failed", "node", ref.NodeID, "name", ref.Name)
-			res, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonFetchFailed)
-			return res, oerr
-		}
-		// Successful dispatcher round-trip — reset the budget counter.
-		if rerr := r.budget(dispatchAttemptsAnnotation, dispatchRetryBudget).Clear(ctx, lt); rerr != nil {
-			logger.Error(rerr, "resetDispatchAttempts failed; non-fatal")
-		}
-		updatedRefs[i].Phase = stage
-
-		switch stage {
-		case "finished", "stopped":
-			finishedCount++
-		case "error":
-			errorCount++
-		default:
-			allDone = false
-		}
+	nodeIDs := make([]string, 0, len(lt.Status.TestRuns))
+	for _, ref := range lt.Status.TestRuns {
+		nodeIDs = append(nodeIDs, ref.NodeID)
 	}
+	rd := r.survey(ctx, lt, env, nodeIDs)
+	updatedRefs := rd.refs(lt.Status.TestRuns)
+
+	if len(rd.unusable) > 0 {
+		// A generator that left the Environment can neither be polled nor
+		// released: fail on the spot instead of waiting out a budget it cannot
+		// satisfy.
+		return r.failLoadTest(ctx, lt, "generator unusable: "+rd.describe(rd.unusable))
+	}
+
+	budget := r.budget(fetchMissesAnnotation, fetchRetryBudget)
+	if len(rd.missing) > 0 {
+		// ErrNotFound included: a TestRun that disappeared under a running test
+		// is a failed round, charged once however many generators missed.
+		outcome, berr := r.attempt(ctx, lt, budget)
+		if berr != nil {
+			logger.Error(berr, "fetch-misses counter write failed; the budget cannot advance")
+		}
+		detail := "no status from " + rd.describe(rd.missing)
+		if outcome.Exhausted {
+			return r.failLoadTest(ctx, lt, fmt.Sprintf("observe: %d consecutive rounds failed: %s", outcome.Count, detail))
+		}
+		logStatusErr(ctx, "persist failed observe round", r.writer().Record(ctx, lt, ltTransition{
+			Conditions: []statuswriter.Cond{{Type: dfaasv1.LTCondK6Healthy, Status: metav1.ConditionUnknown,
+				Reason: dfaasv1.LTReasonFetchFailed, Message: fmt.Sprintf("attempt %s: %s", budget.Attempts(outcome), detail)}},
+			Touch: func(latest *dfaasv1.LoadTest) error {
+				latest.Status.TestRuns = updatedRefs
+				return nil
+			},
+		}))
+		return ctrl.Result{RequeueAfter: r.retryInterval()}, nil
+	}
+	// A complete round — reset the counter (a no-op at zero).
+	if rerr := budget.Clear(ctx, lt); rerr != nil {
+		logger.Error(rerr, "reset fetch-misses failed; non-fatal")
+	}
+	finishedCount, errorCount := rd.count[stageDone], rd.count[stageErrored]
+	allDone := rd.count[stagePending]+rd.count[stageStarted] == 0
 
 	// Persist updated phases (best-effort).
 	logStatusErr(ctx, "persist updated TestRun phases", r.writer().Record(ctx, lt, ltTransition{Touch: func(latest *dfaasv1.LoadTest) error {
@@ -120,18 +128,16 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 			metav1.ConditionTrue, dfaasv1.LTReasonAllFinished,
 			fmt.Sprintf("%d/%d TestRun(s) finished cleanly", finishedCount, total))
 	case finishedCount == 0:
-		r.cond(ctx, lt, dfaasv1.LTCondK6Healthy,
-			metav1.ConditionFalse, dfaasv1.LTReasonAllFailed,
-			fmt.Sprintf("%d/%d TestRun(s) reported error", errorCount, total))
 		return r.failLoadTest(ctx, lt,
-			fmt.Sprintf("all %d remote TestRuns reported error stage", errorCount))
+			fmt.Sprintf("all %d remote TestRuns reported error stage", errorCount),
+			statuswriter.Cond{Type: dfaasv1.LTCondK6Healthy, Status: metav1.ConditionFalse,
+				Reason: dfaasv1.LTReasonAllFailed, Message: fmt.Sprintf("%d/%d TestRun(s) reported error", errorCount, total)})
 	default:
-		r.cond(ctx, lt, dfaasv1.LTCondK6Healthy,
-			metav1.ConditionFalse, dfaasv1.LTReasonPartialFailure,
-			fmt.Sprintf("%d finished, %d error (of %d)",
-				finishedCount, errorCount, total))
 		return r.failLoadTest(ctx, lt,
-			fmt.Sprintf("%d of %d remote TestRuns reported error stage", errorCount, total))
+			fmt.Sprintf("%d of %d remote TestRuns reported error stage", errorCount, total),
+			statuswriter.Cond{Type: dfaasv1.LTCondK6Healthy, Status: metav1.ConditionFalse,
+				Reason:  dfaasv1.LTReasonPartialFailure,
+				Message: fmt.Sprintf("%d finished, %d error (of %d)", finishedCount, errorCount, total)})
 	}
 
 	// Capture each VM's k6 end-of-test summary into per-node ConfigMaps
@@ -225,25 +231,23 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 
 	if apierrors.IsNotFound(err) {
 		if lt.Status.StartTime == nil || lt.Status.EndTime == nil {
-			r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
-				metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
-				"missing StartTime/EndTime; cannot run exporter")
-			return r.failLoadTest(ctx, lt, "missing StartTime/EndTime; cannot run exporter")
+			return r.failLoadTest(ctx, lt, "missing StartTime/EndTime; cannot run exporter",
+				exportFailed("missing StartTime/EndTime; cannot run exporter"))
 		}
 
 		// Cool-down before querying. The management Prometheus does not scrape
 		// the workers directly — it federates from each worker's own Prometheus
-		// on the chart-default 1m interval, so at the instant k6 stops, the tail
+		// every federationInterval (15s), so at the instant k6 stops, the tail
 		// of the run may not have been pulled across yet. Exporting immediately
 		// truncates the CSV by up to one federation period, and by a different
 		// amount on every run (it depends where EndTime lands in the cycle),
 		// which makes the tails of two otherwise-identical runs incomparable.
 		//
-		// The query window is NOT extended: END_TIME stays at the k6 finish, so
-		// the CSV still covers exactly the load test — the wait only lets the
-		// samples for that window arrive. Keyed off the persisted Status.EndTime,
-		// so an operator restart mid-cool-down resumes with the correct deadline
-		// rather than starting the minute again.
+		// The query window IS extended by exportTailWindow (one interval past
+		// EndTime, see its doc), so every node has a sample at or after the k6
+		// finish; exportCooldown covers that widened window. Keyed off the
+		// persisted Status.EndTime, so an operator restart mid-cool-down resumes
+		// with the correct deadline rather than starting the wait again.
 		if waited := time.Since(lt.Status.EndTime.Time); waited < exportCooldown {
 			remaining := exportCooldown - waited
 			r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
@@ -265,22 +269,25 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 			configName = env.Spec.S3ConfigRef.Name
 		}
 		var s3SecretName string
+		runningMsg := "exporter Job created, awaiting completion"
 		mirrored, mirrorErr := r.ensureMirroredS3Secret(ctx, lt, configName)
 		if mirrorErr != nil {
 			if apierrors.IsNotFound(mirrorErr) {
 				missing := fmt.Sprintf("S3 config %q not found in namespace %s",
 					configName, S3ConfigNamespace)
-				// Stamp the S3ConfigMissing condition either way for visibility.
-				r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
-					metav1.ConditionFalse, dfaasv1.LTReasonS3ConfigMissing, missing)
 				if explicitRef {
 					// Explicit ref must exist — a missing one is a hard failure
 					// (unchanged behaviour).
-					return r.phase(ctx, lt, dfaasv1.LoadTestFailed,
-						dfaasv1.LTReasonS3ConfigMissing, missing)
+					return r.endRun(ctx, lt, dfaasv1.LoadTestFailed, dfaasv1.LTReasonS3ConfigMissing, missing,
+						statuswriter.Cond{Type: dfaasv1.LTCondMetricsExported, Status: metav1.ConditionFalse,
+							Reason: dfaasv1.LTReasonS3ConfigMissing, Message: missing})
 				}
 				// Default sink missing (e.g. SeaweedFS not yet deployed) — degrade
-				// gracefully to the stdout path rather than failing the test.
+				// gracefully to the stdout path rather than failing the test. No
+				// S3ConfigMissing stamp here: that reason is terminal, and this
+				// path is not; the running message names the fallback instead.
+				runningMsg = "exporter Job created, awaiting completion; " + missing +
+					", so the CSV goes to the Job's stdout (kubectl logs)"
 				logger.Info("default S3 config not found; falling back to stdout export",
 					"config", configName)
 				s3SecretName = ""
@@ -307,17 +314,14 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 			// sample at or after EndTime. See exportTailWindow.
 			lt.Status.EndTime.Time.Add(exportTailWindow), s3SecretName, k6LogCMs)
 		if err != nil {
-			r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
-				metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
-				"build exporter job: "+condMessage(err))
-			return r.failLoadTest(ctx, lt, fmt.Sprintf("build exporter job: %v", err))
+			return r.failLoadTest(ctx, lt, fmt.Sprintf("build exporter job: %v", err),
+				exportFailed("build exporter job: "+condMessage(err)))
 		}
 		if err := r.Create(ctx, newJob); err != nil && !apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{}, err
 		}
 		r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
-			metav1.ConditionUnknown, dfaasv1.LTReasonExporterRunning,
-			"exporter Job created, awaiting completion")
+			metav1.ConditionUnknown, dfaasv1.LTReasonExporterRunning, runningMsg)
 		logStatusErr(ctx, "persist exporter Job name", r.writer().Record(ctx, lt, ltTransition{Touch: func(latest *dfaasv1.LoadTest) error {
 			latest.Status.ExporterJob = jobName
 			return nil
@@ -330,12 +334,10 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 
 	if job.Status.Succeeded > 0 || jobConditionTrue(&job, batchv1.JobComplete) {
 		logger.Info("exporter Job succeeded")
-		// Summaries consumed by the exporter — sweep them off the filer.
-		logStatusErr(ctx, "delete k6 summaries", r.syncChannel().DeleteSummaries(ctx, lt))
-		r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
-			metav1.ConditionTrue, dfaasv1.LTReasonExportSucceeded,
-			"metrics exported")
-		return r.phase(ctx, lt, dfaasv1.LoadTestCompleted, "", "")
+		// endRun sweeps the summaries the exporter consumed off the filer.
+		return r.endRun(ctx, lt, dfaasv1.LoadTestCompleted, "", "",
+			statuswriter.Cond{Type: dfaasv1.LTCondMetricsExported, Status: metav1.ConditionTrue,
+				Reason: dfaasv1.LTReasonExportSucceeded, Message: "metrics exported"})
 	}
 	// Decide terminal failure from the JobFailed condition, not the raw
 	// Status.Failed counter: that counter tracks failed *attempts*, and the Job
@@ -343,13 +345,14 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 	// otherwise fail the LoadTest while Kubernetes is still spawning a retry pod
 	// that may yet succeed (same backoff-aware pattern as the Ansible Jobs).
 	if jobConditionTrue(&job, batchv1.JobFailed) {
-		// Nothing will consume the summaries anymore — sweep them.
-		logStatusErr(ctx, "delete k6 summaries", r.syncChannel().DeleteSummaries(ctx, lt))
-		r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
-			metav1.ConditionFalse, dfaasv1.LTReasonJobFailed,
-			"exporter Job reported Failed")
-		return r.failLoadTest(ctx, lt, "exporter Job failed")
+		return r.failLoadTest(ctx, lt, "exporter Job failed", exportFailed("exporter Job reported Failed"))
 	}
 	logger.Info("exporter Job running")
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// exportFailed is the MetricsExported Condition of a failed export step.
+func exportFailed(message string) statuswriter.Cond {
+	return statuswriter.Cond{Type: dfaasv1.LTCondMetricsExported, Status: metav1.ConditionFalse,
+		Reason: dfaasv1.LTReasonJobFailed, Message: message}
 }

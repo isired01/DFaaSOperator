@@ -344,9 +344,10 @@ spec:
                 type: string
               observedGeneration:
                 description: |-
-                  ObservedGeneration is the spec.generation observed at the last
-                  successful provisioning run. The reconciler skips re-provisioning when
-                  metadata.generation == status.observedGeneration and phase == Ready.
+                  ObservedGeneration is the spec.generation the last settled run (Ready or
+                  Failed) applied, copied from provisioningGeneration at the settle. The
+                  reconciler skips re-provisioning when metadata.generation ==
+                  status.observedGeneration and phase == Ready.
                 format: int64
                 type: integer
               phase:
@@ -360,6 +361,15 @@ spec:
                 - Failed
                 - Unreachable
                 type: string
+              provisioningGeneration:
+                description: |-
+                  ProvisioningGeneration is the metadata.generation the current (or last)
+                  provisioning run is applying, recorded when the run starts
+                  (ProvisioningVMs). A settled phase stamps it into observedGeneration, so
+                  an edit that lands mid-run is detected as drift instead of being marked
+                  installed without ever reaching Ansible.
+                format: int64
+                type: integer
             type: object
         type: object
     served: true

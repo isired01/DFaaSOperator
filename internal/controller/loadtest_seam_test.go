@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -151,6 +152,9 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 		r = &LoadTestReconciler{
 			Client: k8sClient, Scheme: scheme.Scheme,
 			Dispatcher: fleet, Sync: channel,
+			// reconcileUntil does not wait between passes; production paces a
+			// failed remote round at remoteRetryInterval.
+			retryEvery: time.Nanosecond,
 		}
 	})
 
@@ -238,9 +242,12 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 
 		fleet.SetStage("gen-a", lt, "error")
 		fleet.SetStage("gen-b", lt, "error")
+		deletedBefore := len(fleet.Deleted())
 		fresh := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestFailed))
 		Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
 		Expect(cond(fresh, dfaasv1.LTCondK6Healthy).Reason).To(Equal(dfaasv1.LTReasonAllFailed))
+		// Runners already observed done are not torn down: their remote logs survive.
+		Expect(fleet.Deleted()).To(HaveLen(deletedBefore))
 	})
 
 	It("holds a syncStart test on the barrier until every runner has started, then publishes GO", func() {
@@ -356,17 +363,644 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(fleet.Applied()).To(BeEmpty())
 		})
 
-		It("a node that left the Environment mid-test fails the test on the next observe", func() {
+		It("a parked draft still gets its Environment ownerRef", func() {
 			env := envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.Suspended = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestPending))
+			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool { return hasOwnerRef(l, env) })
+			Expect(hasOwnerRef(fresh, env)).To(BeTrue())
+			Expect(fleet.Applied()).To(BeEmpty())
+		})
+
+		It("a node that left the Environment mid-test fails the test and deletes the other runners", func() {
+			env := envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+
+			env.Status.K6Nodes = env.Status.K6Nodes[:1] // gen-b gone
+			Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
+			fresh := reconcileUntil(lt, 3, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse(), "the reachable runner must not keep loading")
+			Expect(cond(fresh, dfaasv1.LTCondK6Healthy).Message).To(ContainSubstring("gen-b"))
+			Expect(cond(fresh, dfaasv1.LTCondMetricsExported).Reason).To(Equal(dfaasv1.LTReasonExportSkipped))
+		})
+	})
+	// Every way a run ends goes through one module that reclaims what the run
+	// may still have live on the generators. Before, only the Sync barrier
+	// tore down: four exits to Failed left runners loading the DFaaS nodes
+	// while Occupancy freed the Environment for the next queued test.
+	Context("run end (every exit reclaims)", func() {
+		remoteDown := fmt.Errorf("remote k3s API down")
+		k6Healthy := func(l *dfaasv1.LoadTest) *metav1.Condition { return cond(l, dfaasv1.LTCondK6Healthy) }
+		exhaustBudget := func(lt *dfaasv1.LoadTest) {
+			var fresh dfaasv1.LoadTest
+			Expect(k8sClient.Get(ctx, keyOf(lt), &fresh)).To(Succeed())
+			patch := fmt.Sprintf(`{"metadata":{"annotations":{%q:"%d:%d"}}}`,
+				dispatchAttemptsAnnotation, fresh.Generation, dispatchRetryBudget-1)
+			Expect(k8sClient.Patch(ctx, &fresh, client.RawPatch(types.MergePatchType, []byte(patch)))).To(Succeed())
+		}
+
+		It("an exhausted dispatch budget reclaims gen-a and does not hold the Environment for gen-b, which never got a TestRun", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			fleet.FailNext("gen-b", "apply", remoteDown)
+			reconcileUntil(lt, 6, func(l *dfaasv1.LoadTest) bool { return len(l.Status.TestRuns) == 1 })
+
+			exhaustBudget(lt)
+			fleet.FailNext("gen-b", "mirror", remoteDown)
+			fleet.FailNext("gen-b", "delete", remoteDown)
+			fresh := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(cond(fresh, dfaasv1.LTCondReady).Reason).To(Equal(dfaasv1.LTReasonDispatchFailed))
+			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Reason).To(Equal(dfaasv1.LTReasonDispatchFailed))
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+			Expect(k6Healthy(fresh).Reason).NotTo(Equal(dfaasv1.LTReasonRunnersUnreclaimed))
+			Expect(k6Healthy(fresh).Message).To(ContainSubstring("gen-b"))
+
+			lt2 := newLT("lt2", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt2)).To(Succeed())
+			Expect(reconcileUntil(lt2, 12, phaseIs(dfaasv1.LoadTestRunning)).Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+		})
+
+		It("a generator that left the Environment mid-dispatch fails the test and deletes the TestRun already applied", func() {
+			env := envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			fleet.FailNext("gen-b", "apply", remoteDown)
+			reconcileUntil(lt, 6, func(l *dfaasv1.LoadTest) bool { return len(l.Status.TestRuns) == 1 })
+
+			env.Status.K6Nodes = env.Status.K6Nodes[:1]
+			Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
+			fresh := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+			Expect(k6Healthy(fresh).Message).To(ContainSubstring("gen-b"))
+		})
+
+		It("an unreachable generator no longer blocks the barrier's Failed transition", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 10, func(l *dfaasv1.LoadTest) bool {
+				c := cond(l, dfaasv1.LTCondSyncReady)
+				return c != nil && c.Reason == dfaasv1.LTReasonAwaitingRunners
+			})
+
+			fleet.SetStage("gen-a", lt, "error")
+			fleet.FailNext("gen-b", "delete", remoteDown)
+			fresh := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(cond(fresh, dfaasv1.LTCondSyncReady).Reason).To(Equal(dfaasv1.LTReasonSyncTimeout))
+			Expect(k6Healthy(fresh).Reason).To(Equal(dfaasv1.LTReasonRunnersUnreclaimed))
+			Expect(k6Healthy(fresh).Message).To(ContainSubstring("gen-b"))
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+			Expect(channel.Count("PublishGo")).To(BeZero())
+		})
+
+		It("an exhausted observe budget fails the test and reclaims every generator", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+
+			var cur dfaasv1.LoadTest
+			Expect(k8sClient.Get(ctx, keyOf(lt), &cur)).To(Succeed())
+			patch := fmt.Sprintf(`{"metadata":{"annotations":{%q:"%d:%d"}}}`,
+				fetchMissesAnnotation, cur.Generation, fetchRetryBudget-1)
+			Expect(k8sClient.Patch(ctx, &cur, client.RawPatch(types.MergePatchType, []byte(patch)))).To(Succeed())
+			fleet.FailNext("gen-a", "stage", remoteDown)
+			fresh := reconcileUntil(lt, 3, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(cond(fresh, dfaasv1.LTCondReady).Message).To(ContainSubstring("gen-a"))
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+			Expect(fleet.Exists("gen-b", lt)).To(BeFalse())
+			Expect(k6Healthy(fresh).Reason).To(Equal(dfaasv1.LTReasonRunnersReclaimed))
+		})
+
+		It("abort with an unreachable generator reaches Aborted in one pass, holds the Environment, then releases it", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+
+			Expect(k8sClient.Patch(ctx, lt, client.RawPatch(types.MergePatchType, []byte(`{"spec":{"stop":true}}`)))).To(Succeed())
+			fleet.FailNext("gen-b", "delete", remoteDown)
+			fresh := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestAborted))
+			Expect(k6Healthy(fresh).Reason).To(Equal(dfaasv1.LTReasonRunnersUnreclaimed))
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+			Expect(fleet.Exists("gen-b", lt)).To(BeTrue())
+
+			lt2 := newLT("lt2", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt2)).To(Succeed())
+			held := reconcileUntil(lt2, 6, func(l *dfaasv1.LoadTest) bool { return cond(l, dfaasv1.LTCondQueued) != nil })
+			Expect(held.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
+			q := cond(held, dfaasv1.LTCondQueued)
+			Expect(q).NotTo(BeNil())
+			Expect(q.Reason).To(Equal(dfaasv1.LTReasonEnvBusy))
+			Expect(q.Message).To(ContainSubstring(`"lt"`))
+			for _, a := range fleet.Applied() {
+				Expect(a.Name).NotTo(HavePrefix("lt2-"))
+			}
+
+			fleet.FailNext("gen-b", "delete", remoteDown)
+			still := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(k6Healthy(still).Reason).To(Equal(dfaasv1.LTReasonRunnersUnreclaimed))
+
+			healed := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(k6Healthy(healed).Reason).To(Equal(dfaasv1.LTReasonRunnersReclaimed))
+			Expect(fleet.Exists("gen-b", lt)).To(BeFalse())
+			Expect(reconcileUntil(lt2, 12, phaseIs(dfaasv1.LoadTestRunning)).Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+		})
+
+		It("a Failed exit from the exporter step sweeps the k6 summaries", func() {
+			envReady("env", "gen-a")
 			scriptCM("script")
 			lt := newLT("lt", "env", "gen-a")
 			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
 			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			fleet.SetStage("gen-a", lt, "finished")
+			exporting := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestExporting))
+			deletedBefore := len(fleet.Deleted())
 
-			env.Status.K6Nodes = nil
+			exporting.Status.StartTime = nil
+			Expect(k8sClient.Status().Update(ctx, exporting)).To(Succeed())
+			fresh := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(cond(fresh, dfaasv1.LTCondMetricsExported).Reason).To(Equal(dfaasv1.LTReasonJobFailed))
+			Expect(channel.Count("DeleteSummaries")).To(Equal(1))
+			Expect(fleet.Deleted()).To(HaveLen(deletedBefore))
+		})
+
+		It("deleting a Completed test reclaims its TestRun without rewriting its record", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			fleet.SetStage("gen-a", lt, "finished")
+			done := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestExporting))
+			done.Status.Phase = dfaasv1.LoadTestCompleted
+			meta.SetStatusCondition(&done.Status.Conditions, metav1.Condition{Type: dfaasv1.LTCondMetricsExported,
+				Status: metav1.ConditionTrue, Reason: dfaasv1.LTReasonExportSucceeded, Message: "metrics exported"})
+			Expect(k8sClient.Status().Update(ctx, done)).To(Succeed())
+
+			fleet.FailNext("gen-a", "stage", remoteDown)
+			Expect(k8sClient.Delete(ctx, lt)).To(Succeed())
+			kept := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(kept).NotTo(BeNil())
+			Expect(kept.Status.Phase).To(Equal(dfaasv1.LoadTestCompleted))
+			Expect(cond(kept, dfaasv1.LTCondMetricsExported).Reason).To(Equal(dfaasv1.LTReasonExportSucceeded))
+
+			Expect(reconcileUntil(lt, 6, func(*dfaasv1.LoadTest) bool { return false })).To(BeNil())
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+		})
+
+		It("an unreachable generator holds the deletion finalizer only for the deletion budget", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+
+			Expect(k8sClient.Delete(ctx, lt)).To(Succeed())
+			fleet.FailNext("gen-b", "delete", remoteDown)
+			first := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(first.Status.Phase).To(Equal(dfaasv1.LoadTestAborted))
+
+			fleet.FailNext("gen-b", "stage", remoteDown)
+			Expect(reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })).NotTo(BeNil())
+
+			var fresh dfaasv1.LoadTest
+			Expect(k8sClient.Get(ctx, keyOf(lt), &fresh)).To(Succeed())
+			past := metav1.NewTime(fresh.DeletionTimestamp.Add(-deletionReclaimBudget - time.Second))
+			fresh.DeletionTimestamp = &past
+			fleet.FailNext("gen-b", "stage", remoteDown)
+			_, err := r.handleLoadTestDeletion(ctx, &fresh)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, keyOf(lt), &fresh))).To(BeTrue())
+		})
+
+		It("deleting a never-dispatched draft makes no remote call", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			lt.Spec.Suspended = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestPending))
+
+			Expect(k8sClient.Delete(ctx, lt)).To(Succeed())
+			Expect(reconcileUntil(lt, 3, func(*dfaasv1.LoadTest) bool { return false })).To(BeNil())
+			Expect(fleet.Deleted()).To(BeEmpty())
+			Expect(channel.Calls()).To(BeEmpty())
+		})
+
+		It("with the Environment already gone, deletion still sweeps the GO object and the summaries", func() {
+			lt := newLT("lt", "missing", "gen-a")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false }) // adds the finalizer
+			var fresh dfaasv1.LoadTest
+			Expect(k8sClient.Get(ctx, keyOf(lt), &fresh)).To(Succeed())
+			fresh.Status.TestRuns = []dfaasv1.TestRunRef{{NodeID: "gen-a", Name: "lt-gen-a", Namespace: "default"}}
+			Expect(k8sClient.Status().Update(ctx, &fresh)).To(Succeed())
+
+			Expect(k8sClient.Delete(ctx, lt)).To(Succeed())
+			Expect(reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })).To(BeNil())
+			Expect(channel.Count("DeleteGo")).To(Equal(1))
+			Expect(channel.Count("DeleteSummaries")).To(Equal(1))
+		})
+
+		It("Environment deletion drains the tests it owns first, and a deleting Environment dispatches nothing new", func() {
+			env := envReady("env", "gen-a")
+			scriptCM("script")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			env.Finalizers = append(env.Finalizers, environmentFinalizer)
+			Expect(k8sClient.Update(ctx, env)).To(Succeed())
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+
+			Expect(k8sClient.Delete(ctx, env)).To(Succeed())
+			lt3 := newLT("lt3", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt3)).To(Succeed())
+			reconcileUntil(lt3, 3, func(*dfaasv1.LoadTest) bool { return false })
+			for _, a := range fleet.Applied() {
+				Expect(a.Name).NotTo(HavePrefix("lt3-"))
+			}
+
+			er := &EnvironmentReconciler{Client: k8sClient, Scheme: scheme.Scheme}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			res, err := er.handleEnvDeletion(ctx, env)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			Expect(env.Finalizers).To(ContainElement(environmentFinalizer))
+
+			Expect(reconcileUntil(lt, 6, func(*dfaasv1.LoadTest) bool { return false })).To(BeNil())
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+			_, err = er.handleEnvDeletion(ctx, env)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env))).To(BeTrue())
+		})
+	})
+	// One fleet round per tick: every generator is polled once and the Retry
+	// counter is charged once per round. Before, a healthy generator's
+	// success reset the counter every pass, so one generator down behind a
+	// healthy one never exhausted the budget and the test stayed Running.
+	Context("fleet round", func() {
+		remoteDown := fmt.Errorf("remote k3s API down")
+		awaiting := func(l *dfaasv1.LoadTest) bool {
+			c := cond(l, dfaasv1.LTCondSyncReady)
+			return c != nil && c.Reason == dfaasv1.LTReasonAwaitingRunners
+		}
+		runningOn := func(ids ...string) *dfaasv1.LoadTest {
+			envReady("env", ids...)
+			scriptCM("script")
+			lt := newLT("lt", "env", ids...)
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			return lt
+		}
+		refPhase := func(l *dfaasv1.LoadTest, nodeID string) string {
+			for _, ref := range l.Status.TestRuns {
+				if ref.NodeID == nodeID {
+					return ref.Phase
+				}
+			}
+			return "<none>"
+		}
+
+		It("a generator down behind a healthy one exhausts the observe budget", func() {
+			lt := runningOn("gen-a", "gen-b")
+			var fresh *dfaasv1.LoadTest
+			passes := 0
+			for passes < fetchRetryBudget+5 {
+				fleet.FailNext("gen-b", "stage", remoteDown)
+				fresh = reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+				passes++
+				if fresh.Status.Phase == dfaasv1.LoadTestFailed {
+					break
+				}
+			}
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(passes).To(BeNumerically("<=", fetchRetryBudget))
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+		})
+
+		It("a failed round still persists the stage of every generator that answered", func() {
+			lt := runningOn("gen-a", "gen-b")
+			fleet.SetStage("gen-b", lt, "finished")
+			fleet.FailNext("gen-a", "stage", remoteDown)
+			fresh := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(refPhase(fresh, "gen-b")).To(Equal("finished"))
+		})
+
+		It("a fetch failure charges its own counter and leaves K6Dispatched alone", func() {
+			lt := runningOn("gen-a", "gen-b")
+			fleet.FailNext("gen-a", "stage", remoteDown)
+			fresh := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(fresh.Annotations[fetchMissesAnnotation]).To(Equal(fmt.Sprintf("%d:1", fresh.Generation)))
+			Expect(fresh.Annotations[dispatchAttemptsAnnotation]).NotTo(HaveSuffix(":1"))
+			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Reason).To(Equal(dfaasv1.LTReasonAllDispatched))
+			h := cond(fresh, dfaasv1.LTCondK6Healthy)
+			Expect(h.Status).To(Equal(metav1.ConditionUnknown))
+			Expect(h.Reason).To(Equal(dfaasv1.LTReasonFetchFailed))
+			Expect(h.Message).To(ContainSubstring("gen-a"))
+		})
+
+		It("the next remote round waits for the retry interval after a failed one", func() {
+			lt := runningOn("gen-a")
+			r.retryEvery = 0 // production pacing
+			fleet.FailNext("gen-a", "stage", remoteDown)
+			reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: keyOf(lt)})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			var fresh dfaasv1.LoadTest
+			Expect(k8sClient.Get(ctx, keyOf(lt), &fresh)).To(Succeed())
+			Expect(fresh.Annotations[fetchMissesAnnotation]).To(Equal(fmt.Sprintf("%d:1", fresh.Generation)))
+		})
+
+		It("a GO publish that keeps failing past the barrier budget fails the test", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 10, awaiting)
+			fleet.SetStage("gen-a", lt, "started")
+			fleet.SetStage("gen-b", lt, "started")
+			channel.PublishErr = fmt.Errorf("filer down")
+			waiting := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(waiting.Status.Phase).NotTo(Equal(dfaasv1.LoadTestFailed))
+
+			for i := range waiting.Status.Conditions {
+				if waiting.Status.Conditions[i].Type == dfaasv1.LTCondK6Dispatched {
+					waiting.Status.Conditions[i].LastTransitionTime = metav1.NewTime(time.Now().Add(-syncWaitBudget - time.Minute))
+				}
+			}
+			Expect(k8sClient.Status().Update(ctx, waiting)).To(Succeed())
+			fresh := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(cond(fresh, dfaasv1.LTCondSyncReady).Reason).To(Equal(dfaasv1.LTReasonSyncTimeout))
+		})
+
+		It("a runner that finished before the GO signal fails the test", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 10, awaiting)
+			fleet.SetStage("gen-a", lt, "finished")
+			fleet.SetStage("gen-b", lt, "started")
+			fresh := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(cond(fresh, dfaasv1.LTCondSyncReady).Reason).To(Equal(dfaasv1.LTReasonSyncTimeout))
+			Expect(channel.Count("PublishGo")).To(BeZero())
+		})
+
+		It("a GO already published finishes the dispatch without publishing again", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			parked := reconcileUntil(lt, 10, awaiting)
+			meta.SetStatusCondition(&parked.Status.Conditions, metav1.Condition{Type: dfaasv1.LTCondSyncReady,
+				Status: metav1.ConditionTrue, Reason: dfaasv1.LTReasonGoPublished, Message: "GO signal published"})
+			Expect(k8sClient.Status().Update(ctx, parked)).To(Succeed())
+			fleet.SetStage("gen-a", lt, "finished")
+			fresh := reconcileUntil(lt, 2, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+			Expect(channel.Count("PublishGo")).To(BeZero())
+		})
+	})
+
+	// A scheduled test is created suspended with a startAt (that is what the
+	// SPA sends); the operator lifts the suspension itself at fire time. These
+	// pin that the fire lands on a parked test instead of tripping the
+	// "startAt without suspended" guard meant for a kubectl apply.
+	Context("scheduled start (spec.startAt)", func() {
+		scheduledReason := func(l *dfaasv1.LoadTest) string {
+			if c := cond(l, dfaasv1.LTCondScheduled); c != nil {
+				return c.Reason
+			}
+			return ""
+		}
+		newScheduled := func(at time.Time) *dfaasv1.LoadTest {
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.Suspended = true
+			lt.Spec.StartAt = &metav1.Time{Time: at}
+			return lt
+		}
+		moveStartAtToPast := func(lt *dfaasv1.LoadTest) {
+			patch := fmt.Sprintf(`{"spec":{"startAt":%q}}`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339))
+			Expect(k8sClient.Patch(ctx, lt, client.RawPatch(types.MergePatchType, []byte(patch)))).To(Succeed())
+		}
+
+		It("parks an armed scheduled test at Pending, then fires and dispatches it", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newScheduled(time.Now().Add(time.Hour))
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			armed := reconcileUntil(lt, 4, func(l *dfaasv1.LoadTest) bool {
+				return scheduledReason(l) == dfaasv1.LTReasonScheduledArmed
+			})
+			Expect(armed.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
+			Expect(fleet.Applied()).To(BeEmpty())
+
+			moveStartAtToPast(lt)
+			fresh := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+			Expect(scheduledReason(fresh)).To(Equal(dfaasv1.LTReasonScheduledFired))
+			Expect(fleet.Applied()).NotTo(BeEmpty())
+		})
+
+		It("fires a scheduled test whose startAt already passed instead of failing it", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newScheduled(time.Now().Add(-time.Minute))
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			fresh := reconcileUntil(lt, 12, func(l *dfaasv1.LoadTest) bool {
+				return l.Status.Phase == dfaasv1.LoadTestRunning || l.Status.Phase == dfaasv1.LoadTestFailed
+			})
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+			Expect(scheduledReason(fresh)).To(Equal(dfaasv1.LTReasonScheduledFired))
+			Expect(fleet.Applied()).NotTo(BeEmpty())
+		})
+
+		It("waits at Pending when the schedule fires on a non-Ready Environment, then fires once it is Ready", func() {
+			env := envReady("env", "gen-a")
+			env.Status.Phase = dfaasv1.EnvProvisioningInfra
 			Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
+			scriptCM("script")
+			lt := newScheduled(time.Now().Add(-time.Minute))
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			delayed := reconcileUntil(lt, 4, func(l *dfaasv1.LoadTest) bool {
+				return scheduledReason(l) == dfaasv1.LTReasonScheduledDelayedEnvNot
+			})
+			Expect(delayed.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
+			Expect(fleet.Applied()).To(BeEmpty())
+
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			env.Status.Phase = dfaasv1.EnvReady
+			Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
+			fresh := reconcileUntil(lt, 12, func(l *dfaasv1.LoadTest) bool {
+				return l.Status.Phase == dfaasv1.LoadTestRunning || l.Status.Phase == dfaasv1.LoadTestFailed
+			})
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+		})
+
+		It("Start on an armed scheduled test dispatches it now, startAt left in place", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newScheduled(time.Now().Add(time.Hour))
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			armed := reconcileUntil(lt, 4, func(l *dfaasv1.LoadTest) bool {
+				return scheduledReason(l) == dfaasv1.LTReasonScheduledArmed
+			})
+			Expect(armed.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
+
+			// What a pre-fix gateway's Activate or a kubectl patch sends.
+			Expect(k8sClient.Patch(ctx, lt, client.RawPatch(types.MergePatchType,
+				[]byte(`{"spec":{"suspended":false}}`)))).To(Succeed())
+			fresh := reconcileUntil(lt, 12, func(l *dfaasv1.LoadTest) bool {
+				return l.Status.Phase == dfaasv1.LoadTestRunning || l.Status.Phase == dfaasv1.LoadTestFailed
+			})
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+		})
+
+		It("still fails a test created with startAt but without suspended", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.StartAt = &metav1.Time{Time: time.Now().Add(time.Hour)}
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			fresh := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(cond(fresh, dfaasv1.LTCondReady).Message).To(ContainSubstring("spec.startAt requires spec.suspended=true"))
+			Expect(fleet.Applied()).To(BeEmpty())
+		})
+	})
+	// phase "" means "not yet admitted", nothing more. A test that was never
+	// queued used to keep "" through its whole dispatch and the Sync barrier,
+	// so the create-time gate fired mid-run with the create-time message, and
+	// a Pending test holding TestRuns waited forever on an Environment that
+	// never recovered.
+	Context("admission", func() {
+		setEnvPhase := func(p dfaasv1.EnvironmentPhase) {
+			var env dfaasv1.Environment
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "env", Namespace: ns}, &env)).To(Succeed())
+			env.Status.Phase = p
+			Expect(k8sClient.Status().Update(ctx, &env)).To(Succeed())
+		}
+
+		It("admits every test at Pending before anything remote happens", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool { return l.Status.Phase != "" })
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
+			Expect(fleet.Applied()).To(BeEmpty())
+		})
+
+		It("an Environment lost mid-barrier ends the run with its own failure, not the create-time one", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 10, func(l *dfaasv1.LoadTest) bool {
+				c := cond(l, dfaasv1.LTCondSyncReady)
+				return c != nil && c.Reason == dfaasv1.LTReasonAwaitingRunners
+			})
+
+			setEnvPhase(dfaasv1.EnvUnreachable)
 			fresh := reconcileUntil(lt, 3, phaseIs(dfaasv1.LoadTestFailed))
 			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			msg := cond(fresh, dfaasv1.LTCondReady).Message
+			Expect(msg).NotTo(ContainSubstring("before creating a LoadTest"))
+			Expect(msg).To(ContainSubstring("Unreachable"))
+			Expect(cond(fresh, dfaasv1.LTCondSyncReady).Reason).To(Equal(dfaasv1.LTReasonSyncTimeout))
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+			Expect(fleet.Exists("gen-b", lt)).To(BeFalse())
+		})
+
+		It("a Pending test holding TestRuns fails and reclaims them when its Environment stops being dispatchable", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			fleet.FailNext("gen-b", "apply", fmt.Errorf("remote down"))
+			partial := reconcileUntil(lt, 6, func(l *dfaasv1.LoadTest) bool { return len(l.Status.TestRuns) == 1 })
+			if partial.Status.Phase != dfaasv1.LoadTestPending {
+				partial.Status.Phase = dfaasv1.LoadTestPending // what a queued-then-dispatched test looks like
+				Expect(k8sClient.Status().Update(ctx, partial)).To(Succeed())
+			}
+
+			setEnvPhase(dfaasv1.EnvProvisioningVMs)
+			fresh := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+		})
+
+		It("a test that dispatched nothing waits for its Environment without rewriting its status", func() {
+			env := envReady("env", "gen-a")
+			env.Status.Phase = dfaasv1.EnvProvisioningInfra
+			Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.Suspended = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestPending))
+			Expect(k8sClient.Patch(ctx, lt, client.RawPatch(types.MergePatchType, []byte(`{"spec":{"suspended":false}}`)))).To(Succeed())
+			reconcileUntil(lt, 2, func(*dfaasv1.LoadTest) bool { return false })
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: keyOf(lt)})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(res.Requeue).To(BeFalse())
+			Expect(fleet.Applied()).To(BeEmpty())
+		})
+	})
+	// The background re-sweep of an unreclaimed runner is paced like every
+	// other failed remote round: it runs off every watch event (its own
+	// terminal write, each Environment health write), and each try against a
+	// dead k3s API stalls the single LoadTest worker for the remote timeout.
+	Context("reclaim pacing", func() {
+		It("does not re-sweep an unreclaimed runner before the retry interval", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(k8sClient.Patch(ctx, lt, client.RawPatch(types.MergePatchType, []byte(`{"spec":{"stop":true}}`)))).To(Succeed())
+			fleet.FailNext("gen-b", "delete", fmt.Errorf("remote k3s API down"))
+			aborted := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(cond(aborted, dfaasv1.LTCondK6Healthy).Reason).To(Equal(dfaasv1.LTReasonRunnersUnreclaimed))
+
+			r.retryEvery = 0 // production pacing
+			deletes := len(fleet.Deleted())
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: keyOf(lt)})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(fleet.Deleted()).To(HaveLen(deletes), "no remote call inside the retry interval")
 		})
 	})
 })

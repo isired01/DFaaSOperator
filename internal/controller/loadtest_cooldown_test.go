@@ -27,7 +27,8 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 )
 
-// The management Prometheus federates worker metrics on a 1m interval, so the
+// The management Prometheus federates worker metrics every federationInterval
+// (15s), so the
 // tail of a run lands after k6 stops. runExporter must therefore hold for
 // exportCooldown before creating the exporter Job — otherwise the CSV is
 // truncated by up to one federation period, by a different amount each run.
@@ -94,14 +95,17 @@ var _ = Describe("Export cool-down", func() {
 		_, err := reconciler.runExporter(ctx, lt, env)
 		Expect(err).NotTo(HaveOccurred())
 
-		// Past the gate: whatever the export path then does (in envtest the
-		// default S3 config is absent, so it degrades to the stdout dump), it
-		// must no longer report itself as cooling down.
+		// Past the gate it must no longer report itself as cooling down. In
+		// envtest the default S3 config is absent, so the export degrades to
+		// the stdout dump, and the running message must say so: S3ConfigMissing
+		// is stamped only where it is terminal (an explicit s3ConfigRef).
 		fresh := &dfaasv1.LoadTest{}
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(lt), fresh)).To(Succeed())
 		cond := meta.FindStatusCondition(fresh.Status.Conditions, dfaasv1.LTCondMetricsExported)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Reason).NotTo(Equal(dfaasv1.LTReasonExportCooldown))
+		Expect(cond.Reason).To(Equal(dfaasv1.LTReasonExporterRunning))
+		Expect(cond.Message).To(ContainSubstring("stdout"))
 	})
 
 	// EndTime is persisted, so the deadline is absolute: an operator restart

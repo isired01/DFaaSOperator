@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -95,15 +96,24 @@ func TestSettledEnvironmentSeedsMissingSnapshot(t *testing.T) {
 		phase      dfaasv1.EnvironmentPhase
 		observed   int64
 		generation int64
+		infraReady bool
 		wantSeed   bool
 	}{
-		{name: "Ready and settled", phase: dfaasv1.EnvReady, observed: 3, generation: 3, wantSeed: true},
-		{name: "Failed but settled", phase: dfaasv1.EnvFailed, observed: 3, generation: 3, wantSeed: true},
+		{name: "Ready and settled", phase: dfaasv1.EnvReady, observed: 3, generation: 3, infraReady: true, wantSeed: true},
+		{
+			// Failed at the Infra fan-in: some playbook did not complete, so the
+			// machines do not match spec.nodes and a seed would be a false record.
+			name: "Failed at the Infra fan-in", phase: dfaasv1.EnvFailed, observed: 3, generation: 3, wantSeed: false,
+		},
+		{
+			// Failed later (monitoring): every playbook completed, the designed backfill.
+			name: "Failed after the fan-in", phase: dfaasv1.EnvFailed, observed: 3, generation: 3, infraReady: true, wantSeed: true,
+		},
 		{
 			// Spec edited: the machines no longer match spec.nodes, so seeding
 			// from it would record a state that was never installed.
 			name: "spec edited after the last run", phase: dfaasv1.EnvReady,
-			observed: 2, generation: 3, wantSeed: false,
+			observed: 2, generation: 3, infraReady: true, wantSeed: false,
 		},
 		{
 			// Never provisioned: nothing is installed, so there is nothing to
@@ -117,6 +127,10 @@ func TestSettledEnvironmentSeedsMissingSnapshot(t *testing.T) {
 			env.Generation = tc.generation
 			env.Status.Phase = tc.phase
 			env.Status.ObservedGeneration = tc.observed
+			if tc.infraReady {
+				env.Status.Conditions = []metav1.Condition{{Type: dfaasv1.EnvCondInfrastructureReady,
+					Status: metav1.ConditionTrue, Reason: dfaasv1.EnvReasonInfraReady, LastTransitionTime: metav1.Now()}}
+			}
 			// Any Environment that has reached a settled phase has had the
 			// finalizer stamped on its first ever reconcile; without it here the
 			// reconcile returns right after adding one and never reaches the seed.

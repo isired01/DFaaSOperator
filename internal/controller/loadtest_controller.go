@@ -61,6 +61,12 @@ type LoadTestReconciler struct {
 	// Nil-safe -- syncChannel() falls back to one resolved from the
 	// environment, resolved once for the whole process.
 	Sync syncchannel.Channel
+
+	// retryEvery paces remote rounds after a failed one; zero means
+	// remoteRetryInterval. Tests that drive Reconcile back to back set it tiny.
+	retryEvery time.Duration
+	// lastMiss holds, per LoadTest, when its last remote round failed.
+	lastMiss sync.Map
 }
 
 // envSyncChannel is the process-wide fallback: the bases are read from the
@@ -108,9 +114,19 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	// Terminal phases — no-op.
+	// Terminal phases — no-op, unless the run end left a runner it applied
+	// undeleted: keep re-sweeping it, since Occupancy holds the Environment.
 	if lt.Status.Phase.Terminal() {
+		if runnersUnreclaimed(&lt) {
+			return r.retryReclaim(ctx, &lt)
+		}
 		return ctrl.Result{}, nil
+	}
+
+	// Pace remote retries: the watch event of a failed round's own counter or
+	// status write must not start the next attempt at once.
+	if wait := r.paced(&lt); wait > 0 {
+		return ctrl.Result{RequeueAfter: wait}, nil
 	}
 
 	// Lookup target Environment in the same namespace.
@@ -118,14 +134,11 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	envKey := types.NamespacedName{Name: lt.Spec.TargetEnvironment, Namespace: lt.Namespace}
 	if err := r.Get(ctx, envKey, &env); err != nil {
 		if apierrors.IsNotFound(err) {
-			// P9: surface link state on EnvironmentLinked before failing.
-			r.cond(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
-				metav1.ConditionFalse, dfaasv1.LTReasonEnvNotFound,
-				fmt.Sprintf("environment %q not found in namespace %s",
-					lt.Spec.TargetEnvironment, lt.Namespace))
-			return r.failLoadTest(ctx, &lt,
-				fmt.Sprintf("environment %q not found in namespace %s",
-					lt.Spec.TargetEnvironment, lt.Namespace))
+			// P9: surface link state on EnvironmentLinked, in the same write.
+			msg := fmt.Sprintf("environment %q not found in namespace %s",
+				lt.Spec.TargetEnvironment, lt.Namespace)
+			return r.failLoadTest(ctx, &lt, msg, statuswriter.Cond{Type: dfaasv1.LTCondEnvironmentLinked,
+				Status: metav1.ConditionFalse, Reason: dfaasv1.LTReasonEnvNotFound, Message: msg})
 		}
 		return ctrl.Result{}, err
 	}
@@ -147,13 +160,49 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		inAbortWindow := lt.Status.Phase.PreExecution() ||
 			lt.Status.Phase == dfaasv1.LoadTestRunning
 		if inAbortWindow {
-			return r.abortLoadTest(ctx, &lt, &env, dfaasv1.LTReasonUserAborted,
-				"The test was manually aborted from the UI. Remote worker resources have been reclaimed.")
+			return r.abortLoadTest(ctx, &lt, dfaasv1.LTReasonUserAborted,
+				"The test was manually aborted from the UI.")
 		}
 	}
 
+	// An Environment being deleted dispatches nothing new: its finalizer is
+	// draining the tests it owns before it prunes their kubeconfig Secrets.
+	// ponytail: a test created meanwhile never gets an OwnerRef and ends
+	// Failed/EnvNotFound once the Environment is gone.
+	if !env.DeletionTimestamp.IsZero() && lt.Status.Phase.PreExecution() {
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	// Admission. Phase "" means "not yet admitted", nothing more: the two
+	// create-time checks run here, then every test -- draft, scheduled or
+	// plain -- is written Pending before anything below runs, so nothing
+	// remote ever happens at "". A scheduled test is therefore Pending while
+	// armed and after the operator's own fire PATCH, and a test that is mid-
+	// dispatch or on the Sync barrier is never mistaken for a fresh one.
+	if lt.Status.Phase == "" {
+		// Only an older binary could leave "" with TestRuns recorded: admit it
+		// without the create-time checks, so it reaches the reclaiming exits.
+		if len(lt.Status.TestRuns) == 0 {
+			// startAt is honoured only on a suspended LoadTest; without it the
+			// test would dispatch at once, ignoring the schedule. The gateway
+			// rejects that on both create paths; a kubectl apply reaches here.
+			if lt.Spec.StartAt != nil && !lt.Spec.Suspended {
+				return r.failLoadTest(ctx, &lt,
+					"spec.startAt requires spec.suspended=true; otherwise the schedule is ignored and the test starts immediately")
+			}
+			// Strict create-time gate, relaxed for drafts (they may target an
+			// Environment that is still provisioning).
+			if !lt.Spec.Suspended && !env.Status.Phase.Dispatchable() {
+				return r.failLoadTest(ctx, &lt,
+					fmt.Sprintf("environment %q is %q; it must be Ready before creating a LoadTest",
+						env.Name, env.Status.Phase))
+			}
+		}
+		return r.phase(ctx, &lt, dfaasv1.LoadTestPending, "", "")
+	}
+
 	// Scheduled-start branch (P9: stamps LTCondScheduled).
-	if lt.Spec.StartAt != nil && lt.Status.Phase.PreExecution() && lt.Spec.Suspended {
+	if lt.Spec.StartAt != nil && lt.Status.Phase.PreExecution() && lt.Spec.Suspended && len(lt.Status.TestRuns) == 0 {
 
 		fireT := lt.Spec.StartAt.Time
 		switch {
@@ -188,24 +237,6 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	// startAt is honoured only on a suspended LoadTest: the scheduled branch
-	// above requires Suspended, so a test carrying startAt without it falls
-	// straight through and dispatches immediately, ignoring the schedule with
-	// no diagnostic anywhere. The gateway rejects that on both create paths;
-	// a kubectl apply reaches here instead, so fail it loudly. phase == "" is
-	// create time -- the same scope the gate below uses.
-	if lt.Status.Phase == "" && lt.Spec.StartAt != nil && !lt.Spec.Suspended {
-		return r.failLoadTest(ctx, &lt,
-			"spec.startAt requires spec.suspended=true; otherwise the schedule is ignored and the test starts immediately")
-	}
-
-	// Strict create-time gate.
-	if lt.Status.Phase == "" && !lt.Spec.Suspended && !env.Status.Phase.Dispatchable() {
-		return r.failLoadTest(ctx, &lt,
-			fmt.Sprintf("environment %q is %q; it must be Ready before creating a LoadTest",
-				env.Name, env.Status.Phase))
-	}
-
 	// OwnerReference Environment → LoadTest.
 	if !hasOwnerRef(&lt, &env) {
 		if err := controllerutil.SetOwnerReference(&env, &lt, r.Scheme); err != nil {
@@ -220,19 +251,21 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Run-once guard + suspended gate.
 	preExecution := lt.Status.Phase.PreExecution()
 	if preExecution {
-		if lt.Spec.Suspended {
-			// Save-as-Draft: hold at Pending, dispatch nothing. PATCH
-			// spec.suspended=false to start.
-			if lt.Status.Phase == "" {
-				return r.phase(ctx, &lt, dfaasv1.LoadTestPending, "", "")
-			}
+		if lt.Spec.Suspended && len(lt.Status.TestRuns) == 0 {
+			// Save-as-Draft or armed schedule, parked at Pending above:
+			// dispatch nothing until spec.suspended=false.
 			return ctrl.Result{}, nil
 		}
 
 		// Block while Environment is mid-flight.
 		if !env.Status.Phase.Dispatchable() {
+			if len(lt.Status.TestRuns) > 0 {
+				return r.endOnEnvironmentLost(ctx, &lt, &env)
+			}
+			// Nothing dispatched: wait, with no status write; the Environment
+			// watch wakes the test when it recovers.
 			logger.Info("waiting for environment", "env", env.Name, "phase", env.Status.Phase)
-			return r.phase(ctx, &lt, dfaasv1.LoadTestPending, "", "")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 	}
 
@@ -241,8 +274,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Sits after the scheduled-fire branch, so a just-fired scheduled test is
 	// caught here on its next reconcile and queued rather than colliding with
 	// a sibling already running on the same Environment.
-	if preExecution && !lt.Spec.Suspended &&
-		env.Status.Phase.Dispatchable() {
+	if preExecution && !lt.Spec.Suspended {
 		proceed, res, err := r.envOccupancyGate(ctx, &lt)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -314,15 +346,13 @@ func stampLTAggregate(lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase, reasonO
 	})
 }
 
-// failLoadTest moves the LoadTest to Failed, carrying the caller's specific
-// message onto the Ready aggregator. Callers wanting a richer reason should
-// stamp a sub-condition before calling failLoadTest (the aggregator overwrites
-// only Ready).
+// failLoadTest ends the run as Failed, carrying the caller's message onto the
+// Ready aggregator. Pass diagnostics as conds so they land in the same write;
+// endRun reclaims whatever the run may still have live.
 func (r *LoadTestReconciler) failLoadTest(ctx context.Context,
-	lt *dfaasv1.LoadTest, message string) (ctrl.Result, error) {
+	lt *dfaasv1.LoadTest, message string, conds ...statuswriter.Cond) (ctrl.Result, error) {
 
-	return r.phase(ctx, lt, dfaasv1.LoadTestFailed,
-		dfaasv1.LTReasonFailed, message)
+	return r.endRun(ctx, lt, dfaasv1.LoadTestFailed, dfaasv1.LTReasonFailed, message, conds...)
 }
 
 // writer is the one way this reconciler persists LoadTest status. Stateless;
@@ -356,14 +386,21 @@ func (r *LoadTestReconciler) condErr(ctx context.Context, lt *dfaasv1.LoadTest,
 	})
 }
 
-// phase moves the LoadTest to p and requeues immediately so the next phase
-// handler runs without waiting for the watch. reason/message override the
-// Ready aggregator's generic text (empty = generic). This is the reconciler's
-// scheduling policy, stated once here; the writer itself never decides requeue.
+// phase moves the LoadTest to p, with conds stamped in the same write, and
+// requeues immediately so the next phase handler runs without waiting for the
+// watch. reason/message override the Ready aggregator's generic text (empty =
+// generic). After a terminal write it does not requeue: an immediate pass would
+// read the pre-terminal cached copy and stamp in-progress Conditions onto an
+// ended test; the write's own watch event arrives once the cache holds it.
+// This is the reconciler's scheduling policy, stated once here; the writer
+// itself never decides requeue.
 func (r *LoadTestReconciler) phase(ctx context.Context, lt *dfaasv1.LoadTest,
-	p dfaasv1.LoadTestPhase, reason, message string) (ctrl.Result, error) {
-	if err := r.writer().Record(ctx, lt, ltTransition{Phase: &p, Reason: reason, Message: message}); err != nil {
+	p dfaasv1.LoadTestPhase, reason, message string, conds ...statuswriter.Cond) (ctrl.Result, error) {
+	if err := r.writer().Record(ctx, lt, ltTransition{Phase: &p, Reason: reason, Message: message, Conditions: conds}); err != nil {
 		return ctrl.Result{}, err
+	}
+	if p.Terminal() {
+		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{Requeue: true}, nil
 }
@@ -455,6 +492,12 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 		if sib.Name == lt.Name || sib.Spec.TargetEnvironment != lt.Spec.TargetEnvironment {
 			continue
 		}
+		if runnersUnreclaimed(sib) {
+			return hold(dfaasv1.LTReasonEnvBusy,
+				fmt.Sprintf("waiting: load test %q has ended but a runner it applied on the generators "+
+					"could not be deleted; the operator keeps retrying — delete that test to release environment %q",
+					sib.Name, lt.Spec.TargetEnvironment))
+		}
 		occupying := sib.Status.Phase == dfaasv1.LoadTestRunning ||
 			sib.Status.Phase == dfaasv1.LoadTestExporting ||
 			(sib.Status.Phase.PreExecution() && len(sib.Status.TestRuns) > 0)
@@ -479,6 +522,10 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 		if sib.Spec.Suspended {
 			continue
 		}
+		// ponytail: an un-suspended test still carrying a future startAt
+		// (kubectl, or a pre-fix gateway's Start) is skipped here too, so younger
+		// waiting tests may go first until its startAt passes. Bounded priority
+		// inversion; it still dispatches once none waits.
 		if sib.Spec.StartAt != nil && now.Before(sib.Spec.StartAt.Time) {
 			continue
 		}
@@ -535,4 +582,29 @@ func (r *LoadTestReconciler) loadTestsForEnv(ctx context.Context, obj client.Obj
 		}
 	}
 	return out
+}
+
+// endOnEnvironmentLost ends a pre-execution test whose dispatch already began
+// when its Environment stops being Dispatchable (a spec edit, Unreachable,
+// Failed): the partial run is reclaimed and the test fails, instead of the
+// create-time gate firing mid-run or a Pending test waiting forever. It
+// re-reads the test uncached first, so a stale Pending copy of a test that is
+// already Running is never ended.
+func (r *LoadTestReconciler) endOnEnvironmentLost(ctx context.Context,
+	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
+	var fresh dfaasv1.LoadTest
+	if err := r.occupancyReader().Get(ctx, client.ObjectKeyFromObject(lt), &fresh); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if !fresh.Status.Phase.PreExecution() || len(fresh.Status.TestRuns) == 0 {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	msg := fmt.Sprintf("environment %q became %q after dispatch began; the partial run was reclaimed",
+		env.Name, env.Status.Phase)
+	var conds []statuswriter.Cond
+	if lt.Spec.SyncStart {
+		conds = append(conds, statuswriter.Cond{Type: dfaasv1.LTCondSyncReady, Status: metav1.ConditionFalse,
+			Reason: dfaasv1.LTReasonSyncTimeout, Message: msg})
+	}
+	return r.failLoadTest(ctx, lt, msg, conds...)
 }
