@@ -16,27 +16,40 @@ import "testing"
 // Reconcile: Dispatchable at four sites (three of them negated) plus once more
 // in the gateway, the pre-execution window at five, and terminal at two -- the
 // second an approximation of the first. Naming them is only half the fix; the
-// other half is a table that says what the sets are, so adding a phase to the
-// enum without deciding which set it belongs to fails here.
+// other half is a table that says what the sets are. The phase list is read
+// from the +kubebuilder:validation:Enum marker (phasesOf), and every table
+// needs an explicit row per phase, so adding a phase to the enum without
+// deciding which set it belongs to fails here.
+
+// classify checks pred against table over every phase, and fails on a phase
+// the table does not classify.
+func classify[P ~string](t *testing.T, pred string, table map[P]bool, all []P, got func(P) bool) {
+	t.Helper()
+	if len(table) != len(all) {
+		t.Errorf("%s: %d rows for %d phases", pred, len(table), len(all))
+	}
+	for _, p := range all {
+		want, ok := table[p]
+		if !ok {
+			t.Errorf("%q is declared by the Enum marker but not classified for %s", p, pred)
+			continue
+		}
+		if got(p) != want {
+			t.Errorf("%s(%q) = %v, want %v", pred, p, got(p), want)
+		}
+	}
+}
 
 func TestEnvironmentPhaseDispatchable(t *testing.T) {
 	// Ready only. Degraded (infra up, monitoring down) used to qualify; it was
 	// dropped because no reconcile path ever produced it. The gateway mirrors
 	// this set, so it must not be looser either.
 	dispatchable := map[EnvironmentPhase]bool{
-		EnvReady: true,
+		"": false, EnvIdle: false, EnvProvisioningVMs: false, EnvProvisioningInfra: false,
+		EnvProvisioningMonitoring: false, EnvReady: true, EnvFailed: false, EnvUnreachable: false,
 	}
-
-	// Every phase the enum declares, so a new one has to be classified here.
-	all := []EnvironmentPhase{
-		"", EnvIdle, EnvProvisioningVMs, EnvProvisioningInfra,
-		EnvProvisioningMonitoring, EnvReady, EnvFailed, EnvUnreachable,
-	}
-	for _, p := range all {
-		if got, want := p.Dispatchable(), dispatchable[p]; got != want {
-			t.Errorf("EnvironmentPhase(%q).Dispatchable() = %v, want %v", p, got, want)
-		}
-	}
+	classify(t, "Dispatchable", dispatchable, phasesOf[EnvironmentPhase](t, "EnvironmentPhase"),
+		EnvironmentPhase.Dispatchable)
 
 	// Unreachable is explicitly non-terminal and auto-recovering, which makes
 	// adding it to this set plausible. It is deliberately NOT in it: a
@@ -49,19 +62,10 @@ func TestEnvironmentPhaseDispatchable(t *testing.T) {
 
 func TestLoadTestPhaseTerminal(t *testing.T) {
 	terminal := map[LoadTestPhase]bool{
-		LoadTestCompleted: true,
-		LoadTestFailed:    true,
-		LoadTestAborted:   true,
+		"": false, LoadTestPending: false, LoadTestRunning: false, LoadTestExporting: false,
+		LoadTestCompleted: true, LoadTestFailed: true, LoadTestAborted: true,
 	}
-	all := []LoadTestPhase{
-		"", LoadTestPending, LoadTestRunning, LoadTestExporting,
-		LoadTestCompleted, LoadTestFailed, LoadTestAborted,
-	}
-	for _, p := range all {
-		if got, want := p.Terminal(), terminal[p]; got != want {
-			t.Errorf("LoadTestPhase(%q).Terminal() = %v, want %v", p, got, want)
-		}
-	}
+	classify(t, "Terminal", terminal, phasesOf[LoadTestPhase](t, "LoadTestPhase"), LoadTestPhase.Terminal)
 
 	// Exporting is the trap: the k6 run is over, but the metrics export is
 	// not, so the reconcile loop must keep running.
@@ -74,18 +78,10 @@ func TestLoadTestPhasePreExecution(t *testing.T) {
 	// The unreconciled empty phase counts: it is the create-time window, and
 	// the reconciler's gates key on it.
 	preExecution := map[LoadTestPhase]bool{
-		"":              true,
-		LoadTestPending: true,
+		"": true, LoadTestPending: true, LoadTestRunning: false, LoadTestExporting: false,
+		LoadTestCompleted: false, LoadTestFailed: false, LoadTestAborted: false,
 	}
-	all := []LoadTestPhase{
-		"", LoadTestPending, LoadTestRunning, LoadTestExporting,
-		LoadTestCompleted, LoadTestFailed, LoadTestAborted,
-	}
-	for _, p := range all {
-		if got, want := p.PreExecution(), preExecution[p]; got != want {
-			t.Errorf("LoadTestPhase(%q).PreExecution() = %v, want %v", p, got, want)
-		}
-	}
+	classify(t, "PreExecution", preExecution, phasesOf[LoadTestPhase](t, "LoadTestPhase"), LoadTestPhase.PreExecution)
 
 	// Once execution begins the state machine is immutable: spec.suspended is
 	// no longer read, which is what the run-once guard depends on.
@@ -97,11 +93,7 @@ func TestLoadTestPhasePreExecution(t *testing.T) {
 // The two LoadTest sets must not overlap: a phase cannot be both "not started"
 // and "finished for good".
 func TestLoadTestPhaseSetsAreDisjoint(t *testing.T) {
-	all := []LoadTestPhase{
-		"", LoadTestPending, LoadTestRunning, LoadTestExporting,
-		LoadTestCompleted, LoadTestFailed, LoadTestAborted,
-	}
-	for _, p := range all {
+	for _, p := range phasesOf[LoadTestPhase](t, "LoadTestPhase") {
 		if p.PreExecution() && p.Terminal() {
 			t.Errorf("LoadTestPhase(%q) is both pre-execution and terminal", p)
 		}

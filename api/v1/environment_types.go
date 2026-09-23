@@ -81,13 +81,10 @@ const (
 	EnvReasonInfraReady         = "InfraReady"
 	EnvReasonInfraFailed        = "InfraFailed"
 	EnvReasonUpdating           = "Updating"
-	EnvReasonSpecChanged        = "SpecChanged"
 	EnvReasonInitializing       = "Initializing"
 	EnvReasonProvisioning       = "Provisioning"
 	EnvReasonAllSubsystemsReady = "AllSubsystemsReady"
 	EnvReasonFailed             = "Failed"
-	EnvReasonLibp2pKeyError     = "Libp2pKeyError"
-	EnvReasonNodeStatusError    = "NodeStatusError"
 	EnvReasonJobPending         = "JobPending"
 	// EnvReasonCheckFailed marks a readiness probe that could not be evaluated
 	// at all (e.g. the Pod List was refused), as opposed to WaitingPods which

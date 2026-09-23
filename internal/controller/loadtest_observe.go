@@ -237,17 +237,17 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 
 		// Cool-down before querying. The management Prometheus does not scrape
 		// the workers directly — it federates from each worker's own Prometheus
-		// on the chart-default 1m interval, so at the instant k6 stops, the tail
+		// every federationInterval (15s), so at the instant k6 stops, the tail
 		// of the run may not have been pulled across yet. Exporting immediately
 		// truncates the CSV by up to one federation period, and by a different
 		// amount on every run (it depends where EndTime lands in the cycle),
 		// which makes the tails of two otherwise-identical runs incomparable.
 		//
-		// The query window is NOT extended: END_TIME stays at the k6 finish, so
-		// the CSV still covers exactly the load test — the wait only lets the
-		// samples for that window arrive. Keyed off the persisted Status.EndTime,
-		// so an operator restart mid-cool-down resumes with the correct deadline
-		// rather than starting the minute again.
+		// The query window IS extended by exportTailWindow (one interval past
+		// EndTime, see its doc), so every node has a sample at or after the k6
+		// finish; exportCooldown covers that widened window. Keyed off the
+		// persisted Status.EndTime, so an operator restart mid-cool-down resumes
+		// with the correct deadline rather than starting the wait again.
 		if waited := time.Since(lt.Status.EndTime.Time); waited < exportCooldown {
 			remaining := exportCooldown - waited
 			r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
@@ -269,6 +269,7 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 			configName = env.Spec.S3ConfigRef.Name
 		}
 		var s3SecretName string
+		runningMsg := "exporter Job created, awaiting completion"
 		mirrored, mirrorErr := r.ensureMirroredS3Secret(ctx, lt, configName)
 		if mirrorErr != nil {
 			if apierrors.IsNotFound(mirrorErr) {
@@ -281,11 +282,12 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 						statuswriter.Cond{Type: dfaasv1.LTCondMetricsExported, Status: metav1.ConditionFalse,
 							Reason: dfaasv1.LTReasonS3ConfigMissing, Message: missing})
 				}
-				// Stamp the S3ConfigMissing condition for visibility.
-				r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
-					metav1.ConditionFalse, dfaasv1.LTReasonS3ConfigMissing, missing)
 				// Default sink missing (e.g. SeaweedFS not yet deployed) — degrade
-				// gracefully to the stdout path rather than failing the test.
+				// gracefully to the stdout path rather than failing the test. No
+				// S3ConfigMissing stamp here: that reason is terminal, and this
+				// path is not; the running message names the fallback instead.
+				runningMsg = "exporter Job created, awaiting completion; " + missing +
+					", so the CSV goes to the Job's stdout (kubectl logs)"
 				logger.Info("default S3 config not found; falling back to stdout export",
 					"config", configName)
 				s3SecretName = ""
@@ -319,8 +321,7 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 			return ctrl.Result{}, err
 		}
 		r.cond(ctx, lt, dfaasv1.LTCondMetricsExported,
-			metav1.ConditionUnknown, dfaasv1.LTReasonExporterRunning,
-			"exporter Job created, awaiting completion")
+			metav1.ConditionUnknown, dfaasv1.LTReasonExporterRunning, runningMsg)
 		logStatusErr(ctx, "persist exporter Job name", r.writer().Record(ctx, lt, ltTransition{Touch: func(latest *dfaasv1.LoadTest) error {
 			latest.Status.ExporterJob = jobName
 			return nil

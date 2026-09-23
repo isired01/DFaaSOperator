@@ -74,7 +74,6 @@ const (
 	LTReasonScheduledArmed         = "ScheduledArmed"
 	LTReasonScheduledFired         = "ScheduledFired"
 	LTReasonScheduledDelayedEnvNot = "ScheduledDelayedEnvNotReady"
-	LTReasonNotScheduled           = "NotScheduled"
 	LTReasonInFlight               = "InFlight"
 	LTReasonAllDispatched          = "AllDispatched"
 	LTReasonDispatchFailed         = "DispatchFailed"
@@ -83,7 +82,6 @@ const (
 	LTReasonPartialFailure         = "PartialFailure"
 	LTReasonAllFailed              = "AllFailed"
 	LTReasonRunning                = "Running"
-	LTReasonK6Running              = "K6Running"
 	LTReasonExportCooldown         = "ExportCooldown"
 	LTReasonExporterRunning        = "ExporterRunning"
 	LTReasonExportSucceeded        = "ExportSucceeded"
@@ -113,7 +111,6 @@ const (
 	// opposed to ApplyFailed which marks a failed write. Reusing ApplyFailed
 	// for both made a dead k6 node read like a rejected manifest.
 	LTReasonFetchFailed = "FetchFailed"
-	LTReasonPostStart   = "PostStart"
 	LTReasonEnvNotFound = "EnvNotFound"
 	LTReasonEnvFound    = "EnvFound"
 	LTReasonEnvFailed   = "EnvFailed"
