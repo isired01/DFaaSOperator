@@ -61,6 +61,12 @@ type LoadTestReconciler struct {
 	// Nil-safe -- syncChannel() falls back to one resolved from the
 	// environment, resolved once for the whole process.
 	Sync syncchannel.Channel
+
+	// retryEvery paces remote rounds after a failed one; zero means
+	// remoteRetryInterval. Tests that drive Reconcile back to back set it tiny.
+	retryEvery time.Duration
+	// lastMiss holds, per LoadTest, when its last remote round failed.
+	lastMiss sync.Map
 }
 
 // envSyncChannel is the process-wide fallback: the bases are read from the
@@ -115,6 +121,12 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			return r.retryReclaim(ctx, &lt)
 		}
 		return ctrl.Result{}, nil
+	}
+
+	// Pace remote retries: the watch event of a failed round's own counter or
+	// status write must not start the next attempt at once.
+	if wait := r.paced(&lt); wait > 0 {
+		return ctrl.Result{RequeueAfter: wait}, nil
 	}
 
 	// Lookup target Environment in the same namespace.

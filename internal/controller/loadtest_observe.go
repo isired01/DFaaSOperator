@@ -61,41 +61,48 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	allDone := true
-	var errorCount, finishedCount int
-	updatedRefs := make([]dfaasv1.TestRunRef, len(lt.Status.TestRuns))
-	copy(updatedRefs, lt.Status.TestRuns)
-
-	for i, ref := range lt.Status.TestRuns {
-		node, nerr := r.Dispatcher.Node(ctx, env, ref.NodeID)
-		if nerr != nil {
-			// A node that vanished mid-test can neither be polled nor released:
-			// fail on the spot instead of waiting out a budget it cannot satisfy.
-			return r.failLoadTest(ctx, lt, nerr.Error())
-		}
-		stage, err := node.Stage(ctx, lt)
-		if err != nil {
-			// ErrNotFound included: a TestRun that disappeared under a running
-			// test is a fetch failure, routed through the retry budget.
-			logger.Error(err, "remote TestRun fetch failed", "node", ref.NodeID, "name", ref.Name)
-			res, oerr := r.onDispatchError(ctx, lt, err, dfaasv1.LTReasonFetchFailed)
-			return res, oerr
-		}
-		// Successful dispatcher round-trip — reset the budget counter.
-		if rerr := r.budget(dispatchAttemptsAnnotation, dispatchRetryBudget).Clear(ctx, lt); rerr != nil {
-			logger.Error(rerr, "resetDispatchAttempts failed; non-fatal")
-		}
-		updatedRefs[i].Phase = stage
-
-		switch stage {
-		case "finished", "stopped":
-			finishedCount++
-		case "error":
-			errorCount++
-		default:
-			allDone = false
-		}
+	nodeIDs := make([]string, 0, len(lt.Status.TestRuns))
+	for _, ref := range lt.Status.TestRuns {
+		nodeIDs = append(nodeIDs, ref.NodeID)
 	}
+	rd := r.survey(ctx, lt, env, nodeIDs)
+	updatedRefs := rd.refs(lt.Status.TestRuns)
+
+	if len(rd.unusable) > 0 {
+		// A generator that left the Environment can neither be polled nor
+		// released: fail on the spot instead of waiting out a budget it cannot
+		// satisfy.
+		return r.failLoadTest(ctx, lt, "generator unusable: "+rd.describe(rd.unusable))
+	}
+
+	budget := r.budget(fetchMissesAnnotation, fetchRetryBudget)
+	if len(rd.missing) > 0 {
+		// ErrNotFound included: a TestRun that disappeared under a running test
+		// is a failed round, charged once however many generators missed.
+		outcome, berr := r.attempt(ctx, lt, budget)
+		if berr != nil {
+			logger.Error(berr, "fetch-misses counter write failed; the budget cannot advance")
+		}
+		detail := "no status from " + rd.describe(rd.missing)
+		if outcome.Exhausted {
+			return r.failLoadTest(ctx, lt, fmt.Sprintf("observe: %d consecutive rounds failed: %s", outcome.Count, detail))
+		}
+		logStatusErr(ctx, "persist failed observe round", r.writer().Record(ctx, lt, ltTransition{
+			Conditions: []statuswriter.Cond{{Type: dfaasv1.LTCondK6Healthy, Status: metav1.ConditionUnknown,
+				Reason: dfaasv1.LTReasonFetchFailed, Message: fmt.Sprintf("attempt %s: %s", budget.Attempts(outcome), detail)}},
+			Touch: func(latest *dfaasv1.LoadTest) error {
+				latest.Status.TestRuns = updatedRefs
+				return nil
+			},
+		}))
+		return ctrl.Result{RequeueAfter: r.retryInterval()}, nil
+	}
+	// A complete round — reset the counter (a no-op at zero).
+	if rerr := budget.Clear(ctx, lt); rerr != nil {
+		logger.Error(rerr, "reset fetch-misses failed; non-fatal")
+	}
+	finishedCount, errorCount := rd.count[stageDone], rd.count[stageErrored]
+	allDone := rd.count[stagePending]+rd.count[stageStarted] == 0
 
 	// Persist updated phases (best-effort).
 	logStatusErr(ctx, "persist updated TestRun phases", r.writer().Record(ctx, lt, ltTransition{Touch: func(latest *dfaasv1.LoadTest) error {

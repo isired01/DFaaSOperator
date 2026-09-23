@@ -113,16 +113,13 @@ func dispatchBegan(lt *dfaasv1.LoadTest) bool {
 // runnersMayBeLive reports whether lt may still have k6 runners generating
 // load. Runners already observed done are not deleted, so their remote logs
 // survive AllFailed, PartialFailure and every Exporting exit.
-// ponytail: the stage literals are duplicated with observeK6 until they get a
-// named type.
 func runnersMayBeLive(lt *dfaasv1.LoadTest) bool {
 	if !dispatchBegan(lt) || lt.Status.Phase == dfaasv1.LoadTestExporting {
 		return false
 	}
 	done := map[string]bool{}
 	for _, ref := range lt.Status.TestRuns {
-		switch ref.Phase {
-		case "finished", "stopped", "error":
+		if b := classifyStage(ref.Phase); b == stageDone || b == stageErrored {
 			done[ref.NodeID] = true
 		}
 	}

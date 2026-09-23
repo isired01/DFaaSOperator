@@ -108,9 +108,10 @@ const (
 	LTReasonGoPublished        = "GoPublished"
 	LTReasonSyncTimeout        = "SyncTimeout"
 	LTReasonApplyFailed        = "ApplyFailed"
-	// LTReasonFetchFailed marks a failed READ of a remote TestRun (status
-	// poll), as opposed to ApplyFailed which marks a failed write. Reusing
-	// ApplyFailed for both made a dead k6 node read like a rejected manifest.
+	// LTReasonFetchFailed marks an observe round in which some generator could
+	// not report its TestRun's stage (K6Healthy=Unknown, "attempt n/15"), as
+	// opposed to ApplyFailed which marks a failed write. Reusing ApplyFailed
+	// for both made a dead k6 node read like a rejected manifest.
 	LTReasonFetchFailed = "FetchFailed"
 	LTReasonPostStart   = "PostStart"
 	LTReasonEnvNotFound = "EnvNotFound"

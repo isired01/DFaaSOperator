@@ -152,6 +152,9 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 		r = &LoadTestReconciler{
 			Client: k8sClient, Scheme: scheme.Scheme,
 			Dispatcher: fleet, Sync: channel,
+			// reconcileUntil does not wait between passes; production paces a
+			// failed remote round at remoteRetryInterval.
+			retryEvery: time.Nanosecond,
 		}
 	})
 
@@ -472,11 +475,15 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
 			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
 
-			exhaustBudget(lt)
-			fleet.FailNext("gen-a", "stage", remoteDown) // TestRuns[0]
+			var cur dfaasv1.LoadTest
+			Expect(k8sClient.Get(ctx, keyOf(lt), &cur)).To(Succeed())
+			patch := fmt.Sprintf(`{"metadata":{"annotations":{%q:"%d:%d"}}}`,
+				fetchMissesAnnotation, cur.Generation, fetchRetryBudget-1)
+			Expect(k8sClient.Patch(ctx, &cur, client.RawPatch(types.MergePatchType, []byte(patch)))).To(Succeed())
+			fleet.FailNext("gen-a", "stage", remoteDown)
 			fresh := reconcileUntil(lt, 3, phaseIs(dfaasv1.LoadTestFailed))
 			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
-			Expect(cond(fresh, dfaasv1.LTCondReady).Reason).To(Equal(dfaasv1.LTReasonDispatchFailed))
+			Expect(cond(fresh, dfaasv1.LTCondReady).Message).To(ContainSubstring("gen-a"))
 			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
 			Expect(fleet.Exists("gen-b", lt)).To(BeFalse())
 			Expect(k6Healthy(fresh).Reason).To(Equal(dfaasv1.LTReasonRunnersReclaimed))
@@ -648,6 +655,139 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			_, err = er.handleEnvDeletion(ctx, env)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env))).To(BeTrue())
+		})
+	})
+	// One fleet round per tick: every generator is polled once and the Retry
+	// counter is charged once per round. Before, a healthy generator's
+	// success reset the counter every pass, so one generator down behind a
+	// healthy one never exhausted the budget and the test stayed Running.
+	Context("fleet round", func() {
+		remoteDown := fmt.Errorf("remote k3s API down")
+		awaiting := func(l *dfaasv1.LoadTest) bool {
+			c := cond(l, dfaasv1.LTCondSyncReady)
+			return c != nil && c.Reason == dfaasv1.LTReasonAwaitingRunners
+		}
+		runningOn := func(ids ...string) *dfaasv1.LoadTest {
+			envReady("env", ids...)
+			scriptCM("script")
+			lt := newLT("lt", "env", ids...)
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			return lt
+		}
+		refPhase := func(l *dfaasv1.LoadTest, nodeID string) string {
+			for _, ref := range l.Status.TestRuns {
+				if ref.NodeID == nodeID {
+					return ref.Phase
+				}
+			}
+			return "<none>"
+		}
+
+		It("a generator down behind a healthy one exhausts the observe budget", func() {
+			lt := runningOn("gen-a", "gen-b")
+			var fresh *dfaasv1.LoadTest
+			passes := 0
+			for passes < fetchRetryBudget+5 {
+				fleet.FailNext("gen-b", "stage", remoteDown)
+				fresh = reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+				passes++
+				if fresh.Status.Phase == dfaasv1.LoadTestFailed {
+					break
+				}
+			}
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(passes).To(BeNumerically("<=", fetchRetryBudget))
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+		})
+
+		It("a failed round still persists the stage of every generator that answered", func() {
+			lt := runningOn("gen-a", "gen-b")
+			fleet.SetStage("gen-b", lt, "finished")
+			fleet.FailNext("gen-a", "stage", remoteDown)
+			fresh := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(refPhase(fresh, "gen-b")).To(Equal("finished"))
+		})
+
+		It("a fetch failure charges its own counter and leaves K6Dispatched alone", func() {
+			lt := runningOn("gen-a", "gen-b")
+			fleet.FailNext("gen-a", "stage", remoteDown)
+			fresh := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(fresh.Annotations[fetchMissesAnnotation]).To(Equal(fmt.Sprintf("%d:1", fresh.Generation)))
+			Expect(fresh.Annotations[dispatchAttemptsAnnotation]).NotTo(HaveSuffix(":1"))
+			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Reason).To(Equal(dfaasv1.LTReasonAllDispatched))
+			h := cond(fresh, dfaasv1.LTCondK6Healthy)
+			Expect(h.Status).To(Equal(metav1.ConditionUnknown))
+			Expect(h.Reason).To(Equal(dfaasv1.LTReasonFetchFailed))
+			Expect(h.Message).To(ContainSubstring("gen-a"))
+		})
+
+		It("the next remote round waits for the retry interval after a failed one", func() {
+			lt := runningOn("gen-a")
+			r.retryEvery = 0 // production pacing
+			fleet.FailNext("gen-a", "stage", remoteDown)
+			reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: keyOf(lt)})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			var fresh dfaasv1.LoadTest
+			Expect(k8sClient.Get(ctx, keyOf(lt), &fresh)).To(Succeed())
+			Expect(fresh.Annotations[fetchMissesAnnotation]).To(Equal(fmt.Sprintf("%d:1", fresh.Generation)))
+		})
+
+		It("a GO publish that keeps failing past the barrier budget fails the test", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 10, awaiting)
+			fleet.SetStage("gen-a", lt, "started")
+			fleet.SetStage("gen-b", lt, "started")
+			channel.PublishErr = fmt.Errorf("filer down")
+			waiting := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(waiting.Status.Phase).NotTo(Equal(dfaasv1.LoadTestFailed))
+
+			for i := range waiting.Status.Conditions {
+				if waiting.Status.Conditions[i].Type == dfaasv1.LTCondK6Dispatched {
+					waiting.Status.Conditions[i].LastTransitionTime = metav1.NewTime(time.Now().Add(-syncWaitBudget - time.Minute))
+				}
+			}
+			Expect(k8sClient.Status().Update(ctx, waiting)).To(Succeed())
+			fresh := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(cond(fresh, dfaasv1.LTCondSyncReady).Reason).To(Equal(dfaasv1.LTReasonSyncTimeout))
+		})
+
+		It("a runner that finished before the GO signal fails the test", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 10, awaiting)
+			fleet.SetStage("gen-a", lt, "finished")
+			fleet.SetStage("gen-b", lt, "started")
+			fresh := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(cond(fresh, dfaasv1.LTCondSyncReady).Reason).To(Equal(dfaasv1.LTReasonSyncTimeout))
+			Expect(channel.Count("PublishGo")).To(BeZero())
+		})
+
+		It("a GO already published finishes the dispatch without publishing again", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			parked := reconcileUntil(lt, 10, awaiting)
+			meta.SetStatusCondition(&parked.Status.Conditions, metav1.Condition{Type: dfaasv1.LTCondSyncReady,
+				Status: metav1.ConditionTrue, Reason: dfaasv1.LTReasonGoPublished, Message: "GO signal published"})
+			Expect(k8sClient.Status().Update(ctx, parked)).To(Succeed())
+			fleet.SetStage("gen-a", lt, "finished")
+			fresh := reconcileUntil(lt, 2, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+			Expect(channel.Count("PublishGo")).To(BeZero())
 		})
 	})
 

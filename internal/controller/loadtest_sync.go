@@ -17,7 +17,6 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -63,70 +62,76 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	// GO already out (a finishDispatch that failed after the publish): finish,
+	// never publish twice.
+	if c := meta.FindStatusCondition(lt.Status.Conditions, dfaasv1.LTCondSyncReady); c != nil &&
+		c.Status == metav1.ConditionTrue && c.Reason == dfaasv1.LTReasonGoPublished {
+		return r.finishDispatch(ctx, lt, lt.Status.TestRuns)
+	}
+
 	total := len(lt.Status.TestRuns)
-	started := 0
+	nodeIDs := make([]string, 0, total)
 	for _, ref := range lt.Status.TestRuns {
-		node, nerr := r.Dispatcher.Node(ctx, env, ref.NodeID)
-		if nerr != nil {
-			// A node that left the Environment will never report "started":
-			// fail in one tick instead of burning the whole syncWaitBudget
-			// waiting on a runner nobody can poll.
-			logger.Info("sync barrier: node unusable; aborting all",
-				"node", ref.NodeID, "cause", nerr.Error())
-			return r.failLoadTest(ctx, lt, "synchronized start: "+nerr.Error(), statuswriter.Cond{
-				Type: dfaasv1.LTCondSyncReady, Status: metav1.ConditionFalse,
-				Reason: dfaasv1.LTReasonSyncTimeout, Message: nerr.Error()})
-		}
-		stage, err := node.Stage(ctx, lt)
-		if err != nil {
-			// Transient remote hiccup (or not yet visible): keep waiting, the
-			// budget bounds us.
-			logger.Error(err, "sync barrier: remote TestRun poll failed", "node", ref.NodeID)
-			continue
-		}
-		switch stage {
-		case "started", "finished", "stopped":
-			// finished/stopped should not happen while parked on the barrier,
-			// but count them as past-the-start so the GO still fires.
-			started++
-		case "error":
-			logger.Info("sync barrier: TestRun errored while waiting; aborting all",
-				"node", ref.NodeID)
-			return r.failLoadTest(ctx, lt,
-				fmt.Sprintf("synchronized start: runner on node %q errored before the GO signal", ref.NodeID),
-				statuswriter.Cond{Type: dfaasv1.LTCondSyncReady, Status: metav1.ConditionFalse,
-					Reason:  dfaasv1.LTReasonSyncTimeout,
-					Message: fmt.Sprintf("runner on node %q reported stage=error before the GO signal", ref.NodeID)})
+		nodeIDs = append(nodeIDs, ref.NodeID)
+	}
+	rd := r.survey(ctx, lt, env, nodeIDs)
+	fail := func(ready, detail string) (ctrl.Result, error) {
+		logger.Info("sync barrier: aborting all", "cause", detail)
+		return r.failLoadTest(ctx, lt, "synchronized start: "+ready, statuswriter.Cond{
+			Type: dfaasv1.LTCondSyncReady, Status: metav1.ConditionFalse,
+			Reason: dfaasv1.LTReasonSyncTimeout, Message: detail})
+	}
+
+	// A generator that left the Environment will never report "started": fail
+	// in one tick instead of burning the whole syncWaitBudget.
+	if len(rd.unusable) > 0 {
+		d := "generator unusable: " + rd.describe(rd.unusable)
+		return fail(d, d)
+	}
+	for _, id := range nodeIDs {
+		switch classifyStage(rd.stages[id]) {
+		case stageErrored:
+			return fail(fmt.Sprintf("runner on node %q errored before the GO signal", id),
+				fmt.Sprintf("runner on node %q reported stage=error before the GO signal", id))
+		case stageDone:
+			// A runner past its script before GO ran unsynchronized: the data
+			// is not the experiment that was asked for.
+			return fail(fmt.Sprintf("runner on node %q finished before the GO signal", id),
+				fmt.Sprintf("runner on node %q reported stage=%s before the GO signal", id, rd.stages[id]))
 		}
 	}
 
+	// One wait, one bound: syncWaitBudget from K6Dispatched=True bounds both
+	// the runners parking and the GO publish.
+	expired := false
+	if c := meta.FindStatusCondition(lt.Status.Conditions, dfaasv1.LTCondK6Dispatched); c != nil &&
+		c.Status == metav1.ConditionTrue && time.Since(c.LastTransitionTime.Time) > syncWaitBudget {
+		expired = true
+	}
+	started := rd.count[stageStarted]
+
 	if started < total {
-		// Budget reference: when the dispatch completed, i.e. K6Dispatched
-		// flipped to True. Re-fetch to see the freshest conditions.
-		var latest dfaasv1.LoadTest
-		if err := r.Get(ctx, types.NamespacedName{Name: lt.Name, Namespace: lt.Namespace}, &latest); err == nil {
-			if cond := meta.FindStatusCondition(latest.Status.Conditions, dfaasv1.LTCondK6Dispatched); cond != nil &&
-				cond.Status == metav1.ConditionTrue &&
-				time.Since(cond.LastTransitionTime.Time) > syncWaitBudget {
-				logger.Info("sync barrier: wait budget exhausted; aborting all",
-					"started", started, "total", total)
-				return r.failLoadTest(ctx, lt,
-					fmt.Sprintf("synchronized start: only %d/%d runners started within %s", started, total, syncWaitBudget),
-					statuswriter.Cond{Type: dfaasv1.LTCondSyncReady, Status: metav1.ConditionFalse,
-						Reason:  dfaasv1.LTReasonSyncTimeout,
-						Message: fmt.Sprintf("only %d/%d runners started within %s", started, total, syncWaitBudget)})
-			}
+		if expired {
+			return fail(fmt.Sprintf("only %d/%d runners started within %s", started, total, syncWaitBudget),
+				fmt.Sprintf("only %d/%d runners started within %s", started, total, syncWaitBudget))
 		}
-		r.cond(ctx, lt, dfaasv1.LTCondSyncReady,
-			metav1.ConditionFalse, dfaasv1.LTReasonAwaitingRunners,
-			fmt.Sprintf("%d/%d runners started, holding the GO signal", started, total))
+		msg := fmt.Sprintf("%d/%d runners started, holding the GO signal", started, total)
+		if len(rd.missing) > 0 {
+			msg += "; no status from " + rd.describe(rd.missing)
+		}
+		r.cond(ctx, lt, dfaasv1.LTCondSyncReady, metav1.ConditionFalse, dfaasv1.LTReasonAwaitingRunners, msg)
 		return ctrl.Result{RequeueAfter: syncPollRequeue}, nil
 	}
 
 	if err := r.syncChannel().PublishGo(ctx, lt); err != nil {
-		// Filer hiccup: retry on the poll cadence; the wait budget above still
-		// bounds the total time spent here.
-		logger.Error(err, "sync barrier: GO signal publish failed; retrying")
+		logger.Error(err, "sync barrier: GO signal publish failed")
+		if expired {
+			return fail("GO signal publish failed within "+syncWaitBudget.String(),
+				"every runner started, but the GO signal could not be published within "+
+					syncWaitBudget.String()+": "+condMessage(err))
+		}
+		r.cond(ctx, lt, dfaasv1.LTCondSyncReady, metav1.ConditionFalse, dfaasv1.LTReasonAwaitingRunners,
+			fmt.Sprintf("%d/%d runners started; GO signal publish failed, retrying: %s", started, total, condMessage(err)))
 		return ctrl.Result{RequeueAfter: syncPollRequeue}, nil
 	}
 	logger.Info("sync barrier: GO signal published", "runners", total)
