@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -356,6 +357,18 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(fleet.Applied()).To(BeEmpty())
 		})
 
+		It("a parked draft still gets its Environment ownerRef", func() {
+			env := envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.Suspended = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestPending))
+			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool { return hasOwnerRef(l, env) })
+			Expect(hasOwnerRef(fresh, env)).To(BeTrue())
+			Expect(fleet.Applied()).To(BeEmpty())
+		})
+
 		It("a node that left the Environment mid-test fails the test on the next observe", func() {
 			env := envReady("env", "gen-a")
 			scriptCM("script")
@@ -367,6 +380,113 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
 			fresh := reconcileUntil(lt, 3, phaseIs(dfaasv1.LoadTestFailed))
 			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+		})
+	})
+
+	// A scheduled test is created suspended with a startAt (that is what the
+	// SPA sends); the operator lifts the suspension itself at fire time. These
+	// pin that the fire lands on a parked test instead of tripping the
+	// "startAt without suspended" guard meant for a kubectl apply.
+	Context("scheduled start (spec.startAt)", func() {
+		scheduledReason := func(l *dfaasv1.LoadTest) string {
+			if c := cond(l, dfaasv1.LTCondScheduled); c != nil {
+				return c.Reason
+			}
+			return ""
+		}
+		newScheduled := func(at time.Time) *dfaasv1.LoadTest {
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.Suspended = true
+			lt.Spec.StartAt = &metav1.Time{Time: at}
+			return lt
+		}
+		moveStartAtToPast := func(lt *dfaasv1.LoadTest) {
+			patch := fmt.Sprintf(`{"spec":{"startAt":%q}}`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339))
+			Expect(k8sClient.Patch(ctx, lt, client.RawPatch(types.MergePatchType, []byte(patch)))).To(Succeed())
+		}
+
+		It("parks an armed scheduled test at Pending, then fires and dispatches it", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newScheduled(time.Now().Add(time.Hour))
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			armed := reconcileUntil(lt, 4, func(l *dfaasv1.LoadTest) bool {
+				return scheduledReason(l) == dfaasv1.LTReasonScheduledArmed
+			})
+			Expect(armed.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
+			Expect(fleet.Applied()).To(BeEmpty())
+
+			moveStartAtToPast(lt)
+			fresh := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+			Expect(scheduledReason(fresh)).To(Equal(dfaasv1.LTReasonScheduledFired))
+			Expect(fleet.Applied()).NotTo(BeEmpty())
+		})
+
+		It("fires a scheduled test whose startAt already passed instead of failing it", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newScheduled(time.Now().Add(-time.Minute))
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			fresh := reconcileUntil(lt, 12, func(l *dfaasv1.LoadTest) bool {
+				return l.Status.Phase == dfaasv1.LoadTestRunning || l.Status.Phase == dfaasv1.LoadTestFailed
+			})
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+			Expect(scheduledReason(fresh)).To(Equal(dfaasv1.LTReasonScheduledFired))
+			Expect(fleet.Applied()).NotTo(BeEmpty())
+		})
+
+		It("waits at Pending when the schedule fires on a non-Ready Environment, then fires once it is Ready", func() {
+			env := envReady("env", "gen-a")
+			env.Status.Phase = dfaasv1.EnvProvisioningInfra
+			Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
+			scriptCM("script")
+			lt := newScheduled(time.Now().Add(-time.Minute))
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			delayed := reconcileUntil(lt, 4, func(l *dfaasv1.LoadTest) bool {
+				return scheduledReason(l) == dfaasv1.LTReasonScheduledDelayedEnvNot
+			})
+			Expect(delayed.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
+			Expect(fleet.Applied()).To(BeEmpty())
+
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			env.Status.Phase = dfaasv1.EnvReady
+			Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
+			fresh := reconcileUntil(lt, 12, func(l *dfaasv1.LoadTest) bool {
+				return l.Status.Phase == dfaasv1.LoadTestRunning || l.Status.Phase == dfaasv1.LoadTestFailed
+			})
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+		})
+
+		It("Start on an armed scheduled test dispatches it now, startAt left in place", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newScheduled(time.Now().Add(time.Hour))
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			armed := reconcileUntil(lt, 4, func(l *dfaasv1.LoadTest) bool {
+				return scheduledReason(l) == dfaasv1.LTReasonScheduledArmed
+			})
+			Expect(armed.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
+
+			// What a pre-fix gateway's Activate or a kubectl patch sends.
+			Expect(k8sClient.Patch(ctx, lt, client.RawPatch(types.MergePatchType,
+				[]byte(`{"spec":{"suspended":false}}`)))).To(Succeed())
+			fresh := reconcileUntil(lt, 12, func(l *dfaasv1.LoadTest) bool {
+				return l.Status.Phase == dfaasv1.LoadTestRunning || l.Status.Phase == dfaasv1.LoadTestFailed
+			})
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+		})
+
+		It("still fails a test created with startAt but without suspended", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.StartAt = &metav1.Time{Time: time.Now().Add(time.Hour)}
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			fresh := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(cond(fresh, dfaasv1.LTCondReady).Message).To(ContainSubstring("spec.startAt requires spec.suspended=true"))
+			Expect(fleet.Applied()).To(BeEmpty())
 		})
 	})
 })

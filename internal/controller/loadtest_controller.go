@@ -152,6 +152,16 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
+	// Park every suspended test (draft or scheduled) at Pending on its first
+	// pass, before the scheduled branch can arm or fire it. Every later
+	// un-suspend -- the fire PATCH below, the gateway's Activate, a kubectl
+	// patch -- then lands on a Pending test, outside the phase == "" guards
+	// that follow. Before this, a scheduled test sat at "" until it fired and
+	// the startAt guard below failed it.
+	if lt.Spec.Suspended && lt.Status.Phase == "" {
+		return r.phase(ctx, &lt, dfaasv1.LoadTestPending, "", "")
+	}
+
 	// Scheduled-start branch (P9: stamps LTCondScheduled).
 	if lt.Spec.StartAt != nil && lt.Status.Phase.PreExecution() && lt.Spec.Suspended {
 
@@ -192,8 +202,10 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// above requires Suspended, so a test carrying startAt without it falls
 	// straight through and dispatches immediately, ignoring the schedule with
 	// no diagnostic anywhere. The gateway rejects that on both create paths;
-	// a kubectl apply reaches here instead, so fail it loudly. phase == "" is
-	// create time -- the same scope the gate below uses.
+	// a kubectl apply reaches here instead, so fail it loudly. Every suspended
+	// test was parked at Pending above, so a test here at phase "" with
+	// startAt and without suspended was created, or un-suspended, before the
+	// operator ever parked it -- either way the schedule was never armed.
 	if lt.Status.Phase == "" && lt.Spec.StartAt != nil && !lt.Spec.Suspended {
 		return r.failLoadTest(ctx, &lt,
 			"spec.startAt requires spec.suspended=true; otherwise the schedule is ignored and the test starts immediately")
@@ -221,11 +233,8 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	preExecution := lt.Status.Phase.PreExecution()
 	if preExecution {
 		if lt.Spec.Suspended {
-			// Save-as-Draft: hold at Pending, dispatch nothing. PATCH
-			// spec.suspended=false to start.
-			if lt.Status.Phase == "" {
-				return r.phase(ctx, &lt, dfaasv1.LoadTestPending, "", "")
-			}
+			// Save-as-Draft or armed schedule, parked at Pending above:
+			// dispatch nothing until spec.suspended=false.
 			return ctrl.Result{}, nil
 		}
 
@@ -479,6 +488,10 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 		if sib.Spec.Suspended {
 			continue
 		}
+		// ponytail: an un-suspended test still carrying a future startAt
+		// (kubectl, or a pre-fix gateway's Start) is skipped here too, so younger
+		// waiting tests may go first until its startAt passes. Bounded priority
+		// inversion; it still dispatches once none waits.
 		if sib.Spec.StartAt != nil && now.Before(sib.Spec.StartAt.Time) {
 			continue
 		}
