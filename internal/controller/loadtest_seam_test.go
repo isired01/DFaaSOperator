@@ -897,4 +897,86 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(fleet.Applied()).To(BeEmpty())
 		})
 	})
+	// phase "" means "not yet admitted", nothing more. A test that was never
+	// queued used to keep "" through its whole dispatch and the Sync barrier,
+	// so the create-time gate fired mid-run with the create-time message, and
+	// a Pending test holding TestRuns waited forever on an Environment that
+	// never recovered.
+	Context("admission", func() {
+		setEnvPhase := func(p dfaasv1.EnvironmentPhase) {
+			var env dfaasv1.Environment
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "env", Namespace: ns}, &env)).To(Succeed())
+			env.Status.Phase = p
+			Expect(k8sClient.Status().Update(ctx, &env)).To(Succeed())
+		}
+
+		It("admits every test at Pending before anything remote happens", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool { return l.Status.Phase != "" })
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
+			Expect(fleet.Applied()).To(BeEmpty())
+		})
+
+		It("an Environment lost mid-barrier ends the run with its own failure, not the create-time one", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 10, func(l *dfaasv1.LoadTest) bool {
+				c := cond(l, dfaasv1.LTCondSyncReady)
+				return c != nil && c.Reason == dfaasv1.LTReasonAwaitingRunners
+			})
+
+			setEnvPhase(dfaasv1.EnvUnreachable)
+			fresh := reconcileUntil(lt, 3, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			msg := cond(fresh, dfaasv1.LTCondReady).Message
+			Expect(msg).NotTo(ContainSubstring("before creating a LoadTest"))
+			Expect(msg).To(ContainSubstring("Unreachable"))
+			Expect(cond(fresh, dfaasv1.LTCondSyncReady).Reason).To(Equal(dfaasv1.LTReasonSyncTimeout))
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+			Expect(fleet.Exists("gen-b", lt)).To(BeFalse())
+		})
+
+		It("a Pending test holding TestRuns fails and reclaims them when its Environment stops being dispatchable", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			fleet.FailNext("gen-b", "apply", fmt.Errorf("remote down"))
+			partial := reconcileUntil(lt, 6, func(l *dfaasv1.LoadTest) bool { return len(l.Status.TestRuns) == 1 })
+			if partial.Status.Phase != dfaasv1.LoadTestPending {
+				partial.Status.Phase = dfaasv1.LoadTestPending // what a queued-then-dispatched test looks like
+				Expect(k8sClient.Status().Update(ctx, partial)).To(Succeed())
+			}
+
+			setEnvPhase(dfaasv1.EnvProvisioningVMs)
+			fresh := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+		})
+
+		It("a test that dispatched nothing waits for its Environment without rewriting its status", func() {
+			env := envReady("env", "gen-a")
+			env.Status.Phase = dfaasv1.EnvProvisioningInfra
+			Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.Suspended = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestPending))
+			Expect(k8sClient.Patch(ctx, lt, client.RawPatch(types.MergePatchType, []byte(`{"spec":{"suspended":false}}`)))).To(Succeed())
+			reconcileUntil(lt, 2, func(*dfaasv1.LoadTest) bool { return false })
+
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: keyOf(lt)})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(res.Requeue).To(BeFalse())
+			Expect(fleet.Applied()).To(BeEmpty())
+		})
+	})
 })

@@ -47,9 +47,11 @@ func (p LoadTestPhase) Terminal() bool {
 }
 
 // PreExecution reports whether the LoadTest has not started running yet --
-// unreconciled ("") or held at Pending. It is the window in which the
-// create-time gates, the draft hold and the scheduled branch apply, and the
-// scope the API server would need a CEL transition rule to express.
+// not yet admitted ("") or held at Pending. The create-time gates run only at
+// "" (admission writes Pending before anything remote happens); the draft
+// hold, the scheduled branch and the Environment wait apply to the whole
+// window. It is the scope the API server would need a CEL transition rule to
+// express.
 func (p LoadTestPhase) PreExecution() bool {
 	return p == "" || p == LoadTestPending
 }

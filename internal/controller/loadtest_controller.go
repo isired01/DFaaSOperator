@@ -173,18 +173,36 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 	}
 
-	// Park every suspended test (draft or scheduled) at Pending on its first
-	// pass, before the scheduled branch can arm or fire it. Every later
-	// un-suspend -- the fire PATCH below, the gateway's Activate, a kubectl
-	// patch -- then lands on a Pending test, outside the phase == "" guards
-	// that follow. Before this, a scheduled test sat at "" until it fired and
-	// the startAt guard below failed it.
-	if lt.Spec.Suspended && lt.Status.Phase == "" {
+	// Admission. Phase "" means "not yet admitted", nothing more: the two
+	// create-time checks run here, then every test -- draft, scheduled or
+	// plain -- is written Pending before anything below runs, so nothing
+	// remote ever happens at "". A scheduled test is therefore Pending while
+	// armed and after the operator's own fire PATCH, and a test that is mid-
+	// dispatch or on the Sync barrier is never mistaken for a fresh one.
+	if lt.Status.Phase == "" {
+		// Only an older binary could leave "" with TestRuns recorded: admit it
+		// without the create-time checks, so it reaches the reclaiming exits.
+		if len(lt.Status.TestRuns) == 0 {
+			// startAt is honoured only on a suspended LoadTest; without it the
+			// test would dispatch at once, ignoring the schedule. The gateway
+			// rejects that on both create paths; a kubectl apply reaches here.
+			if lt.Spec.StartAt != nil && !lt.Spec.Suspended {
+				return r.failLoadTest(ctx, &lt,
+					"spec.startAt requires spec.suspended=true; otherwise the schedule is ignored and the test starts immediately")
+			}
+			// Strict create-time gate, relaxed for drafts (they may target an
+			// Environment that is still provisioning).
+			if !lt.Spec.Suspended && !env.Status.Phase.Dispatchable() {
+				return r.failLoadTest(ctx, &lt,
+					fmt.Sprintf("environment %q is %q; it must be Ready before creating a LoadTest",
+						env.Name, env.Status.Phase))
+			}
+		}
 		return r.phase(ctx, &lt, dfaasv1.LoadTestPending, "", "")
 	}
 
 	// Scheduled-start branch (P9: stamps LTCondScheduled).
-	if lt.Spec.StartAt != nil && lt.Status.Phase.PreExecution() && lt.Spec.Suspended {
+	if lt.Spec.StartAt != nil && lt.Status.Phase.PreExecution() && lt.Spec.Suspended && len(lt.Status.TestRuns) == 0 {
 
 		fireT := lt.Spec.StartAt.Time
 		switch {
@@ -219,26 +237,6 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	// startAt is honoured only on a suspended LoadTest: the scheduled branch
-	// above requires Suspended, so a test carrying startAt without it falls
-	// straight through and dispatches immediately, ignoring the schedule with
-	// no diagnostic anywhere. The gateway rejects that on both create paths;
-	// a kubectl apply reaches here instead, so fail it loudly. Every suspended
-	// test was parked at Pending above, so a test here at phase "" with
-	// startAt and without suspended was created, or un-suspended, before the
-	// operator ever parked it -- either way the schedule was never armed.
-	if lt.Status.Phase == "" && lt.Spec.StartAt != nil && !lt.Spec.Suspended {
-		return r.failLoadTest(ctx, &lt,
-			"spec.startAt requires spec.suspended=true; otherwise the schedule is ignored and the test starts immediately")
-	}
-
-	// Strict create-time gate.
-	if lt.Status.Phase == "" && !lt.Spec.Suspended && !env.Status.Phase.Dispatchable() {
-		return r.failLoadTest(ctx, &lt,
-			fmt.Sprintf("environment %q is %q; it must be Ready before creating a LoadTest",
-				env.Name, env.Status.Phase))
-	}
-
 	// OwnerReference Environment → LoadTest.
 	if !hasOwnerRef(&lt, &env) {
 		if err := controllerutil.SetOwnerReference(&env, &lt, r.Scheme); err != nil {
@@ -253,7 +251,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Run-once guard + suspended gate.
 	preExecution := lt.Status.Phase.PreExecution()
 	if preExecution {
-		if lt.Spec.Suspended {
+		if lt.Spec.Suspended && len(lt.Status.TestRuns) == 0 {
 			// Save-as-Draft or armed schedule, parked at Pending above:
 			// dispatch nothing until spec.suspended=false.
 			return ctrl.Result{}, nil
@@ -261,8 +259,13 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 		// Block while Environment is mid-flight.
 		if !env.Status.Phase.Dispatchable() {
+			if len(lt.Status.TestRuns) > 0 {
+				return r.endOnEnvironmentLost(ctx, &lt, &env)
+			}
+			// Nothing dispatched: wait, with no status write; the Environment
+			// watch wakes the test when it recovers.
 			logger.Info("waiting for environment", "env", env.Name, "phase", env.Status.Phase)
-			return r.phase(ctx, &lt, dfaasv1.LoadTestPending, "", "")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 	}
 
@@ -271,8 +274,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Sits after the scheduled-fire branch, so a just-fired scheduled test is
 	// caught here on its next reconcile and queued rather than colliding with
 	// a sibling already running on the same Environment.
-	if preExecution && !lt.Spec.Suspended &&
-		env.Status.Phase.Dispatchable() {
+	if preExecution && !lt.Spec.Suspended {
 		proceed, res, err := r.envOccupancyGate(ctx, &lt)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -580,4 +582,29 @@ func (r *LoadTestReconciler) loadTestsForEnv(ctx context.Context, obj client.Obj
 		}
 	}
 	return out
+}
+
+// endOnEnvironmentLost ends a pre-execution test whose dispatch already began
+// when its Environment stops being Dispatchable (a spec edit, Unreachable,
+// Failed): the partial run is reclaimed and the test fails, instead of the
+// create-time gate firing mid-run or a Pending test waiting forever. It
+// re-reads the test uncached first, so a stale Pending copy of a test that is
+// already Running is never ended.
+func (r *LoadTestReconciler) endOnEnvironmentLost(ctx context.Context,
+	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
+	var fresh dfaasv1.LoadTest
+	if err := r.occupancyReader().Get(ctx, client.ObjectKeyFromObject(lt), &fresh); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if !fresh.Status.Phase.PreExecution() || len(fresh.Status.TestRuns) == 0 {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+	msg := fmt.Sprintf("environment %q became %q after dispatch began; the partial run was reclaimed",
+		env.Name, env.Status.Phase)
+	var conds []statuswriter.Cond
+	if lt.Spec.SyncStart {
+		conds = append(conds, statuswriter.Cond{Type: dfaasv1.LTCondSyncReady, Status: metav1.ConditionFalse,
+			Reason: dfaasv1.LTReasonSyncTimeout, Message: msg})
+	}
+	return r.failLoadTest(ctx, lt, msg, conds...)
 }
