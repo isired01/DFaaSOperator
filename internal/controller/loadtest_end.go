@@ -80,7 +80,11 @@ func (r *LoadTestReconciler) endRun(ctx context.Context, lt *dfaasv1.LoadTest,
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		own = append(own, rec.verdict(endReason))
+		v := rec.verdict(endReason)
+		if v.Reason == dfaasv1.LTReasonRunnersUnreclaimed {
+			r.lastMiss.Store(client.ObjectKeyFromObject(lt), time.Now()) // pace the re-sweep
+		}
+		own = append(own, v)
 	}
 	if dispatchBegan(&fresh) {
 		r.sweepFilerObjects(ctx, &fresh, "run end")
@@ -276,9 +280,15 @@ func endRestamps(lt *dfaasv1.LoadTest, p dfaasv1.LoadTestPhase, endReason string
 // retryReclaim re-sweeps a terminal test that still holds its Environment.
 // Still unreclaimed: no write, try again later. Otherwise one write of the new
 // K6Healthy verdict releases the queue.
-// ponytail: each retry against a dead k3s API stalls the single LoadTest
-// worker for up to the remote timeout per generator.
+// ponytail: paced at remoteRetryInterval (like any failed remote round), so a
+// dead k3s API stalls the single LoadTest worker for at most one remote
+// timeout per generator per interval.
 func (r *LoadTestReconciler) retryReclaim(ctx context.Context, lt *dfaasv1.LoadTest) (ctrl.Result, error) {
+	// Paced like every failed remote round: this runs off every watch event,
+	// and a try against a dead k3s API stalls the single worker.
+	if wait := r.paced(lt); wait > 0 {
+		return ctrl.Result{RequeueAfter: wait}, nil
+	}
 	var env dfaasv1.Environment
 	err := r.Get(ctx, types.NamespacedName{Name: lt.Spec.TargetEnvironment, Namespace: lt.Namespace}, &env)
 	if apierrors.IsNotFound(err) {
@@ -293,6 +303,7 @@ func (r *LoadTestReconciler) retryReclaim(ctx context.Context, lt *dfaasv1.LoadT
 	}
 	v := r.teardownRemoteTestRuns(ctx, lt, &env).verdict(endReason)
 	if v.Reason == dfaasv1.LTReasonRunnersUnreclaimed {
+		r.lastMiss.Store(client.ObjectKeyFromObject(lt), time.Now())
 		return ctrl.Result{RequeueAfter: reclaimRetryInterval}, nil
 	}
 	return ctrl.Result{}, r.writer().Record(ctx, lt, ltTransition{Conditions: []statuswriter.Cond{v}})

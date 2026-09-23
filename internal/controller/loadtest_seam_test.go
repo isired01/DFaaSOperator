@@ -979,4 +979,28 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(fleet.Applied()).To(BeEmpty())
 		})
 	})
+	// The background re-sweep of an unreclaimed runner is paced like every
+	// other failed remote round: it runs off every watch event (its own
+	// terminal write, each Environment health write), and each try against a
+	// dead k3s API stalls the single LoadTest worker for the remote timeout.
+	Context("reclaim pacing", func() {
+		It("does not re-sweep an unreclaimed runner before the retry interval", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(k8sClient.Patch(ctx, lt, client.RawPatch(types.MergePatchType, []byte(`{"spec":{"stop":true}}`)))).To(Succeed())
+			fleet.FailNext("gen-b", "delete", fmt.Errorf("remote k3s API down"))
+			aborted := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(cond(aborted, dfaasv1.LTCondK6Healthy).Reason).To(Equal(dfaasv1.LTReasonRunnersUnreclaimed))
+
+			r.retryEvery = 0 // production pacing
+			deletes := len(fleet.Deleted())
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: keyOf(lt)})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(fleet.Deleted()).To(HaveLen(deletes), "no remote call inside the retry interval")
+		})
+	})
 })
