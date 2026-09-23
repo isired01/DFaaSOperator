@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -164,6 +165,21 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 // rather than aborting one mid-flight.
 func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
+
+	// An older generation's playbooks must be gone before this generation's
+	// start on the same machines.
+	older, err := r.cleanupStaleGenJobs(ctx, env)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if len(older) > 0 {
+		msg := "waiting for older-generation Ansible Job(s) to terminate: " + strings.Join(older, ", ")
+		logStatusErr(ctx, "stamp older-generation wait", r.writer().Record(ctx, env, envTransition{Conditions: []statuswriter.Cond{
+			{Type: dfaasv1.EnvCondDFaaSNodesReady, Status: metav1.ConditionUnknown, Reason: dfaasv1.EnvReasonJobPending, Message: msg},
+			{Type: dfaasv1.EnvCondK6Ready, Status: metav1.ConditionUnknown, Reason: dfaasv1.EnvReasonJobPending, Message: msg},
+		}}))
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
 
 	am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
 	libp2pKeys, err := am.EnsureLibp2pKeys(ctx, env)
@@ -423,6 +439,7 @@ func (r *EnvironmentReconciler) resetTransientConditions(ctx context.Context,
 		dfaasv1.EnvCondK6Ready,
 		dfaasv1.EnvCondInfrastructureReady,
 		dfaasv1.EnvCondMonitoringReady,
+		dfaasv1.EnvCondNodesReachable,
 	} {
 		conds = append(conds, statuswriter.Cond{Type: condType, Status: metav1.ConditionUnknown,
 			Reason: dfaasv1.EnvReasonUpdating, Message: "spec edited; re-provisioning — condition will be re-evaluated"})

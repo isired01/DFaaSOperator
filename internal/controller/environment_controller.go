@@ -110,7 +110,8 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// after an operator upgrade has nothing to diff against and silently leaves
 	// a live machine running k3s and the dfaas-agent. Never clobbers: a real
 	// snapshot knows more than the current spec does.
-	if env.Status.ObservedGeneration > 0 && env.Status.ObservedGeneration == env.Generation {
+	if env.Status.ObservedGeneration > 0 && env.Status.ObservedGeneration == env.Generation &&
+		meta.IsStatusConditionTrue(env.Status.Conditions, dfaasv1.EnvCondInfrastructureReady) {
 		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
 		logStatusErr(ctx, "seed provisioning snapshot", am.SaveSnapshotIfAbsent(ctx, &env))
 	}
@@ -172,19 +173,21 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // moves the phase back to ProvisioningVMs. Returns handled=true when it took over
 // the reconcile — the caller must return res/err immediately.
 //
-// Cleanup runs only on this settled→ProvisioningVMs transition, not on every
-// reconcile of the subsequent re-provisioning window: observedGeneration stays
-// behind until the new run reaches Ready, but once the old-gen Jobs are deleted
-// the fresh Jobs carry the current generation in their name and labels, so a
-// repeated LIST would only churn finding nothing. Drift seen mid-provisioning
-// (a non-settled phase) needs no cleanup — generation-scoped Job names already
-// keep the previous run's Jobs from being mistaken for the current one.
+// One rule for every phase: drift mid-provisioning (or while Unreachable)
+// restarts the run too, so an edit that lands after the Ansible Jobs ran is
+// never stamped installed. The new run's ProvisioningInfra waits for the older
+// generation's Jobs to terminate before creating its own, so two generations
+// of playbooks never run on the same machines.
 func (r *EnvironmentReconciler) handleGenerationDrift(ctx context.Context,
 	env *dfaasv1.Environment) (handled bool, res ctrl.Result, err error) {
-	if env.Status.ObservedGeneration == 0 || env.Status.ObservedGeneration >= env.Generation {
-		return false, ctrl.Result{}, nil
-	}
+	// Settled phases compare what the last run installed; every other phase
+	// compares what the current run is applying. 0 means "no record": do
+	// nothing (a fresh Environment, or an object an older operator wrote).
+	recorded := env.Status.ObservedGeneration
 	if !isSettledPhase(env.Status.Phase) {
+		recorded = env.Status.ProvisioningGeneration
+	}
+	if recorded == 0 || recorded >= env.Generation {
 		return false, ctrl.Result{}, nil
 	}
 
@@ -192,7 +195,7 @@ func (r *EnvironmentReconciler) handleGenerationDrift(ctx context.Context,
 	logger.Info("generation drift detected — restarting provisioning",
 		"phase", env.Status.Phase,
 		"observed", env.Status.ObservedGeneration, "current", env.Generation)
-	if cerr := r.cleanupStaleGenJobs(ctx, env); cerr != nil {
+	if _, cerr := r.cleanupStaleGenJobs(ctx, env); cerr != nil {
 		logger.Error(cerr, "stale-gen Job cleanup failed")
 	}
 	if rerr := r.resetTransientConditions(ctx, env); rerr != nil {
@@ -215,8 +218,21 @@ func (r *EnvironmentReconciler) writer() statuswriter.Writer[*dfaasv1.Environmen
 		New:    func() *dfaasv1.Environment { return &dfaasv1.Environment{} },
 		SetPhase: func(env *dfaasv1.Environment, p dfaasv1.EnvironmentPhase) {
 			env.Status.Phase = p
+			// Every provisioning run starts at ProvisioningVMs: record the
+			// generation it applies, from the copy being written.
+			if p == dfaasv1.EnvProvisioningVMs {
+				env.Status.ProvisioningGeneration = env.Generation
+			}
+			// A settle stamps the generation the run applied, not whatever the
+			// re-fetched object carries now: an edit that landed mid-run must
+			// stay drift. No record (an object an older operator wrote) falls
+			// back to metadata.generation, never 0.
 			if isSettledPhase(p) {
-				env.Status.ObservedGeneration = env.Generation
+				if env.Status.ProvisioningGeneration > 0 {
+					env.Status.ObservedGeneration = env.Status.ProvisioningGeneration
+				} else {
+					env.Status.ObservedGeneration = env.Generation
+				}
 			}
 		},
 		Aggregate:  func(env *dfaasv1.Environment, p dfaasv1.EnvironmentPhase, _, _ string) { stampEnvAggregate(env, p) },

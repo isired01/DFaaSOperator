@@ -216,11 +216,20 @@ type EnvironmentStatus struct {
 	// +optional
 	Phase EnvironmentPhase `json:"phase,omitempty"`
 
-	// ObservedGeneration is the spec.generation observed at the last
-	// successful provisioning run. The reconciler skips re-provisioning when
-	// metadata.generation == status.observedGeneration and phase == Ready.
+	// ObservedGeneration is the spec.generation the last settled run (Ready or
+	// Failed) applied, copied from provisioningGeneration at the settle. The
+	// reconciler skips re-provisioning when metadata.generation ==
+	// status.observedGeneration and phase == Ready.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// ProvisioningGeneration is the metadata.generation the current (or last)
+	// provisioning run is applying, recorded when the run starts
+	// (ProvisioningVMs). A settled phase stamps it into observedGeneration, so
+	// an edit that lands mid-run is detected as drift instead of being marked
+	// installed without ever reaching Ansible.
+	// +optional
+	ProvisioningGeneration int64 `json:"provisioningGeneration,omitempty"`
 
 	// LastHealthCheck is the wall-clock time of the most recent Ready-state
 	// SSH liveness probe round. Stamped each time the periodic check runs
