@@ -116,22 +116,27 @@ var TestRunGVK = schema.GroupVersionKind{
 const maxTestRunName = 63 - len("-initializer")
 
 // TestRunName is the deterministic remote TestRun name for lt on nodeID.
-// A name within maxTestRunName is returned unchanged, so every name an older
-// release dispatched still resolves. A longer one keeps its head and ends in
-// the fnv32a hash of the full name: the part that gets cut is where two
-// generated LoadTest names (trailing nonce) or two nodeIDs tend to differ.
+// k6-operator uses "<testrun>-<n>" as the runner pod's hostname, a DNS-1123
+// label, so the LoadTest name goes through Sanitize like the nodeID: the
+// gateway admits dotted names, and a dot would leave the TestRun at stage
+// "initialized" forever. A name that needs no change and fits maxTestRunName
+// is returned as is, so every name an older release ran still resolves. Any
+// other name keeps its head and ends in the fnv32a hash of the unmapped name:
+// that keeps "exp.1" apart from "exp-1", and two generated LoadTest names
+// (trailing nonce) or two nodeIDs apart when the cut drops where they differ.
 func TestRunName(lt *dfaasv1.LoadTest, nodeID string) string {
-	name := fmt.Sprintf("%s-%s", lt.Name, Sanitize(nodeID))
-	if len(name) <= maxTestRunName {
+	raw := fmt.Sprintf("%s-%s", lt.Name, Sanitize(nodeID))
+	name := fmt.Sprintf("%s-%s", Sanitize(lt.Name), Sanitize(nodeID))
+	if name == raw && len(name) <= maxTestRunName {
 		return name
 	}
 	h := fnv.New32a()
-	h.Write([]byte(name))
+	h.Write([]byte(raw))
 	suffix := fmt.Sprintf("-%08x", h.Sum32())
-	// A '.' left at the cut would make "<head>.-<hash>" an invalid name: the
-	// gateway admits dotted LoadTest names, and generatedLoadTestName trims
-	// the same two characters at its own cut.
-	return strings.TrimRight(name[:maxTestRunName-len(suffix)], "-.") + suffix
+	if len(name) > maxTestRunName-len(suffix) {
+		name = name[:maxTestRunName-len(suffix)]
+	}
+	return strings.TrimRight(name, "-") + suffix
 }
 
 // K6LogConfigMap is the Management cluster ConfigMap holding one Generator's

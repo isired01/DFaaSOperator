@@ -253,14 +253,17 @@ and the reconciler retries it forever — no terminal state, no event, just a Lo
 The remote k6 TestRun is named `<loadtest>-<sanitized nodeID>` (`k6dispatch.TestRunName`), and
 k6-operator derives its own Job names from it; the longest, `<testrun>-initializer`, hits the same
 label limit. So the TestRun name is capped at **51 bytes**: a longer one keeps its head and ends in
-an 8-hex-digit hash of the full name, and a shorter one is left exactly as before. Past that bound
+an 8-hex-digit hash of the full name, and a shorter one is left exactly as before. A `.` in the
+LoadTest name becomes `-`, because k6-operator uses `<testrun>-1` as the runner pod's hostname and a
+hostname cannot contain a dot (a dotted TestRun stays at stage `initialized`); such a name also
+gets the hash, so `exp.1` and `exp-1` stay apart. Past that bound
 the initializer CREATE fails on the generator and the TestRun waits for its pod forever, so the
 LoadTest stays `Running` (or fails with `SyncTimeout` after 5 min under `syncStart`). The 51 comes
 from k6-operator v0.0.15, the version the k6 playbook pins (chart `3.7.0`); a test fails if the pin
 moves.
 
-Upgrading from v3.5.0: a test whose TestRun name was over 51 bytes and that has not ended at the
-upgrade fails once the new operator runs: a plain test after about 150 s with "TestRun not found", a
+Upgrading from v3.5.0: a test whose TestRun name was over 51 bytes, or whose LoadTest name contains
+a dot, and that has not ended at the upgrade fails once the new operator runs: a plain test after about 150 s with "TestRun not found", a
 `syncStart` test with `SyncTimeout` at its original 5-minute deadline. It keeps the old name in
 `status.testRuns`. Its `K6Healthy` Condition then reads `RunnersReclaimed`, which is wrong: the run
 end looked only for the new name, so the old TestRun is still on the generator. It has no pods and

@@ -185,3 +185,24 @@ func TestK6ChartVersionIsPinned(t *testing.T) {
 			"name suffix (maxTestRunName in dispatcher.go) before changing the chart", got)
 	}
 }
+
+// k6-operator uses "<testrun>-<n>" as the runner pod's hostname, which must be
+// a DNS-1123 label: a dot anywhere in the TestRun name leaves the TestRun at
+// stage "initialized" forever. The gateway admits dotted LoadTest names.
+func TestTestRunNameHasNoDots(t *testing.T) {
+	for _, tc := range []struct{ ltName, nodeID string }{
+		{"exp.1", "gen-a"},
+		// Two dots, one of them at the 42-byte cut.
+		{"exp.v2-" + strings.Repeat("a", 34) + ".bbbbbbbb", "gen-a"},
+	} {
+		got := TestRunName(lt(tc.ltName, nil, nil), tc.nodeID)
+		if errs := validation.IsDNS1123Label(got); len(errs) > 0 || len(got) > 51 {
+			t.Errorf("TestRunName(%q, %q) = %q: want a DNS-1123 label of at most 51 bytes, got %v",
+				tc.ltName, tc.nodeID, got, errs)
+		}
+	}
+	// Mapping '.' to '-' must not merge two LoadTests onto one TestRun name.
+	if TestRunName(lt("exp.1", nil, nil), "gen-a") == TestRunName(lt("exp-1", nil, nil), "gen-a") {
+		t.Error("exp.1 and exp-1 get the same TestRun name")
+	}
+}
