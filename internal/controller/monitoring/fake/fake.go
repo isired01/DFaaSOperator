@@ -46,7 +46,7 @@ type Stack struct {
 
 	deploys  int
 	checks   int
-	targets  []string // nodeIDs-free: one entry per ReconcileTargets call
+	targets  []string // one "namespace/name" entry per ReconcileTargets call
 	cleanups []string
 }
 
@@ -76,14 +76,14 @@ func (s *Stack) Check(_ context.Context) (bool, error) {
 func (s *Stack) ReconcileTargets(_ context.Context, env *dfaasv1.Environment) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.targets = append(s.targets, env.Name)
+	s.targets = append(s.targets, env.Namespace+"/"+env.Name)
 	return s.TargetsErr
 }
 
 func (s *Stack) CleanupTargets(_ context.Context, env *dfaasv1.Environment) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cleanups = append(s.cleanups, env.Name)
+	s.cleanups = append(s.cleanups, env.Namespace+"/"+env.Name)
 	return s.CleanupErr
 }
 

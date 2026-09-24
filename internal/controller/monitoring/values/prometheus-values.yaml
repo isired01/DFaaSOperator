@@ -72,7 +72,8 @@ server:
     servicePort: 9090
     nodePort: 30090
   # Mounts the prometheus-targets ConfigMap managed by the operator
-  # (reconcilePrometheusTargets). `optional: true` avoids errors if the
+  # (monitoring.Manager.ReconcileTargets), keyed one file per Environment as
+  # "<namespace>_<name>.json". `optional: true` avoids errors if the
   # ConfigMap does not exist on the first deploy.
   extraVolumes:
     - name: dfaas-targets
