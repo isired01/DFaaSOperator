@@ -49,6 +49,8 @@ state "Environment FSM" as EnvFSM <<EnvRoot>> #A5D6A7 ##[bold]1B5E20 {
 
   state ProvisioningInfra
   ProvisioningInfra : InfrastructureReady=True/InfraReady
+  ProvisioningInfra : prima attende che i Job Ansible di generazioni precedenti siano spariti
+  ProvisioningInfra : (DFaaSNodesReady/K6Ready=Unknown/JobPending)
 
   state ProvisioningMonitoring
   ProvisioningMonitoring : MonitoringReady=True/PodsRunning
@@ -74,30 +76,43 @@ state "Environment FSM" as EnvFSM <<EnvRoot>> #A5D6A7 ##[bold]1B5E20 {
   Ready --> Unreachable : SSH KO dopo healthRetryBudget=3
   Unreachable --> Ready : nodi di nuovo raggiungibili (infra gia' su)
   Unreachable --> ProvisioningInfra : nodi raggiungibili, infra da rifare
-  Ready --> ProvisioningVMs : drift spec.generation
-  Unreachable --> ProvisioningVMs : drift spec.generation
-  Failed --> ProvisioningVMs : drift spec.generation
+  Ready --> ProvisioningVMs : drift metadata.generation
+  Unreachable --> ProvisioningVMs : drift metadata.generation
+  Failed --> ProvisioningVMs : drift metadata.generation
+  ProvisioningVMs --> ProvisioningVMs : drift metadata.generation (la run riparte)
+  ProvisioningInfra --> ProvisioningVMs : drift metadata.generation
+  ProvisioningMonitoring --> ProvisioningVMs : drift metadata.generation
+
+  note bottom of Failed
+    Drift in ogni fase. Ready e Failed (fasi stabili) confrontano
+    observedGeneration con metadata.generation, le altre fasi
+    provisioningGeneration (registrata entrando in ProvisioningVMs).
+    Ready/Failed copiano provisioningGeneration in observedGeneration.
+  end note
 }
 
 ' =====================================================================
 ' LoadTest FSM
 ' Source: internal/controller/loadtest_controller.go +
-'         internal/controller/loadtest_lifecycle.go
+'         internal/controller/loadtest_lifecycle.go +
+'         internal/controller/loadtest_end.go
 ' =====================================================================
 state "LoadTest FSM" as LTFSM <<LTRoot>> #CE93D8 ##[bold]4A148C {
-  [*] --> Pending
+  [*] --> Pending : ammissione (phase ""): ogni test, draft, schedulato o normale
+  [*] --> LTFailed : ammissione: startAt senza suspended | test non-draft su env non Ready | env NotFound
 
   state Pending
   Pending : EnvironmentLinked=True/EnvFound
   Pending : Ready=False/Pending
-  Pending : Queued=False/EnvBusy|QueuedBehind (coda per-Environment)
+  Pending : Queued=True/EnvBusy|QueuedBehind (coda per-Environment)
+  Pending : il dispatch avviene qui (K6Dispatched)
 
   state Running
   Running : K6Dispatched=True/AllDispatched
 
   state Exporting
   Exporting : K6Healthy=True/AllFinished
-  Exporting : MetricsExported=Unknown/ExporterRunning
+  Exporting : MetricsExported=Unknown/ExportCooldown (30 s), poi ExporterRunning
 
   state Completed
   Completed : MetricsExported=True/ExportSucceeded
@@ -105,24 +120,35 @@ state "LoadTest FSM" as LTFSM <<LTRoot>> #CE93D8 ##[bold]4A148C {
 
   state LTFailed <<Error>>
   LTFailed : Failed
-  LTFailed : Ready=False/Failed
+  LTFailed : Ready=False/Failed|DispatchFailed|S3ConfigMissing
 
   state Aborted
   Aborted : MetricsExported=False/Skipped
-  Aborted : Ready=False/Aborted
+Aborted : (da Exporting resta ExportCooldown|ExporterRunning)
+  Aborted : Ready=False/UserAborted
 
-  Pending --> Pending : suspended=true (draft) | startAt>now (Scheduled/ScheduledArmed) | in coda (Queued)
-  Pending --> Running : env Ready AND !suspended AND startAt scaduto AND front di coda
-  Pending --> LTFailed : env NotFound | env Failed
-  Pending --> Aborted : stop=true (abort draft)
+  Pending --> Pending : suspended=true (draft) | startAt>now (Scheduled/ScheduledArmed)\n| in coda (Queued) | env non Ready, nulla applicato\n| barriera sync (SyncReady=False/AwaitingRunners)
+  Pending --> Running : env Ready AND !suspended AND front di coda AND tutti i TestRun applicati (syncStart: dopo il GO)
+  Pending --> LTFailed : dispatchRetryBudget esaurito | env non Ready con TestRun gia' applicati\n| barriera sync fallita (SyncTimeout) | nodeID di perNodeLoad senza generator utilizzabile\n| syncStart senza URL GO raggiungibile dalle VM
+  Pending --> Aborted : stop=true | delete (finalizer)
   Running --> Exporting : tutti TestRun in finished|stopped
-  Running --> LTFailed : TestRun error | dispatchRetryBudget esaurito
-  Running --> Aborted : stop=true
+  Running --> LTFailed : tutti i runner finiti, qualcuno in error | generator inutilizzabile | fetchRetryBudget=15 esaurito
+  Running --> Aborted : stop=true | delete (finalizer)
   Exporting --> Completed : exporter Job Succeeded
   Exporting --> LTFailed : exporter Job Failed | S3ConfigMissing
+  Exporting --> Aborted : delete (finalizer)
   Completed --> [*]
   LTFailed --> [*]
   Aborted --> [*]
+
+  note bottom of LTFailed
+    Ogni fine del test (Completed, Failed, Aborted) passa da endRun: se dei
+    runner possono essere ancora vivi, una sola passata di delete dei TestRun
+    remoti; poi fase e Conditions in una scrittura. env NotFound porta a Failed
+    da ogni fase non terminale. Se il delete fallisce su un generator con un
+    TestRun della run: K6Healthy=False/RunnersUnreclaimed, l'Environment resta
+    occupato (Queued EnvBusy) e il delete viene ritentato ogni 30 s.
+  end note
 }
 
 @enduml
