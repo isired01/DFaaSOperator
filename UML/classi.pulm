@@ -44,18 +44,17 @@ class Environment <<EnvRoot>> #A5D6A7 ##[bold]1B5E20 {
 class EnvironmentSpec {
     + List<EnvironmentNode> nodes
     + Topology topology
-    + bool cleanupOnDelete
     + S3ConfigRef s3ConfigRef
 }
 
 class EnvironmentStatus {
     + EnvironmentPhase phase
     + int64 observedGeneration
+    + int64 provisioningGeneration
     + metav1.Time lastHealthCheck
     + List<K6NodeStatus> k6Nodes
     + List<String> dfaasNodes
     + List<metav1.Condition> conditions
-    + String message
 }
 
 class EnvironmentNode {
@@ -95,6 +94,7 @@ class LoadTestSpec {
     + bool suspended
     + metav1.Time startAt
     + bool stop
+    + bool syncStart
 }
 
 class LoadTestStatus {
@@ -104,7 +104,6 @@ class LoadTestStatus {
     + List<TestRunRef> testRuns
     + String exporterJob
     + List<metav1.Condition> conditions
-    + String message
 }
 
 class PerNodeLoad {
@@ -165,7 +164,6 @@ enum EnvironmentPhase {
     ProvisioningMonitoring
     Ready
     Unreachable
-    Degraded
     Failed
 }
 
@@ -198,6 +196,7 @@ enum BalancingStrategy {
     recalcstrategy
     alllocalstrategy
     rlagentstrategy
+    randomstrategy
 }
 
 enum MetricsExportType {
@@ -226,6 +225,7 @@ enum "LTConditionType <<Conditions>>" as LTConditionType {
     K6Dispatched
     K6Healthy
     MetricsExported
+    SyncReady
 }
 
 ' =====================================================================
@@ -266,7 +266,9 @@ MetricExportEntry -- MetricsExportType
 
 ' =====================================================================
 ' Cross-CRD soft reference (resolved at reconcile time by name,
-' namespace-local; OwnerRef stamped on first successful link).
+' namespace-local; OwnerRef stamped on the first pass after admission,
+' for a scheduled test only when it fires; a test that ends before that
+' gets none and outlives the Environment).
 ' =====================================================================
 LoadTest ..> Environment : targetEnvironment
 
