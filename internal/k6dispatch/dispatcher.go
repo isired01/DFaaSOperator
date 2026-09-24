@@ -128,7 +128,10 @@ func TestRunName(lt *dfaasv1.LoadTest, nodeID string) string {
 	h := fnv.New32a()
 	h.Write([]byte(name))
 	suffix := fmt.Sprintf("-%08x", h.Sum32())
-	return strings.TrimRight(name[:maxTestRunName-len(suffix)], "-") + suffix
+	// A '.' left at the cut would make "<head>.-<hash>" an invalid name: the
+	// gateway admits dotted LoadTest names, and generatedLoadTestName trims
+	// the same two characters at its own cut.
+	return strings.TrimRight(name[:maxTestRunName-len(suffix)], "-.") + suffix
 }
 
 // K6LogConfigMap is the Management cluster ConfigMap holding one Generator's

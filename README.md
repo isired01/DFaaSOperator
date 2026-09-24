@@ -259,9 +259,12 @@ LoadTest stays `Running` (or fails with `SyncTimeout` after 5 min under `syncSta
 from k6-operator v0.0.15, the version the k6 playbook pins (chart `3.7.0`); a test fails if the pin
 moves.
 
-Upgrading from v3.5.0: a test whose TestRun name was over 51 bytes and is still `Running` at the
-upgrade goes `Failed` after about 150 s with "TestRun not found", and keeps the old name in
-`status.testRuns`. Its orphaned TestRun has no pods and loads nothing; find it on the generator with
+Upgrading from v3.5.0: a test whose TestRun name was over 51 bytes and that has not ended at the
+upgrade fails once the new operator runs: a plain test after about 150 s with "TestRun not found", a
+`syncStart` test with `SyncTimeout` at its original 5-minute deadline. It keeps the old name in
+`status.testRuns`. Its `K6Healthy` Condition then reads `RunnersReclaimed`, which is wrong: the run
+end looked only for the new name, so the old TestRun is still on the generator. It has no pods and
+loads nothing, and deleting the LoadTest does not remove it. Find it on the generator with
 `kubectl -n default get testrun -l dfaas.io/loadtest-name=<lt>` and delete it.
 
 ## 🧩 Components
