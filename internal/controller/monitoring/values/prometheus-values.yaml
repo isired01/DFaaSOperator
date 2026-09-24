@@ -11,15 +11,18 @@ kube-state-metrics:
 prometheus-pushgateway:
   enabled: false
 
-# configmap-reload sidecar (bundled with the chart). Watches the ConfigMap
-# mounts and calls POST http://localhost:9090/-/reload when the filesystem
-# changes → hot-reload without restarting the pod.
+# configmap-reload sidecar (bundled with the chart). It watches only
+# /etc/config, the chart's own prometheus.yml, and calls
+# POST http://localhost:9090/-/reload when that file changes: a change to the
+# Prometheus config (the retention block below included) never restarts the
+# pod. The file_sd mount below is inert, since without extraVolumeDirs the
+# sidecar does not watch it; Prometheus picks up the operator's target files
+# on its own (file_sd watches the directory, refresh_interval is the fallback).
+# ponytail: drop this mount with the next change that restarts the pod anyway;
+# removing it on its own would restart the shared Prometheus for nothing.
 configmapReload:
   prometheus:
     enabled: true
-    # Extends the watch to the file-based service-discovery dir:
-    # when the operator updates the prometheus-targets ConfigMap, the mounted
-    # JSON file changes and the reloader notifies Prometheus.
     extraVolumeMounts:
       - name: dfaas-targets
         mountPath: /etc/prometheus/file_sd
@@ -48,12 +51,22 @@ server:
   # a restart or a night was enough to make a finished test unreviewable in
   # Grafana, and the exported CSVs are the analysis path, not the dashboard.
   # The federation below pulls every series of every worker, so 7d can fill
-  # 20Gi sooner than expected — Prometheus then drops its oldest blocks on its
-  # own; raise the size rather than the retention if that starts to bite.
+  # 20Gi. The size limit in tsdb.retention makes Prometheus delete its oldest
+  # blocks first instead of failing writes on a full volume. It lives in
+  # prometheus.yml, which the sidecar hot-reloads, so changing it never
+  # restarts Prometheus; server.retention stays because removing the flag
+  # brings back the chart default as a flag, which does. tsdb.retention.time
+  # repeats 7d because a retention block without time disables time-based
+  # retention. 16GB is 16GiB, 80% of the volume: the size counts the WAL and
+  # head chunks, and compaction needs room for a temporary block.
   persistentVolume:
     enabled: true
     size: 20Gi
   retention: "7d"
+  tsdb:
+    retention:
+      time: 7d
+      size: 16GB
   service:
     type: NodePort
     servicePort: 9090
