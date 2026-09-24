@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"sort"
 	"strings"
@@ -106,9 +107,36 @@ var TestRunGVK = schema.GroupVersionKind{
 	Kind:    "TestRun",
 }
 
+// maxTestRunName bounds a remote TestRun name. k6-operator names its Jobs
+// after the TestRun, the longest being <testrun>-initializer, and Kubernetes
+// copies a Job's name into the 63-byte job-name pod label: past this length
+// the initializer CREATE fails and the TestRun waits for its pod forever.
+// Suffix read off k6-operator v0.0.15, the version chart 3.7.0 installs
+// (setup-k6-nodes.yml; TestK6ChartVersionIsPinned holds the two together).
+const maxTestRunName = 63 - len("-initializer")
+
 // TestRunName is the deterministic remote TestRun name for lt on nodeID.
+// k6-operator uses "<testrun>-<n>" as the runner pod's hostname, a DNS-1123
+// label, so the LoadTest name goes through Sanitize like the nodeID: the
+// gateway admits dotted names, and a dot would leave the TestRun at stage
+// "initialized" forever. A name that needs no change and fits maxTestRunName
+// is returned as is, so every name an older release ran still resolves. Any
+// other name keeps its head and ends in the fnv32a hash of the unmapped name:
+// that keeps "exp.1" apart from "exp-1", and two generated LoadTest names
+// (trailing nonce) or two nodeIDs apart when the cut drops where they differ.
 func TestRunName(lt *dfaasv1.LoadTest, nodeID string) string {
-	return fmt.Sprintf("%s-%s", lt.Name, Sanitize(nodeID))
+	raw := fmt.Sprintf("%s-%s", lt.Name, Sanitize(nodeID))
+	name := fmt.Sprintf("%s-%s", Sanitize(lt.Name), Sanitize(nodeID))
+	if name == raw && len(name) <= maxTestRunName {
+		return name
+	}
+	h := fnv.New32a()
+	h.Write([]byte(raw))
+	suffix := fmt.Sprintf("-%08x", h.Sum32())
+	if len(name) > maxTestRunName-len(suffix) {
+		name = name[:maxTestRunName-len(suffix)]
+	}
+	return strings.TrimRight(name, "-") + suffix
 }
 
 // K6LogConfigMap is the Management cluster ConfigMap holding one Generator's
