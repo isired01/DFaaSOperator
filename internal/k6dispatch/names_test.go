@@ -11,10 +11,14 @@ You may obtain a copy of the License at
 package k6dispatch
 
 import (
+	"os"
 	"reflect"
+	"regexp"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	dfaasv1 "dfaas-operator/api/v1"
 )
@@ -122,5 +126,62 @@ func TestTargetNodeIDsIsStable(t *testing.T) {
 		if got := TargetNodeIDs(l); !reflect.DeepEqual(got, first) {
 			t.Fatalf("order changed between calls: %v then %v", first, got)
 		}
+	}
+}
+
+// k6-operator derives its Job names from the TestRun name, and Kubernetes
+// copies a Job's name into the 63-byte job-name pod label. The longest derived
+// name is <testrun>-initializer: past 51 bytes its CREATE fails and the TestRun
+// polls for an initializer pod forever, so the LoadTest stays Running. The
+// gateway caps the LoadTest name at 63 and a nodeID can be 63 too.
+func TestTestRunNameFitsK6OperatorJobNames(t *testing.T) {
+	// Short names are untouched: every remote call recomputes the name, so a
+	// name v3.5.0 dispatched must stay identical.
+	if got := TestRunName(lt("lt", nil, nil), "gen-a"); got != "lt-gen-a" {
+		t.Errorf("short name = %q, want lt-gen-a unchanged", got)
+	}
+
+	ltName := strings.Repeat("l", 62) + "a"
+	nodeID := strings.Repeat("n", 62) + "a"
+	got := TestRunName(lt(ltName, nil, nil), nodeID)
+	if len(got) > 51 {
+		t.Errorf("bounded name is %d bytes, want <= 51: %s", len(got), got)
+	}
+	if errs := validation.IsDNS1123Label(got); len(errs) > 0 {
+		t.Errorf("bounded name %q is not a DNS-1123 label: %v", got, errs)
+	}
+	if n := len(got + "-initializer"); n > 63 {
+		t.Errorf("initializer Job name is %d bytes, want <= 63", n)
+	}
+	if again := TestRunName(lt(ltName, nil, nil), nodeID); again != got {
+		t.Errorf("not deterministic: %q then %q", got, again)
+	}
+
+	// The uniqueness is in the part that gets cut: generated LoadTest names
+	// differ only in their trailing nonce, and nodeIDs in their tail.
+	otherLT := strings.Repeat("l", 62) + "b"
+	if TestRunName(lt(otherLT, nil, nil), nodeID) == got {
+		t.Error("LoadTest names differing only at the end collide")
+	}
+	otherNode := strings.Repeat("n", 62) + "b"
+	if TestRunName(lt(ltName, nil, nil), otherNode) == got {
+		t.Error("nodeIDs differing only at the end collide")
+	}
+}
+
+// maxTestRunName is k6-operator's longest derived suffix, read off the version
+// the k6 playbook installs. A chart bump can change that suffix.
+func TestK6ChartVersionIsPinned(t *testing.T) {
+	raw, err := os.ReadFile("../controller/ansible/templates/setup-k6-nodes.yml")
+	if err != nil {
+		t.Fatalf("read k6 playbook: %v", err)
+	}
+	m := regexp.MustCompile(`k6_chart_version:\s*"([^"]+)"`).FindSubmatch(raw)
+	if m == nil {
+		t.Fatal("k6_chart_version not found in setup-k6-nodes.yml")
+	}
+	if got := string(m[1]); got != "3.7.0" {
+		t.Errorf("k6_chart_version = %q, want 3.7.0: recheck k6-operator's longest derived "+
+			"name suffix (maxTestRunName in dispatcher.go) before changing the chart", got)
 	}
 }

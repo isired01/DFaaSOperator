@@ -250,6 +250,20 @@ spec.template.labels: Invalid value: "…": must be no more than 63 bytes
 and the reconciler retries it forever — no terminal state, no event, just a LoadTest wedged in
 `Exporting`. A 41-character LoadTest name was enough to trigger it.
 
+The remote k6 TestRun is named `<loadtest>-<sanitized nodeID>` (`k6dispatch.TestRunName`), and
+k6-operator derives its own Job names from it; the longest, `<testrun>-initializer`, hits the same
+label limit. So the TestRun name is capped at **51 bytes**: a longer one keeps its head and ends in
+an 8-hex-digit hash of the full name, and a shorter one is left exactly as before. Past that bound
+the initializer CREATE fails on the generator and the TestRun waits for its pod forever, so the
+LoadTest stays `Running` (or fails with `SyncTimeout` after 5 min under `syncStart`). The 51 comes
+from k6-operator v0.0.15, the version the k6 playbook pins (chart `3.7.0`); a test fails if the pin
+moves.
+
+Upgrading from v3.5.0: a test whose TestRun name was over 51 bytes and is still `Running` at the
+upgrade goes `Failed` after about 150 s with "TestRun not found", and keeps the old name in
+`status.testRuns`. Its orphaned TestRun has no pods and loads nothing; find it on the generator with
+`kubectl -n default get testrun -l dfaas.io/loadtest-name=<lt>` and delete it.
+
 ## 🧩 Components
 
 | Component                                             | Path                                     | Image                                                                        |
