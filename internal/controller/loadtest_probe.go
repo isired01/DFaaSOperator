@@ -103,9 +103,16 @@ func (r *LoadTestReconciler) collectProbes(ctx context.Context, lt *dfaasv1.Load
 	// only name fewer generators. The probe Pods are the verdict's only
 	// record, so a warning that did not land keeps them for the next pass.
 	if len(failed) > 0 && c.Reason != dfaasv1.LTReasonDispatchedUnreachable {
-		msg := fmt.Sprintf("dispatched %d remote TestRun(s), but %d generator(s) cannot reach the filer the runners report to: %s. "+
-			"The GO signal and the end-of-test summaries will not reach them; DFAAS_SYNC_PUBLIC_URL must be an address every generator can reach.",
-			len(lt.Status.TestRuns), len(failed), strings.Join(failed, "; "))
+		// Shown verbatim in the UI's conditions panel. The runners talk to the
+		// filer, not the other way round, and only a syncStart runner fetches
+		// the GO signal.
+		cannot := "upload the end-of-test summaries"
+		if lt.Spec.SyncStart {
+			cannot = "fetch the GO signal or upload the end-of-test summaries"
+		}
+		msg := fmt.Sprintf("dispatched %d remote TestRun(s), but %d generator(s) cannot reach the SeaweedFS filer: %s. "+
+			"Their runners cannot %s. DFAAS_SYNC_PUBLIC_URL must be an address every generator can reach.",
+			len(lt.Status.TestRuns), len(failed), strings.Join(failed, "; "), cannot)
 		if err := r.condErr(ctx, lt, dfaasv1.LTCondK6Dispatched, metav1.ConditionTrue,
 			dfaasv1.LTReasonDispatchedUnreachable, msg); err != nil {
 			logger.Error(err, "filer reachability warning not stored; probe Pods kept for the next pass")

@@ -394,6 +394,11 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(c.Message).To(ContainSubstring(channel.SummaryURL(fresh, "gen-a")))
 			Expect(c.Message).To(ContainSubstring("Connection timed out"))
 			Expect(c.Message).NotTo(ContainSubstring("gen-b"))
+			// The runners upload to the filer; a plain test has no GO signal
+			// for them to fetch, so the warning must not name one.
+			Expect(c.Message).To(ContainSubstring("cannot upload the end-of-test summaries"))
+			Expect(c.Message).NotTo(ContainSubstring("GO signal"))
+			Expect(c.Message).To(ContainSubstring("DFAAS_SYNC_PUBLIC_URL must be an address every generator can reach"))
 			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
 			Expect(fleet.ProbeExists("gen-a", fresh)).To(BeFalse())
 			Expect(fleet.ProbeExists("gen-b", fresh)).To(BeFalse())
@@ -505,6 +510,8 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			fresh := reconcileUntil(lt, 4, func(*dfaasv1.LoadTest) bool { return false }) // more barrier polls
 			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Reason).To(Equal(dfaasv1.LTReasonDispatchedUnreachable))
 			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Status).To(Equal(metav1.ConditionTrue))
+			// Only a syncStart runner fetches the GO signal from the filer.
+			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Message).To(ContainSubstring("cannot fetch the GO signal"))
 		})
 
 		It("a stale probe Pod is deleted before the TestRun is applied", func() {
