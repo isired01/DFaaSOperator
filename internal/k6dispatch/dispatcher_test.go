@@ -92,3 +92,17 @@ func TestSanitize(t *testing.T) {
 		t.Errorf("Sanitize = %q", got)
 	}
 }
+
+// The remote script copy carries the UID of the LoadTest that mirrored it, so
+// DeleteScript can tell its own copy from one a later test re-mirrored under
+// the same name.
+func TestMirrorConfigMapLabelsTheOwningLoadTest(t *testing.T) {
+	l := lt("lt", []string{"gen-a"}, nil)
+	l.UID = "uid-1"
+	src := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "script", Namespace: "default"},
+		Data: map[string]string{"script.js": "x"}}
+	got := mirrorConfigMap(l, src)
+	if got.Labels[ScriptOwnerLabel] != "uid-1" || got.Name != "script" || got.Data["script.js"] != "x" {
+		t.Errorf("mirror = %+v", got)
+	}
+}

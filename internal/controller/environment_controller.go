@@ -12,6 +12,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -57,6 +58,18 @@ type EnvironmentReconciler struct {
 	// Monitoring is the Helm monitoring stack. Nil-safe: monitoring() falls
 	// back to a real &monitoring.Manager{}, which performs real Helm installs.
 	Monitoring monitoring.Stack
+	// now is the clock the deletion drain budget runs on; nil means time.Now.
+	// Tests move it forward, since the API server will not backdate a
+	// DeletionTimestamp.
+	now func() time.Time
+}
+
+// clock is the nil-safe accessor for now.
+func (r *EnvironmentReconciler) clock() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
 }
 
 // monitoringStack is the nil-safe accessor for Monitoring.
@@ -118,6 +131,12 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	if env.Status.Phase == dfaasv1.EnvReady &&
 		env.Status.ObservedGeneration == env.Generation {
+		// Re-assert this Environment's Prometheus target file on every Ready
+		// tick: the write at the end of provisioning is best-effort, and a
+		// legacy "<name>.json" key from before the namespaced key migrates
+		// here. ReconcileTargets writes nothing when the file is current.
+		logStatusErr(ctx, "reconcile Prometheus targets", r.monitoringStack().ReconcileTargets(ctx, &env))
+
 		// No longer idle while Ready: run a periodic SSH liveness probe so a
 		// node that dies after provisioning is noticed instead of only
 		// surfacing when a test fails against it.

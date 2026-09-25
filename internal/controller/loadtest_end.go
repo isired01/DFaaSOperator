@@ -116,7 +116,8 @@ func dispatchBegan(lt *dfaasv1.LoadTest) bool {
 
 // runnersMayBeLive reports whether lt may still have k6 runners generating
 // load. Runners already observed done are not deleted, so their remote logs
-// survive AllFailed, PartialFailure and every Exporting exit.
+// survive AllFailed, PartialFailure and every Exporting exit — until the
+// LoadTest is deleted, directly or with its Environment.
 func runnersMayBeLive(lt *dfaasv1.LoadTest) bool {
 	if !dispatchBegan(lt) || lt.Status.Phase == dfaasv1.LoadTestExporting {
 		return false
@@ -259,9 +260,16 @@ func (r *LoadTestReconciler) sweepFilerObjects(ctx context.Context, lt *dfaasv1.
 // terminal test.
 func endRestamps(lt *dfaasv1.LoadTest, p dfaasv1.LoadTestPhase, endReason string) []statuswriter.Cond {
 	var out []statuswriter.Cond
-	if p != dfaasv1.LoadTestCompleted && lt.Status.Phase != dfaasv1.LoadTestExporting {
+	if p != dfaasv1.LoadTestCompleted {
+		msg := "no exporter ran — the test ended before its metrics export"
+		if c := meta.FindStatusCondition(lt.Status.Conditions, dfaasv1.LTCondMetricsExported); c != nil &&
+			c.Reason == dfaasv1.LTReasonExporterRunning {
+			// Only a deletion aborts a test in Exporting; the exporter Job goes
+			// with the LoadTest, possibly mid-upload.
+			msg = "the exporter Job was stopped before it finished — S3 may hold a partial export"
+		}
 		out = append(out, statuswriter.Cond{Type: dfaasv1.LTCondMetricsExported, Status: metav1.ConditionFalse,
-			Reason: dfaasv1.LTReasonExportSkipped, Message: "no exporter ran — the test ended before its metrics export"})
+			Reason: dfaasv1.LTReasonExportSkipped, Message: msg})
 	}
 	if c := meta.FindStatusCondition(lt.Status.Conditions, dfaasv1.LTCondSyncReady); c != nil &&
 		c.Reason == dfaasv1.LTReasonAwaitingRunners {

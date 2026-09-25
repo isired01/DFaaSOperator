@@ -44,7 +44,10 @@ func (r *LoadTestReconciler) abortLoadTest(ctx context.Context,
 //  3. Ended: poll every target generator, deleting what is still there, and
 //     release once all report NotFound. A generator that cannot answer holds
 //     the release for at most deletionReclaimBudget from DeletionTimestamp;
-//     after that the unconfirmed generators are logged and the CR goes.
+//     after that the unconfirmed generators are logged and the CR goes —
+//     except a RunnersUnreclaimed test (at most one per Environment, since
+//     Occupancy holds it there), which still gets one last Delete pass below
+//     before that same budget releases it.
 //
 // Completed and Failed records are never rewritten, and a test that never
 // dispatched makes no remote call.
@@ -80,6 +83,23 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 	}
 
 	if dispatchBegan(lt) {
+		// Past the budget, release without another remote call — except a
+		// RunnersUnreclaimed test, which falls through to the normal pass
+		// below instead: releasing it with no Delete attempt would leave its
+		// runner free to keep loading the DFaaS nodes while Occupancy frees
+		// the Environment for the next test. At most one such test exists
+		// per Environment (Occupancy holds it), so this costs at most one
+		// extra pass. The post-poll budget branch below still releases it
+		// once that pass is done. With one LoadTest worker, a dead generator
+		// otherwise costs remoteRequestTimeout per Stage, and an Environment
+		// deletion drains every dispatched test at once: this caps the worst
+		// case at deletionReclaimBudget for every other test.
+		if time.Since(lt.DeletionTimestamp.Time) >= deletionReclaimBudget && !runnersUnreclaimed(lt) {
+			logger.Info("deletion budget spent — releasing with remote TestRuns unconfirmed")
+			r.sweepFilerObjects(ctx, lt, "loadtest deletion")
+			return ctrl.Result{}, r.removeLTFinalizer(ctx, lt)
+		}
+
 		var pending, errored []string
 		for _, nodeID := range k6dispatch.TargetNodeIDs(lt) {
 			node, nerr := r.Dispatcher.Node(ctx, &env, nodeID)
@@ -89,6 +109,14 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 			_, serr := node.Stage(ctx, lt)
 			switch {
 			case errors.Is(serr, k6dispatch.ErrNotFound):
+				// The TestRun is gone; its mirrored script is the last remote
+				// object this test left on the node.
+				for _, pn := range lt.Spec.PerNodeLoad {
+					if pn.NodeID == nodeID {
+						logStatusErr(ctx, "delete remote script ConfigMap (loadtest deletion)",
+							node.DeleteScript(ctx, lt, pn.ScriptConfigMap.Name))
+					}
+				}
 			case serr != nil:
 				logger.Error(serr, "remote TestRun NotFound-poll errored", "node", nodeID)
 				errored = append(errored, nodeID)

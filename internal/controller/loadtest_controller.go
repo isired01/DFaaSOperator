@@ -143,6 +143,23 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
+	// OwnerReference Environment → LoadTest, on the first pass that finds the
+	// Environment. It must come before the scheduled branch (all three of its
+	// arms return) and before the deleting-Environment hold, so every test
+	// that ever found its Environment is drained by the Environment finalizer
+	// and cascade-deleted with it: draft, armed, delayed, failed at admission,
+	// created while the Environment is being deleted. lt is still fresh here;
+	// after the EnvironmentLinked write below this Update would conflict.
+	if !hasOwnerRef(&lt, &env) {
+		if err := controllerutil.SetOwnerReference(&env, &lt, r.Scheme); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.Update(ctx, &lt); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// P9: env exists — stamp EnvironmentLinked.
 	switch env.Status.Phase {
 	case dfaasv1.EnvFailed:
@@ -166,9 +183,8 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// An Environment being deleted dispatches nothing new: its finalizer is
-	// draining the tests it owns before it prunes their kubeconfig Secrets.
-	// ponytail: a test created meanwhile never gets an OwnerRef and ends
-	// Failed/EnvNotFound once the Environment is gone.
+	// draining the tests it owns (every test that reached this line is owned)
+	// before it prunes their kubeconfig Secrets.
 	if !env.DeletionTimestamp.IsZero() && lt.Status.Phase.PreExecution() {
 		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 	}
@@ -235,17 +251,6 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				"schedule fired at "+fireT.UTC().Format(time.RFC3339))
 			return ctrl.Result{Requeue: true}, nil
 		}
-	}
-
-	// OwnerReference Environment → LoadTest.
-	if !hasOwnerRef(&lt, &env) {
-		if err := controllerutil.SetOwnerReference(&env, &lt, r.Scheme); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.Update(ctx, &lt); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Run-once guard + suspended gate.

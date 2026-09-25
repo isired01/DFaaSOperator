@@ -25,11 +25,32 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 )
 
-// ReconcileTargets writes one JSON file per Environment into the shared
-// `prometheus-targets` ConfigMap in the `monitoring` namespace. Prometheus
-// re-reads /etc/prometheus/file_sd/*.json every refresh_interval (30s — see
-// values/prometheus-values.yaml), so no reload is required when targets
-// change.
+const (
+	targetsConfigMap = "prometheus-targets"
+	targetsNamespace = "monitoring"
+)
+
+// targetsKey is the Environment's file in the shared ConfigMap. Environment is
+// namespaced, so the key carries the namespace: "<namespace>_<name>.json".
+// '_' appears in neither a namespace (DNS-1123 label) nor a name (DNS-1123
+// subdomain), so the key is unambiguous and never equals a legacy key.
+func targetsKey(env *dfaasv1.Environment) string {
+	return env.Namespace + "_" + env.Name + ".json"
+}
+
+// legacyTargetsKey is the key before the namespace was added. It is deleted
+// unconditionally: its JSON has no namespace, so ownership cannot be proven,
+// and a same-named Environment elsewhere rewrites its own key on its next
+// Ready tick (EnvironmentReconciler.Reconcile).
+func legacyTargetsKey(env *dfaasv1.Environment) string {
+	return env.Name + ".json"
+}
+
+// ReconcileTargets writes one JSON file per Environment, keyed
+// `<namespace>_<name>.json`, into the shared `prometheus-targets` ConfigMap in
+// the `monitoring` namespace. Prometheus re-reads /etc/prometheus/file_sd/*.json
+// every refresh_interval (30s — see values/prometheus-values.yaml), so no
+// reload is required when targets change.
 //
 // Only dfaas-worker nodes are scraped — k6-load-generator nodes run their own
 // k3s and are not part of the operator-cluster monitoring.
@@ -60,8 +81,9 @@ func (m *Manager) ReconcileTargets(ctx context.Context, env *dfaasv1.Environment
 		return err
 	}
 
-	cmKey := client.ObjectKey{Name: "prometheus-targets", Namespace: "monitoring"}
-	fileName := env.Name + ".json"
+	cmKey := client.ObjectKey{Name: targetsConfigMap, Namespace: targetsNamespace}
+	key, legacy := targetsKey(env), legacyTargetsKey(env)
+	wrote := false
 
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		cm := &corev1.ConfigMap{}
@@ -89,26 +111,35 @@ func (m *Manager) ReconcileTargets(ctx context.Context, env *dfaasv1.Environment
 		if cm.Data == nil {
 			cm.Data = make(map[string]string)
 		}
-		cm.Data[fileName] = string(jsonData)
+		_, hasLegacy := cm.Data[legacy]
+		if cm.Data[key] == string(jsonData) && !hasLegacy {
+			wrote = false
+			return nil
+		}
+		cm.Data[key] = string(jsonData)
+		delete(cm.Data, legacy)
+		wrote = true
 		return m.Update(ctx, cm)
 	}); err != nil {
 		logger.Error(err, "unable to update prometheus-targets ConfigMap")
 		return err
 	}
-	logger.Info("prometheus targets reconciled", "file", fileName)
+	if wrote {
+		logger.Info("prometheus targets reconciled", "file", key)
+	}
 	return nil
 }
 
-// CleanupTargets removes the per-environment file from the shared
-// `prometheus-targets` ConfigMap. Same conflict retry as ReconcileTargets: the
-// ConfigMap is cross-environment, so a concurrent reconcile must not turn a
-// deletion cleanup into a lost update (the Environment finalizer blocks on the
-// returned error).
+// CleanupTargets removes the per-environment file, keyed
+// `<namespace>_<name>.json`, from the shared `prometheus-targets` ConfigMap.
+// Same conflict retry as ReconcileTargets: the ConfigMap is cross-environment,
+// so a concurrent reconcile must not turn a deletion cleanup into a lost
+// update (the Environment finalizer blocks on the returned error).
 func (m *Manager) CleanupTargets(ctx context.Context, env *dfaasv1.Environment) error {
 	logger := log.FromContext(ctx)
 
-	cmKey := client.ObjectKey{Name: "prometheus-targets", Namespace: "monitoring"}
-	fileName := env.Name + ".json"
+	cmKey := client.ObjectKey{Name: targetsConfigMap, Namespace: targetsNamespace}
+	key, legacy := targetsKey(env), legacyTargetsKey(env)
 
 	removed := false
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -117,10 +148,13 @@ func (m *Manager) CleanupTargets(ctx context.Context, env *dfaasv1.Environment) 
 		if gerr := m.Get(ctx, cmKey, cm); gerr != nil {
 			return client.IgnoreNotFound(gerr)
 		}
-		if _, exists := cm.Data[fileName]; !exists {
+		_, hasKey := cm.Data[key]
+		_, hasLegacy := cm.Data[legacy]
+		if !hasKey && !hasLegacy {
 			return nil
 		}
-		delete(cm.Data, fileName)
+		delete(cm.Data, key)
+		delete(cm.Data, legacy)
 		if uerr := m.Update(ctx, cm); uerr != nil {
 			return uerr
 		}
@@ -131,7 +165,7 @@ func (m *Manager) CleanupTargets(ctx context.Context, env *dfaasv1.Environment) 
 		return err
 	}
 	if removed {
-		logger.Info("prometheus targets removed", "file", fileName)
+		logger.Info("prometheus targets removed", "file", key)
 	}
 	return nil
 }
