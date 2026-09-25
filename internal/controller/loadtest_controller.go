@@ -609,7 +609,7 @@ func (r *LoadTestReconciler) endOnEnvironmentLost(ctx context.Context,
 		env.Name, env.Status.Phase)
 	var conds []statuswriter.Cond
 	if lt.Spec.SyncStart {
-		msg += probeNote(lt)
+		msg += probeNote(&fresh)
 		conds = append(conds, statuswriter.Cond{Type: dfaasv1.LTCondSyncReady, Status: metav1.ConditionFalse,
 			Reason: dfaasv1.LTReasonSyncTimeout, Message: msg})
 	}

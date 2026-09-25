@@ -21,6 +21,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -547,6 +548,90 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(cond(fresh, dfaasv1.LTCondSyncReady).Message).NotTo(ContainSubstring("at dispatch"))
 		})
 
+		// collectProbes stamps the DispatchedUnreachable warning through condErr,
+		// which re-Gets a separate object inside the status writer -- it never
+		// mutates the lt pointer awaitSyncBarrier itself holds. If a fail()
+		// trigger that does not depend on syncWaitBudget (a runner reporting
+		// stage=error) fires on the very same tick the probe verdict first
+		// settles unreachable, probeNote(lt) must still see the warning that
+		// landed moments earlier in the same pass.
+		It("a probe warning landing on the same tick as an unrelated failure still names it", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			waiting := reconcileUntil(lt, 10, awaiting)
+			// Both land before the reconciler ever reads either: the probe
+			// verdict (unread until this pass) and a runner error (independent
+			// of the probe and of syncWaitBudget).
+			fleet.SetProbe("gen-a", waiting, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeUnreachable, Detail: "download timed out"})
+			fleet.SetStage("gen-a", waiting, "error")
+			fresh := reconcileUntil(lt, 3, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Reason).To(Equal(dfaasv1.LTReasonDispatchedUnreachable))
+			s := cond(fresh, dfaasv1.LTCondSyncReady)
+			Expect(s.Reason).To(Equal(dfaasv1.LTReasonSyncTimeout))
+			Expect(s.Message).To(ContainSubstring("download timed out"))
+		})
+
+		// endOnEnvironmentLost re-Gets the LoadTest into fresh specifically
+		// because the reconciler's own lt (fetched once at the top of Reconcile)
+		// can be stale -- an informer cache lag in production. probeNote must
+		// read fresh, not lt, or the note this function exists to add is lost
+		// exactly when the caller's copy predates the probe's stamp.
+		It("endOnEnvironmentLost names the probe from a fresh copy, not the reconcile's stale one", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			waiting := reconcileUntil(lt, 10, awaiting)
+
+			// A snapshot from before the probe warning landed -- standing in for
+			// the caller's copy of lt, which Reconcile fetches once at the top
+			// and never refreshes itself.
+			var stale dfaasv1.LoadTest
+			Expect(k8sClient.Get(ctx, keyOf(lt), &stale)).To(Succeed())
+
+			fleet.SetProbe("gen-a", waiting, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeUnreachable, Detail: "download timed out"})
+			reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool {
+				return cond(l, dfaasv1.LTCondK6Dispatched).Reason == dfaasv1.LTReasonDispatchedUnreachable
+			})
+
+			// The Environment stops being Dispatchable while the test still
+			// holds on the barrier with TestRuns recorded -- endOnEnvironmentLost's
+			// own branch.
+			var env dfaasv1.Environment
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "env", Namespace: ns}, &env)).To(Succeed())
+			env.Status.Phase = dfaasv1.EnvFailed
+			Expect(k8sClient.Status().Update(ctx, &env)).To(Succeed())
+
+			// Reconcile's own top-level Get returns the pre-warning snapshot
+			// exactly once -- the class of staleness an informer cache lag would
+			// produce in production; every later Get in the same pass (including
+			// endOnEnvironmentLost's own re-Get) sees the real, current object.
+			var served atomic.Bool
+			wc, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme.Scheme})
+			Expect(err).NotTo(HaveOccurred())
+			r.Client = interceptor.NewClient(wc, interceptor.Funcs{
+				Get: func(ictx context.Context, c client.WithWatch, key client.ObjectKey,
+					obj client.Object, opts ...client.GetOption) error {
+					if l, ok := obj.(*dfaasv1.LoadTest); ok && key == keyOf(lt) && served.CompareAndSwap(false, true) {
+						stale.DeepCopyInto(l)
+						return nil
+					}
+					return c.Get(ictx, key, obj, opts...)
+				},
+			})
+
+			fresh := reconcileUntil(lt, 3, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(served.Load()).To(BeTrue(), "the stale copy must have been served exactly once")
+			s := cond(fresh, dfaasv1.LTCondSyncReady)
+			Expect(s.Reason).To(Equal(dfaasv1.LTReasonSyncTimeout))
+			Expect(s.Message).To(ContainSubstring("download timed out"))
+			Expect(cond(fresh, dfaasv1.LTCondReady).Message).To(ContainSubstring("download timed out"))
+		})
+
 		It("the run end deletes a probe Pod nobody read", func() {
 			envReady("env", "gen-a")
 			scriptCM("script")
@@ -571,6 +656,41 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(k8sClient.Delete(ctx, lt)).To(Succeed())
 			Expect(reconcileUntil(lt, 8, func(*dfaasv1.LoadTest) bool { return false })).To(BeNil())
 			Expect(fleet.ProbeExists("gen-a", running)).To(BeFalse())
+		})
+
+		// Neither of the two specs above exercises reclaimProbes: the abort spec
+		// goes through teardownRemoteTestRuns, and the delete spec through the
+		// finalizer's own poll -- both have their own DeleteProbe call. The path
+		// every short run whose probe was never read takes is the ordinary
+		// Exporting -> Completed exit, where endRun's !runnersMayBeLive branch
+		// calls reclaimProbes because the phase itself is already Exporting.
+		It("the run end deletes a probe Pod when an ordinary run reaches Completed", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(fleet.ProbeExists("gen-a", running)).To(BeTrue())
+
+			fleet.SetStage("gen-a", lt, "finished")
+			exporting := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestExporting))
+			Expect(fleet.ProbeExists("gen-a", exporting)).To(BeTrue(),
+				"the probe outlives dispatch: nothing has read or reclaimed it yet")
+
+			// Skip the export cool-down so the exporter Job is created at once.
+			past := metav1.NewTime(exporting.Status.EndTime.Add(-(exportCooldown + time.Minute)))
+			exporting.Status.EndTime = &past
+			Expect(k8sClient.Status().Update(ctx, exporting)).To(Succeed())
+			reconcileUntil(lt, 2, func(*dfaasv1.LoadTest) bool { return false })
+
+			var job batchv1.Job
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ExporterJobName(lt), Namespace: ns}, &job)).To(Succeed())
+			job.Status.Succeeded = 1
+			Expect(k8sClient.Status().Update(ctx, &job)).To(Succeed())
+
+			completed := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestCompleted))
+			Expect(completed.Status.Phase).To(Equal(dfaasv1.LoadTestCompleted))
+			Expect(fleet.ProbeExists("gen-a", completed)).To(BeFalse())
 		})
 	})
 

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -110,6 +111,15 @@ func (r *LoadTestReconciler) collectProbes(ctx context.Context, lt *dfaasv1.Load
 			logger.Error(err, "filer reachability warning not stored; probe Pods kept for the next pass")
 			return
 		}
+		// condErr writes through a separate fresh Get inside the status writer;
+		// it never touches lt itself. Mirror the same stamp onto the caller's
+		// copy so a later read in this same pass (probeNote in awaitSyncBarrier's
+		// fail, or the "first verdict stands" guard above on a second call) sees
+		// it instead of the pre-warning reason.
+		meta.SetStatusCondition(&lt.Status.Conditions, metav1.Condition{
+			Type: dfaasv1.LTCondK6Dispatched, Status: metav1.ConditionTrue,
+			Reason: dfaasv1.LTReasonDispatchedUnreachable, Message: msg,
+		})
 	}
 	for _, ref := range lt.Status.TestRuns {
 		if o, ok := outcomes[ref.NodeID]; ok && o.State != k6dispatch.ProbeAbsent {
@@ -132,13 +142,22 @@ func probeNote(lt *dfaasv1.LoadTest) string {
 // reclaimProbes deletes, best-effort, the probe Pod of every target generator
 // of a run whose runners were already done (the teardown deletes it otherwise).
 func (r *LoadTestReconciler) reclaimProbes(ctx context.Context, lt *dfaasv1.LoadTest) {
+	logger := log.FromContext(ctx)
 	var env dfaasv1.Environment
 	if err := r.Get(ctx, types.NamespacedName{Name: lt.Spec.TargetEnvironment, Namespace: lt.Namespace}, &env); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("environment gone; cannot delete filer reachability probes", "env", lt.Spec.TargetEnvironment)
+		} else {
+			logger.Error(err, "cannot resolve environment to delete filer reachability probes", "env", lt.Spec.TargetEnvironment)
+		}
 		return
 	}
 	for _, nodeID := range k6dispatch.TargetNodeIDs(lt) {
-		if node, err := r.Dispatcher.Node(ctx, &env, nodeID); err == nil {
-			logStatusErr(ctx, "delete filer reachability probe (run end)", node.DeleteProbe(ctx, lt))
+		node, err := r.Dispatcher.Node(ctx, &env, nodeID)
+		if err != nil {
+			logger.Error(err, "cannot resolve generator to delete its filer reachability probe", "node", nodeID)
+			continue
 		}
+		logStatusErr(ctx, "delete filer reachability probe (run end)", node.DeleteProbe(ctx, lt))
 	}
 }
