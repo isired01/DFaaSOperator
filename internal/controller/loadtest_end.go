@@ -88,6 +88,9 @@ func (r *LoadTestReconciler) endRun(ctx context.Context, lt *dfaasv1.LoadTest,
 	}
 	if dispatchBegan(&fresh) {
 		r.sweepFilerObjects(ctx, &fresh, "run end")
+		if !runnersMayBeLive(&fresh) {
+			r.reclaimProbes(ctx, &fresh)
+		}
 	}
 	own = append(own, endRestamps(&fresh, p, endReason)...)
 
@@ -240,6 +243,7 @@ func (r *LoadTestReconciler) teardownRemoteTestRuns(ctx context.Context,
 			rec.fail(applied[nodeID], nodeID, condMessage(err))
 			continue
 		}
+		logStatusErr(ctx, "delete filer reachability probe", node.DeleteProbe(ctx, lt))
 		rec.absent = append(rec.absent, nodeID)
 	}
 	sort.Strings(rec.absent)

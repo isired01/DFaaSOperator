@@ -78,10 +78,11 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 	}
 	rd := r.survey(ctx, lt, env, nodeIDs)
 	fail := func(ready, detail string) (ctrl.Result, error) {
-		logger.Info("sync barrier: aborting all", "cause", detail)
-		return r.failLoadTest(ctx, lt, "synchronized start: "+ready, statuswriter.Cond{
+		note := probeNote(lt)
+		logger.Info("sync barrier: aborting all", "cause", detail+note)
+		return r.failLoadTest(ctx, lt, "synchronized start: "+ready+note, statuswriter.Cond{
 			Type: dfaasv1.LTCondSyncReady, Status: metav1.ConditionFalse,
-			Reason: dfaasv1.LTReasonSyncTimeout, Message: detail})
+			Reason: dfaasv1.LTReasonSyncTimeout, Message: detail + note})
 	}
 
 	// A generator that left the Environment will never report "started": fail

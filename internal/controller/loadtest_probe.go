@@ -18,6 +18,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
@@ -113,6 +114,31 @@ func (r *LoadTestReconciler) collectProbes(ctx context.Context, lt *dfaasv1.Load
 	for _, ref := range lt.Status.TestRuns {
 		if o, ok := outcomes[ref.NodeID]; ok && o.State != k6dispatch.ProbeAbsent {
 			logStatusErr(ctx, "delete filer reachability probe", nodes[ref.NodeID].DeleteProbe(ctx, lt))
+		}
+	}
+}
+
+// probeNote is what a failure message adds when the dispatch-time probe had
+// already found the filer unreachable: the likely cause, for whoever reads
+// only the failure.
+func probeNote(lt *dfaasv1.LoadTest) string {
+	c := meta.FindStatusCondition(lt.Status.Conditions, dfaasv1.LTCondK6Dispatched)
+	if c == nil || c.Reason != dfaasv1.LTReasonDispatchedUnreachable {
+		return ""
+	}
+	return " — at dispatch: " + c.Message
+}
+
+// reclaimProbes deletes, best-effort, the probe Pod of every target generator
+// of a run whose runners were already done (the teardown deletes it otherwise).
+func (r *LoadTestReconciler) reclaimProbes(ctx context.Context, lt *dfaasv1.LoadTest) {
+	var env dfaasv1.Environment
+	if err := r.Get(ctx, types.NamespacedName{Name: lt.Spec.TargetEnvironment, Namespace: lt.Namespace}, &env); err != nil {
+		return
+	}
+	for _, nodeID := range k6dispatch.TargetNodeIDs(lt) {
+		if node, err := r.Dispatcher.Node(ctx, &env, nodeID); err == nil {
+			logStatusErr(ctx, "delete filer reachability probe (run end)", node.DeleteProbe(ctx, lt))
 		}
 	}
 }

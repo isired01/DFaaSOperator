@@ -515,6 +515,63 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
 			Expect(fleet.ProbeURL("gen-a", running)).To(Equal(channel.SummaryURL(running, "gen-a")))
 		})
+
+		It("a SyncTimeout names the failed probe", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			waiting := reconcileUntil(lt, 10, awaiting)
+			fleet.SetProbe("gen-a", waiting, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeUnreachable, Detail: "download timed out"})
+			reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool {
+				return cond(l, dfaasv1.LTCondK6Dispatched).Reason == dfaasv1.LTReasonDispatchedUnreachable
+			})
+			ageDispatched(lt, syncWaitBudget+time.Minute)
+			fresh := reconcileUntil(lt, 3, phaseIs(dfaasv1.LoadTestFailed))
+			s := cond(fresh, dfaasv1.LTCondSyncReady)
+			Expect(s.Reason).To(Equal(dfaasv1.LTReasonSyncTimeout))
+			Expect(s.Message).To(ContainSubstring("download timed out"))
+			Expect(cond(fresh, dfaasv1.LTCondReady).Message).To(ContainSubstring("download timed out"))
+		})
+
+		It("a SyncTimeout without a failed probe says nothing about it", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 10, awaiting)
+			ageDispatched(lt, syncWaitBudget+time.Minute)
+			fresh := reconcileUntil(lt, 3, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(cond(fresh, dfaasv1.LTCondSyncReady).Message).NotTo(ContainSubstring("at dispatch"))
+		})
+
+		It("the run end deletes a probe Pod nobody read", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(fleet.ProbeExists("gen-a", running)).To(BeTrue())
+			_, err := r.abortLoadTest(ctx, running, dfaasv1.LTReasonUserAborted, "stop")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fleet.ProbeExists("gen-a", running)).To(BeFalse())
+		})
+
+		It("deleting the LoadTest deletes its probe Pod", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			running.Status.Phase = dfaasv1.LoadTestCompleted
+			Expect(k8sClient.Status().Update(ctx, running)).To(Succeed())
+			Expect(fleet.ProbeExists("gen-a", running)).To(BeTrue())
+			Expect(k8sClient.Delete(ctx, lt)).To(Succeed())
+			Expect(reconcileUntil(lt, 8, func(*dfaasv1.LoadTest) bool { return false })).To(BeNil())
+			Expect(fleet.ProbeExists("gen-a", running)).To(BeFalse())
+		})
 	})
 
 	Context("ordering guards in Reconcile", func() {
