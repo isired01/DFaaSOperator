@@ -374,6 +374,69 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			}
 		})
 
+		// countOf counts one call in fleet.Calls().
+		countOf := func(call string) int {
+			n := 0
+			for _, c := range fleet.Calls() {
+				if c == call {
+					n++
+				}
+			}
+			return n
+		}
+
+		// Each probe is two remote calls, each building a fresh client: run
+		// between two Applies they would add start skew between the
+		// generators. The TestRuns start as they did before the probe.
+		It("applies every TestRun of the pass before any probe call", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(fleet.Calls()).To(Equal([]string{
+				"apply:gen-a", "apply:gen-b",
+				"probe-delete:gen-a", "probe:gen-a", "probe-delete:gen-b", "probe:gen-b",
+			}))
+		})
+
+		It("a failed Apply starts no probe for that generator while the dispatch retries", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			fleet.FailNext("gen-b", "apply", fmt.Errorf("remote down"))
+			retrying := reconcileUntil(lt, 6, func(l *dfaasv1.LoadTest) bool { return len(l.Status.TestRuns) == 1 })
+			Expect(cond(retrying, dfaasv1.LTCondK6Dispatched).Reason).To(Equal(dfaasv1.LTReasonApplyFailed))
+			Expect(fleet.ProbeExists("gen-b", retrying)).To(BeFalse())
+			Expect(fleet.ProbeExists("gen-a", retrying)).To(BeTrue(), "gen-a was applied in the pass that failed on gen-b")
+
+			running := reconcileUntil(lt, 8, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(running.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+			applied := fleet.Applied()
+			Expect(applied).To(HaveLen(2))
+			Expect(applied[1].NodeID).To(Equal("gen-b"))
+			Expect(fleet.ProbeURL("gen-b", running)).To(Equal(applied[1].Env.SummaryURL))
+			// gen-a's probe was started once; the resume pass left it alone.
+			Expect(countOf("probe:gen-a")).To(Equal(1))
+			Expect(countOf("probe-delete:gen-a")).To(Equal(1))
+		})
+
+		// Here the pass applies gen-a, then fails the test on gen-b (absent from
+		// the Environment): the run end's teardown has already run when the
+		// probes would start, and a probe started after it would outlive the
+		// run it belongs to.
+		It("a pass that ends the run starts no probe for the generator it applied", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			failed := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(failed.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
+			Expect(fleet.Applied()).To(HaveLen(1))
+			Expect(fleet.ProbeExists("gen-a", failed)).To(BeFalse())
+		})
+
 		It("an unreachable filer keeps K6Dispatched True, names generator, URL and error, and deletes the probes", func() {
 			envReady("env", "gen-a", "gen-b")
 			scriptCM("script")
@@ -514,7 +577,7 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Message).To(ContainSubstring("cannot fetch the GO signal"))
 		})
 
-		It("a stale probe Pod is deleted before the TestRun is applied", func() {
+		It("a stale probe Pod is deleted before the new probe starts", func() {
 			envReady("env", "gen-a")
 			scriptCM("script")
 			lt := newLT("lt", "env", "gen-a")

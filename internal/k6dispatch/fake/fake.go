@@ -46,6 +46,7 @@ type Fleet struct {
 	logs     map[string]string
 	probes   map[string]k6dispatch.ProbeOutcome // key(nodeID, lt) → probe verdict
 	failNext map[string]error                   // "<nodeID>|<op>" → error, consumed on first use
+	calls    []string                           // "<op>:<nodeID>", in order (see Calls)
 }
 
 // New returns an empty fleet.
@@ -118,6 +119,16 @@ func (f *Fleet) Mirrored() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.mirrored...)
+}
+
+// Calls returns, in order, every Apply, StartProbe, ProbeResult and
+// DeleteProbe call as "<op>:<nodeID>", op spelled as FailNext names it
+// ("apply", "probe", "probe-read", "probe-delete"). A call that failed is
+// still a call made, so it is recorded too.
+func (f *Fleet) Calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
 }
 
 // Exists reports whether lt's TestRun is present on nodeID.
@@ -206,6 +217,7 @@ func (n *node) DeleteScript(_ context.Context, lt *dfaasv1.LoadTest, name string
 func (n *node) Apply(_ context.Context, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad, env k6dispatch.RunnerEnv) error {
 	n.f.mu.Lock()
 	defer n.f.mu.Unlock()
+	n.f.calls = append(n.f.calls, "apply:"+n.nodeID)
 	if err := n.f.takeFailure(n.nodeID, "apply"); err != nil {
 		return err
 	}
@@ -257,6 +269,7 @@ func (n *node) Logs(_ context.Context, _ *dfaasv1.LoadTest) (string, error) {
 func (n *node) StartProbe(_ context.Context, lt *dfaasv1.LoadTest, url string) error {
 	n.f.mu.Lock()
 	defer n.f.mu.Unlock()
+	n.f.calls = append(n.f.calls, "probe:"+n.nodeID)
 	if err := n.f.takeFailure(n.nodeID, "probe"); err != nil {
 		return err
 	}
@@ -271,6 +284,7 @@ func (n *node) StartProbe(_ context.Context, lt *dfaasv1.LoadTest, url string) e
 func (n *node) ProbeResult(_ context.Context, lt *dfaasv1.LoadTest) (k6dispatch.ProbeOutcome, error) {
 	n.f.mu.Lock()
 	defer n.f.mu.Unlock()
+	n.f.calls = append(n.f.calls, "probe-read:"+n.nodeID)
 	if err := n.f.takeFailure(n.nodeID, "probe-read"); err != nil {
 		return k6dispatch.ProbeOutcome{}, err
 	}
@@ -280,6 +294,7 @@ func (n *node) ProbeResult(_ context.Context, lt *dfaasv1.LoadTest) (k6dispatch.
 func (n *node) DeleteProbe(_ context.Context, lt *dfaasv1.LoadTest) error {
 	n.f.mu.Lock()
 	defer n.f.mu.Unlock()
+	n.f.calls = append(n.f.calls, "probe-delete:"+n.nodeID)
 	if err := n.f.takeFailure(n.nodeID, "probe-delete"); err != nil {
 		return err
 	}

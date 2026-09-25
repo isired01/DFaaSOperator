@@ -117,6 +117,13 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 		dispatched[ref.NodeID] = true
 	}
 
+	// The filer probes start after the Apply loop, never between two Applies:
+	// each is two remote calls, and the TestRuns must start as close together
+	// as they would without a probe. Deferred, so a generator applied in this
+	// pass is probed whichever return the pass takes after it.
+	var probes []probeRequest
+	defer func() { r.startProbes(ctx, lt, probes) }()
+
 	for _, perNode := range lt.Spec.PerNodeLoad {
 		if dispatched[perNode.NodeID] {
 			continue
@@ -126,9 +133,12 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 			return r.failLoadTest(ctx, lt,
 				fmt.Sprintf("perNodeLoad %q on env %q: %v", perNode.NodeID, env.Name, nerr))
 		}
-		if res, stop, err := r.dispatchOne(ctx, lt, node, perNode); stop {
+		// Computed once: the probe must check the URL the runner is given.
+		renv := r.runnerEnv(lt, perNode.NodeID)
+		if res, stop, err := r.dispatchOne(ctx, lt, node, perNode, renv); stop {
 			return res, err
 		}
+		probes = append(probes, probeRequest{node: node, nodeID: perNode.NodeID, url: renv.SummaryURL})
 		// Apply succeeded — record and persist incrementally so a failure later
 		// in the loop leaves the already-dispatched runs visible to observeK6 /
 		// abortLoadTest / the deletion finalizer.
@@ -194,11 +204,12 @@ func (r *LoadTestReconciler) finishDispatch(ctx context.Context,
 }
 
 // dispatchOne runs the mirror → wipe → confirm-gone → apply protocol for lt on
-// one node. stop=true means the caller returns (res, err) as-is: the LoadTest
-// failed, the retry budget spoke, or we wait a tick for the remote delete to
-// propagate. stop=false means the TestRun is applied.
+// one node, applying the TestRun with renv. stop=true means the caller returns
+// (res, err) as-is: the LoadTest failed, the retry budget spoke, or we wait a
+// tick for the remote delete to propagate. stop=false means the TestRun is
+// applied. It makes no probe call: startK6 starts the probes after the loop.
 func (r *LoadTestReconciler) dispatchOne(ctx context.Context, lt *dfaasv1.LoadTest,
-	node k6dispatch.Node, perNode dfaasv1.PerNodeLoad) (res ctrl.Result, stop bool, err error) {
+	node k6dispatch.Node, perNode dfaasv1.PerNodeLoad, renv k6dispatch.RunnerEnv) (res ctrl.Result, stop bool, err error) {
 	logger := log.FromContext(ctx)
 	nodeID := perNode.NodeID
 
@@ -233,8 +244,6 @@ func (r *LoadTestReconciler) dispatchOne(ctx context.Context, lt *dfaasv1.LoadTe
 		res, oerr := r.onDispatchError(ctx, lt, derr, dfaasv1.LTReasonStaleCleanupFailed)
 		return res, true, oerr
 	}
-	// A probe Pod left by a previous run of this name would answer for it.
-	logStatusErr(ctx, "delete stale filer reachability probe", node.DeleteProbe(ctx, lt))
 	_, serr := node.Stage(ctx, lt)
 	switch {
 	case serr == nil:
@@ -246,14 +255,11 @@ func (r *LoadTestReconciler) dispatchOne(ctx context.Context, lt *dfaasv1.LoadTe
 		return res, true, oerr
 	}
 
-	// Computed once: the probe must check the URL the runner is given.
-	renv := r.runnerEnv(lt, nodeID)
 	if aerr := node.Apply(ctx, lt, perNode, renv); aerr != nil {
 		logger.Error(aerr, "remote TestRun apply failed", "node", nodeID)
 		res, oerr := r.onDispatchError(ctx, lt, aerr, dfaasv1.LTReasonApplyFailed)
 		return res, true, oerr
 	}
-	r.startProbe(ctx, lt, node, nodeID, renv.SummaryURL)
 	return ctrl.Result{}, false, nil
 }
 

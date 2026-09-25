@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
@@ -35,8 +36,42 @@ const (
 	probeReadWindow = 2 * time.Minute
 )
 
+// probeRequest is one generator applied in a dispatch pass: its node and the
+// summary URL its TestRun was applied with.
+type probeRequest struct {
+	node   k6dispatch.Node
+	nodeID string
+	url    string
+}
+
+// startProbes wipes a stale probe Pod and starts the probe of every generator
+// applied in this dispatch pass. startK6 runs it after the Apply loop, so no
+// probe call sits between two Applies. A pass that ended the run (a later
+// generator unusable, the dispatch budget spent, the Sync barrier failing)
+// starts none: the run end's teardown has already run, and a probe started
+// after it would outlive the run.
+func (r *LoadTestReconciler) startProbes(ctx context.Context, lt *dfaasv1.LoadTest, reqs []probeRequest) {
+	if len(reqs) == 0 {
+		return
+	}
+	var fresh dfaasv1.LoadTest
+	if err := r.occupancyReader().Get(ctx, client.ObjectKeyFromObject(lt), &fresh); err != nil {
+		log.FromContext(ctx).Error(err, "filer reachability probes not started: cannot tell whether the run is still live")
+		return
+	}
+	if fresh.Status.Phase.Terminal() {
+		log.FromContext(ctx).Info("filer reachability probes not started: the run ended in this pass", "phase", fresh.Status.Phase)
+		return
+	}
+	for _, q := range reqs {
+		// A probe Pod left by a previous run of this name would answer for it.
+		logStatusErr(ctx, "delete stale filer reachability probe", q.node.DeleteProbe(ctx, lt))
+		r.startProbe(ctx, lt, q.node, q.nodeID, q.url)
+	}
+}
+
 // startProbe launches nodeID's reachability probe on url, the summary URL the
-// TestRun was just applied with, never a recomputed one. Best-effort: a probe
+// TestRun was applied with, never a recomputed one. Best-effort: a probe
 // that cannot start is the operator log's business, never the test's.
 func (r *LoadTestReconciler) startProbe(ctx context.Context, lt *dfaasv1.LoadTest,
 	node k6dispatch.Node, nodeID, url string) {
