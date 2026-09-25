@@ -40,25 +40,36 @@ const monitoringAttemptsAnnotation = "dfaas.dfaas.io/monitoring-attempts"
 // tolerated before the Environment is moved to EnvFailed (P4).
 const monitoringRetryBudget = 5
 
-// envDrainBudget bounds how long the Environment finalizer waits for the
-// LoadTests it drains. Each LoadTest finalizer gives up remote calls after
-// deletionReclaimBudget; the extra minute covers its last passes. Past it the
-// Environment prunes its targets and Secrets anyway.
+// envDrainBudget bounds how long the Environment finalizer waits for each
+// LoadTest it drains, counted from that test's own DeletionTimestamp: a first
+// pass that runs late (operator down when the Environment was deleted) still
+// waits for the tests it deletes. Each LoadTest finalizer gives up remote
+// calls after deletionReclaimBudget; the extra minute covers its last passes.
+// Past it the Environment prunes its targets and Secrets anyway.
 const envDrainBudget = deletionReclaimBudget + time.Minute
 
-// handleEnvDeletion drains the LoadTests this Environment owns, then
+// handleEnvDeletion drains the LoadTests that target this Environment, then
 // per-environment cluster-wide state (Prometheus targets, kubeconfig
 // Secrets) and removes the finalizer. Per-environment Jobs and ConfigMaps
 // carry ControllerReferences and are garbage-collected automatically.
 //
-// The drain deletes every owned LoadTest that is live, unreclaimed, or
-// dispatched — finished ones included, since their TestRuns stay on the
-// generators until the LoadTest's own finalizer deletes them — and waits
-// until each is gone, at most envDrainBudget; past it the Environment
-// prunes its targets and Secrets with those LoadTests still finalizing.
-// --cascade=orphan keeps finished tests out of the drain; --cascade=foreground
-// still defeats the ordering below by letting GC delete the kubeconfig
-// Secrets in parallel (keep that ponytail).
+// The drain deletes every LoadTest that targets the Environment and is live,
+// unreclaimed, or dispatched — finished ones included, since their TestRuns
+// stay on the generators until the LoadTest's own finalizer deletes them —
+// and waits until each is gone, at most envDrainBudget from its own deletion;
+// past it the Environment prunes its targets and Secrets with those LoadTests
+// still finalizing. Candidates are picked by spec.targetEnvironment, not by
+// ownerRef: under --cascade=orphan the garbage collector strips the ownerRefs
+// concurrently with this loop. A finished dispatched test is kept when the
+// Environment carries the orphan finalizer or the test has lost its ownerRef
+// (every test that found this Environment is owned, so a missing one means
+// the garbage collector orphaned it, or the test never found this
+// Environment); one already being deleted is waited for all the same. Live
+// and unreclaimed tests are deleted either way. One race remains: the cached
+// Environment has already lost "orphan" while a test's cached ownerRef is not
+// yet stripped, and a finished test is deleted. --cascade=foreground still
+// defeats the ordering below by letting GC delete the kubeconfig Secrets in
+// parallel (keep that ponytail).
 //
 // The finalizer is dropped only once CleanupTargets succeeds: it is the single
 // piece of state that does NOT cascade (the prometheus-targets ConfigMap is
@@ -76,34 +87,44 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 		if err := r.List(ctx, &lts, client.InNamespace(env.Namespace)); err != nil {
 			return ctrl.Result{}, fmt.Errorf("list loadtests: %w", err)
 		}
-		// --cascade=orphan asks to keep the Environment's LoadTests: end only
+		// --cascade=orphan asks to keep the Environment's LoadTests: delete only
 		// the ones that may still load the nodes.
 		orphaning := controllerutil.ContainsFinalizer(env, metav1.FinalizerOrphanDependents)
-		draining := 0
+		now := r.clock()
+		draining, waiting := 0, false
 		for i := range lts.Items {
 			lt := &lts.Items[i]
-			if !hasOwnerRef(lt, env) {
+			if lt.Spec.TargetEnvironment != env.Name {
 				continue
 			}
 			// A finished test that never dispatched left nothing remote, and GC
 			// deletes it. One that dispatched keeps finished TestRuns on its
 			// generators until its own finalizer deletes them, which needs the
-			// kubeconfig Secrets pruned below.
-			if lt.Status.Phase.Terminal() && !runnersUnreclaimed(lt) && (!dispatchBegan(lt) || orphaning) {
-				continue
+			// kubeconfig Secrets pruned below. One already being deleted is
+			// waited for, orphaned or not: its finalizer needs them too.
+			if lt.Status.Phase.Terminal() && !runnersUnreclaimed(lt) {
+				if !dispatchBegan(lt) {
+					continue
+				}
+				if lt.DeletionTimestamp.IsZero() && (orphaning || !hasOwnerRef(lt, env)) {
+					continue
+				}
 			}
 			if lt.DeletionTimestamp.IsZero() {
 				if err := r.Delete(ctx, lt); client.IgnoreNotFound(err) != nil {
 					return ctrl.Result{}, fmt.Errorf("delete loadtest %s: %w", lt.Name, err)
 				}
+				waiting = true
+			} else if now.Sub(lt.DeletionTimestamp.Time) < envDrainBudget {
+				waiting = true
 			}
 			draining++
 		}
+		if waiting {
+			logger.Info("environment deletion: waiting for its load tests to delete their remote TestRuns", "count", draining)
+			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+		}
 		if draining > 0 {
-			if time.Since(env.DeletionTimestamp.Time) < envDrainBudget {
-				logger.Info("environment deletion: waiting for its load tests to delete their remote TestRuns", "count", draining)
-				return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
-			}
 			logger.Info("environment deletion: drain budget spent, pruning with load tests still finalizing", "count", draining)
 		}
 

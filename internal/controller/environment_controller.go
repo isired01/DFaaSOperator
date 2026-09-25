@@ -12,6 +12,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -57,6 +58,18 @@ type EnvironmentReconciler struct {
 	// Monitoring is the Helm monitoring stack. Nil-safe: monitoring() falls
 	// back to a real &monitoring.Manager{}, which performs real Helm installs.
 	Monitoring monitoring.Stack
+	// now is the clock the deletion drain budget runs on; nil means time.Now.
+	// Tests move it forward, since the API server will not backdate a
+	// DeletionTimestamp.
+	now func() time.Time
+}
+
+// clock is the nil-safe accessor for now.
+func (r *EnvironmentReconciler) clock() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
 }
 
 // monitoringStack is the nil-safe accessor for Monitoring.
