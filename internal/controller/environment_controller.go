@@ -131,15 +131,15 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	if env.Status.Phase == dfaasv1.EnvReady &&
 		env.Status.ObservedGeneration == env.Generation {
-		// No longer idle while Ready: run a periodic SSH liveness probe so a
-		// node that dies after provisioning is noticed instead of only
-		// surfacing when a test fails against it.
-
 		// Re-assert this Environment's Prometheus target file on every Ready
 		// tick: the write at the end of provisioning is best-effort, and a
 		// legacy "<name>.json" key from before the namespaced key migrates
 		// here. ReconcileTargets writes nothing when the file is current.
 		logStatusErr(ctx, "reconcile Prometheus targets", r.monitoringStack().ReconcileTargets(ctx, &env))
+
+		// No longer idle while Ready: run a periodic SSH liveness probe so a
+		// node that dies after provisioning is noticed instead of only
+		// surfacing when a test fails against it.
 		return r.reconcileReadyHealth(ctx, &env)
 	}
 
