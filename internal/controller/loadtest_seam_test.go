@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -27,6 +29,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/k6dispatch"
@@ -345,14 +348,28 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(k8sClient.Status().Update(ctx, &fresh)).To(Succeed())
 		}
 
+		// logged sends the reconciler's log into the returned lines, for the
+		// outcomes that go to the operator log rather than to a Condition.
+		logged := func() *[]string {
+			lines := &[]string{}
+			ctx = logr.NewContext(ctx, funcr.New(func(_, args string) { *lines = append(*lines, args) }, funcr.Options{}))
+			return lines
+		}
+
 		It("starts one probe per generator with the summary URL it injects", func() {
+			// Every SummaryURL call answers differently, so a probe that
+			// recomputed the URL would disagree with the one applied.
+			r.Sync = &perCallChannel{Channel: channel}
 			envReady("env", "gen-a", "gen-b")
 			scriptCM("script")
 			lt := newLT("lt", "env", "gen-a", "gen-b")
 			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
 			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
-			for _, id := range []string{"gen-a", "gen-b"} {
-				Expect(fleet.ProbeURL(id, running)).To(Equal(channel.SummaryURL(running, id)))
+			applied := fleet.Applied()
+			Expect(applied).To(HaveLen(2))
+			for _, a := range applied {
+				Expect(a.Env.SummaryURL).NotTo(BeEmpty())
+				Expect(fleet.ProbeURL(a.NodeID, running)).To(Equal(a.Env.SummaryURL))
 			}
 		})
 
@@ -381,6 +398,45 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(fleet.ProbeExists("gen-b", fresh)).To(BeFalse())
 		})
 
+		It("a warning whose status write fails keeps the probes, and the next pass records it", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			fleet.SetProbe("gen-a", running, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeUnreachable,
+				Detail: "Connection timed out"})
+			// The status write carrying the warning fails once, as an API
+			// server hiccup would; RetryOnConflict does not retry a 503.
+			var refused atomic.Bool
+			wc, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme.Scheme})
+			Expect(err).NotTo(HaveOccurred())
+			r.Client = interceptor.NewClient(wc, interceptor.Funcs{
+				SubResourceUpdate: func(ictx context.Context, c client.Client, sub string,
+					obj client.Object, opts ...client.SubResourceUpdateOption) error {
+					if l, ok := obj.(*dfaasv1.LoadTest); ok {
+						k := cond(l, dfaasv1.LTCondK6Dispatched)
+						if k != nil && k.Reason == dfaasv1.LTReasonDispatchedUnreachable && refused.CompareAndSwap(false, true) {
+							return apierrors.NewServiceUnavailable("etcdserver: leader changed")
+						}
+					}
+					return c.SubResource(sub).Update(ictx, obj, opts...)
+				},
+			})
+			lines := logged()
+			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool {
+				return cond(l, dfaasv1.LTCondK6Dispatched).Reason == dfaasv1.LTReasonDispatchedUnreachable
+			})
+			Expect(refused.Load()).To(BeTrue(), "the first warning stamp was refused")
+			c := cond(fresh, dfaasv1.LTCondK6Dispatched)
+			Expect(c.Reason).To(Equal(dfaasv1.LTReasonDispatchedUnreachable))
+			Expect(c.Message).To(ContainSubstring("Connection timed out"))
+			Expect(fleet.ProbeExists("gen-a", fresh)).To(BeFalse())
+			// The verdict reached the log while no Condition held it yet.
+			Expect(*lines).To(ContainElement(SatisfyAll(ContainSubstring(`"node"="gen-a"`),
+				ContainSubstring(channel.SummaryURL(fresh, "gen-a")), ContainSubstring("Connection timed out"))))
+		})
+
 		It("every generator reachable leaves AllDispatched and deletes the probes", func() {
 			envReady("env", "gen-a")
 			scriptCM("script")
@@ -406,6 +462,20 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(fleet.ProbeExists("gen-a", fresh)).To(BeFalse())
 			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Reason).To(Equal(dfaasv1.LTReasonAllDispatched))
 			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+		})
+
+		It("no VM-facing filer URL starts no probe, and the operator log says so", func() {
+			channel.Public = ""
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			lines := logged()
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(running.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+			Expect(fleet.ProbeExists("gen-a", running)).To(BeFalse())
+			Expect(*lines).To(ContainElement(SatisfyAll(ContainSubstring("probe skipped"),
+				ContainSubstring(`"node"="gen-a"`))))
 		})
 
 		It("a probe still pending after the settle time counts as not run and is deleted", func() {
@@ -1463,3 +1533,14 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 		})
 	})
 })
+
+// perCallChannel answers each SummaryURL call with a URL of its own, so a spec
+// can tell the URL a caller was handed from one it recomputed.
+type perCallChannel struct {
+	*syncfake.Channel
+	calls atomic.Int32
+}
+
+func (c *perCallChannel) SummaryURL(lt *dfaasv1.LoadTest, nodeID string) string {
+	return fmt.Sprintf("%s?call=%d", c.Channel.SummaryURL(lt, nodeID), c.calls.Add(1))
+}

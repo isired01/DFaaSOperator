@@ -246,12 +246,14 @@ func (r *LoadTestReconciler) dispatchOne(ctx context.Context, lt *dfaasv1.LoadTe
 		return res, true, oerr
 	}
 
-	if aerr := node.Apply(ctx, lt, perNode, r.runnerEnv(lt, nodeID)); aerr != nil {
+	// Computed once: the probe must check the URL the runner is given.
+	renv := r.runnerEnv(lt, nodeID)
+	if aerr := node.Apply(ctx, lt, perNode, renv); aerr != nil {
 		logger.Error(aerr, "remote TestRun apply failed", "node", nodeID)
 		res, oerr := r.onDispatchError(ctx, lt, aerr, dfaasv1.LTReasonApplyFailed)
 		return res, true, oerr
 	}
-	r.startProbe(ctx, lt, node, nodeID)
+	r.startProbe(ctx, lt, node, nodeID, renv.SummaryURL)
 	return ctrl.Result{}, false, nil
 }
 

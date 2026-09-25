@@ -383,7 +383,8 @@ func (r *LoadTestReconciler) cond(ctx context.Context, lt *dfaasv1.LoadTest,
 
 // condErr is cond for the few sites where a failed stamp must surface to the
 // caller (the occupancy gate: a queued test whose Queued condition did not
-// land would look un-queued to the UI).
+// land would look un-queued to the UI; collectProbes: the probe Pods holding
+// the verdict are deleted only once the warning landed).
 func (r *LoadTestReconciler) condErr(ctx context.Context, lt *dfaasv1.LoadTest,
 	condType string, status metav1.ConditionStatus, reason, message string) error {
 	return r.writer().Record(ctx, lt, ltTransition{

@@ -19,6 +19,7 @@ import (
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 
 	dfaasv1 "dfaas-operator/api/v1"
@@ -251,13 +252,19 @@ func (n *node) Logs(_ context.Context, _ *dfaasv1.LoadTest) (string, error) {
 	return n.f.logs[n.nodeID], nil
 }
 
+// StartProbe refuses a probe already present under the name, as the live
+// Create does: only DeleteProbe clears a leftover.
 func (n *node) StartProbe(_ context.Context, lt *dfaasv1.LoadTest, url string) error {
 	n.f.mu.Lock()
 	defer n.f.mu.Unlock()
 	if err := n.f.takeFailure(n.nodeID, "probe"); err != nil {
 		return err
 	}
-	n.f.probes[key(n.nodeID, lt)] = k6dispatch.ProbeOutcome{State: k6dispatch.ProbeRunning, URL: url}
+	k := key(n.nodeID, lt)
+	if _, ok := n.f.probes[k]; ok {
+		return apierrors.NewAlreadyExists(corev1.Resource("pods"), k6dispatch.ProbeName(lt, n.nodeID))
+	}
+	n.f.probes[k] = k6dispatch.ProbeOutcome{State: k6dispatch.ProbeRunning, URL: url}
 	return nil
 }
 

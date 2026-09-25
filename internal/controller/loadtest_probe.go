@@ -33,13 +33,13 @@ const (
 	probeReadWindow = 2 * time.Minute
 )
 
-// startProbe launches nodeID's reachability probe on the URL the runner gets
-// injected. Best-effort: a probe that cannot start is the operator log's
-// business, never the test's.
+// startProbe launches nodeID's reachability probe on url, the summary URL the
+// TestRun was just applied with, never a recomputed one. Best-effort: a probe
+// that cannot start is the operator log's business, never the test's.
 func (r *LoadTestReconciler) startProbe(ctx context.Context, lt *dfaasv1.LoadTest,
-	node k6dispatch.Node, nodeID string) {
-	url := r.runnerEnv(lt, nodeID).SummaryURL
+	node k6dispatch.Node, nodeID, url string) {
 	if url == "" {
+		log.FromContext(ctx).Info("filer reachability probe skipped: no VM-facing filer URL resolved", "node", nodeID)
 		return
 	}
 	if err := node.StartProbe(ctx, lt, url); err != nil {
@@ -49,8 +49,8 @@ func (r *LoadTestReconciler) startProbe(ctx context.Context, lt *dfaasv1.LoadTes
 
 // collectProbes reads every generator's probe once all have settled, warns on
 // K6Dispatched (status unchanged, so the barrier budget does not move) when
-// one could not reach the filer, and deletes the probe Pods. A probe that did
-// not run is logged only.
+// one could not reach the filer, and deletes the probe Pods once the warning
+// is stored. A probe that did not run is logged only.
 func (r *LoadTestReconciler) collectProbes(ctx context.Context, lt *dfaasv1.LoadTest, env *dfaasv1.Environment) {
 	logger := log.FromContext(ctx)
 	c := meta.FindStatusCondition(lt.Status.Conditions, dfaasv1.LTCondK6Dispatched)
@@ -91,20 +91,28 @@ func (r *LoadTestReconciler) collectProbes(ctx context.Context, lt *dfaasv1.Load
 		}
 		switch o.State {
 		case k6dispatch.ProbeUnreachable:
+			logger.Info("generator cannot reach the filer", "node", ref.NodeID, "url", o.URL, "error", o.Detail)
 			failed = append(failed, fmt.Sprintf("%s tried %s: %s", ref.NodeID, o.URL, o.Detail))
 		case k6dispatch.ProbeDidNotRun:
 			logger.Info("filer reachability probe did not run", "node", ref.NodeID, "detail", o.Detail)
 		}
-		if o.State != k6dispatch.ProbeAbsent {
-			logStatusErr(ctx, "delete filer reachability probe", nodes[ref.NodeID].DeleteProbe(ctx, lt))
-		}
 	}
 	// The first verdict stands: a later pass over a partly deleted set would
-	// only name fewer generators.
+	// only name fewer generators. The probe Pods are the verdict's only
+	// record, so a warning that did not land keeps them for the next pass.
 	if len(failed) > 0 && c.Reason != dfaasv1.LTReasonDispatchedUnreachable {
-		r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched, metav1.ConditionTrue, dfaasv1.LTReasonDispatchedUnreachable,
-			fmt.Sprintf("dispatched %d remote TestRun(s), but %d generator(s) cannot reach the filer the runners report to: %s. "+
-				"The GO signal and the end-of-test summaries will not reach them; DFAAS_SYNC_PUBLIC_URL must be an address every generator can reach.",
-				len(lt.Status.TestRuns), len(failed), strings.Join(failed, "; ")))
+		msg := fmt.Sprintf("dispatched %d remote TestRun(s), but %d generator(s) cannot reach the filer the runners report to: %s. "+
+			"The GO signal and the end-of-test summaries will not reach them; DFAAS_SYNC_PUBLIC_URL must be an address every generator can reach.",
+			len(lt.Status.TestRuns), len(failed), strings.Join(failed, "; "))
+		if err := r.condErr(ctx, lt, dfaasv1.LTCondK6Dispatched, metav1.ConditionTrue,
+			dfaasv1.LTReasonDispatchedUnreachable, msg); err != nil {
+			logger.Error(err, "filer reachability warning not stored; probe Pods kept for the next pass")
+			return
+		}
+	}
+	for _, ref := range lt.Status.TestRuns {
+		if o, ok := outcomes[ref.NodeID]; ok && o.State != k6dispatch.ProbeAbsent {
+			logStatusErr(ctx, "delete filer reachability probe", nodes[ref.NodeID].DeleteProbe(ctx, lt))
+		}
 	}
 }
