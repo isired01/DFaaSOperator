@@ -67,6 +67,10 @@ type LoadTestReconciler struct {
 	retryEvery time.Duration
 	// lastMiss holds, per LoadTest, when its last remote round failed.
 	lastMiss sync.Map
+	// probesRead marks, per LoadTest UID, that collectProbes stored every
+	// probe verdict and deleted every probe Pod: nothing is left to read.
+	// In-memory like lastMiss; a restart only costs one more read.
+	probesRead sync.Map
 }
 
 // envSyncChannel is the process-wide fallback: the bases are read from the
@@ -108,6 +112,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	if !lt.DeletionTimestamp.IsZero() {
+		r.probesRead.Delete(lt.UID) // no probe is read past here
 		return r.handleLoadTestDeletion(ctx, &lt)
 	}
 	if added, err := ensureFinalizer(ctx, r.Client, &lt, loadTestFinalizer); added || err != nil {
@@ -117,6 +122,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Terminal phases — no-op, unless the run end left a runner it applied
 	// undeleted: keep re-sweeping it, since Occupancy holds the Environment.
 	if lt.Status.Phase.Terminal() {
+		r.probesRead.Delete(lt.UID) // no probe is read past here
 		if runnersUnreclaimed(&lt) {
 			return r.retryReclaim(ctx, &lt)
 		}

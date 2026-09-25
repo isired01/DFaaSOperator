@@ -87,8 +87,12 @@ func (r *LoadTestReconciler) startProbe(ctx context.Context, lt *dfaasv1.LoadTes
 // collectProbes reads every generator's probe once all have settled, warns on
 // K6Dispatched (status unchanged, so the barrier budget does not move) when
 // one could not reach the filer, and deletes the probe Pods once the warning
-// is stored. A probe that did not run is logged only.
+// is stored. A probe that did not run is logged only. Once every verdict is
+// stored and every Pod deleted it marks the test and reads nothing more.
 func (r *LoadTestReconciler) collectProbes(ctx context.Context, lt *dfaasv1.LoadTest, env *dfaasv1.Environment) {
+	if _, done := r.probesRead.Load(lt.UID); done {
+		return
+	}
 	logger := log.FromContext(ctx)
 	c := meta.FindStatusCondition(lt.Status.Conditions, dfaasv1.LTCondK6Dispatched)
 	if c == nil || c.Status != metav1.ConditionTrue {
@@ -100,9 +104,11 @@ func (r *LoadTestReconciler) collectProbes(ctx context.Context, lt *dfaasv1.Load
 	}
 	nodes := map[string]k6dispatch.Node{}
 	outcomes := map[string]k6dispatch.ProbeOutcome{}
+	consumed := true // every probe read, its verdict stored, its Pod deleted
 	for _, ref := range lt.Status.TestRuns {
 		node, err := r.Dispatcher.Node(ctx, env, ref.NodeID)
 		if err != nil {
+			consumed = false
 			continue
 		}
 		o, err := node.ProbeResult(ctx, lt)
@@ -165,8 +171,14 @@ func (r *LoadTestReconciler) collectProbes(ctx context.Context, lt *dfaasv1.Load
 	}
 	for _, ref := range lt.Status.TestRuns {
 		if o, ok := outcomes[ref.NodeID]; ok && o.State != k6dispatch.ProbeAbsent {
-			logStatusErr(ctx, "delete filer reachability probe", nodes[ref.NodeID].DeleteProbe(ctx, lt))
+			if err := nodes[ref.NodeID].DeleteProbe(ctx, lt); err != nil {
+				logStatusErr(ctx, "delete filer reachability probe", err)
+				consumed = false // read again, and delete again, next pass
+			}
 		}
+	}
+	if consumed {
+		r.probesRead.Store(lt.UID, struct{}{})
 	}
 }
 

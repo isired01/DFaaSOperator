@@ -480,6 +480,40 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(probeReads(n)).To(BeEmpty())
 		})
 
+		// Once every verdict is stored and every probe Pod deleted there is
+		// nothing left to read: later passes must not GET the probes again
+		// for the rest of probeReadWindow.
+		It("once the verdicts are consumed, later passes read no probe", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			fleet.SetProbe("gen-a", running, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeReachable})
+			reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool { return !fleet.ProbeExists("gen-a", l) })
+			Expect(fleet.ProbeExists("gen-a", running)).To(BeFalse())
+			n := len(fleet.Calls())
+			still := reconcileUntil(lt, 3, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(still.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+			Expect(probeReads(n)).To(BeEmpty())
+		})
+
+		// The verdict is consumed only once its Pod is gone: a delete that
+		// failed leaves the probe to be read, and deleted, on the next pass.
+		It("a probe whose delete failed is read and deleted again on the next pass", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			fleet.SetProbe("gen-a", running, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeReachable})
+			fleet.FailNext("gen-a", "probe-delete", fmt.Errorf("etcdserver: request timed out"))
+			reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(fleet.ProbeExists("gen-a", running)).To(BeTrue(), "the delete failed")
+			reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(fleet.ProbeExists("gen-a", running)).To(BeFalse())
+		})
+
 		It("an unreachable filer keeps K6Dispatched True, names generator, URL and error, and deletes the probes", func() {
 			envReady("env", "gen-a", "gen-b")
 			scriptCM("script")
