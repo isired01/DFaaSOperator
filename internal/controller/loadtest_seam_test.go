@@ -867,6 +867,38 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(fleet.Deleted()).To(HaveLen(deletedBefore))
 			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, keyOf(lt), &dfaasv1.LoadTest{}))).To(BeTrue())
 		})
+
+		It("deleting a finished test deletes its mirrored script on the generator", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(fleet.ScriptExists("gen-a", "script")).To(BeTrue())
+			running.Status.Phase = dfaasv1.LoadTestCompleted
+			Expect(k8sClient.Status().Update(ctx, running)).To(Succeed())
+
+			Expect(k8sClient.Delete(ctx, lt)).To(Succeed())
+			Expect(reconcileUntil(lt, 8, func(*dfaasv1.LoadTest) bool { return false })).To(BeNil())
+			Expect(fleet.ScriptExists("gen-a", "script")).To(BeFalse())
+		})
+
+		It("keeps a script another test re-mirrored under the same name", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			first := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			first.Status.Phase = dfaasv1.LoadTestCompleted
+			Expect(k8sClient.Status().Update(ctx, first)).To(Succeed())
+			lt2 := newLT("lt2", "env", "gen-a") // same "script" name
+			Expect(k8sClient.Create(ctx, lt2)).To(Succeed())
+			reconcileUntil(lt2, 12, phaseIs(dfaasv1.LoadTestRunning))
+
+			Expect(k8sClient.Delete(ctx, lt)).To(Succeed())
+			Expect(reconcileUntil(lt, 8, func(*dfaasv1.LoadTest) bool { return false })).To(BeNil())
+			Expect(fleet.ScriptExists("gen-a", "script")).To(BeTrue())
+		})
 	})
 	// One fleet round per tick: every generator is polled once and the Retry
 	// counter is charged once per round. Before, a healthy generator's

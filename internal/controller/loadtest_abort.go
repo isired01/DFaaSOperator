@@ -99,6 +99,14 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 			_, serr := node.Stage(ctx, lt)
 			switch {
 			case errors.Is(serr, k6dispatch.ErrNotFound):
+				// The TestRun is gone; its mirrored script is the last remote
+				// object this test left on the node.
+				for _, pn := range lt.Spec.PerNodeLoad {
+					if pn.NodeID == nodeID {
+						logStatusErr(ctx, "delete remote script ConfigMap (loadtest deletion)",
+							node.DeleteScript(ctx, lt, pn.ScriptConfigMap.Name))
+					}
+				}
 			case serr != nil:
 				logger.Error(serr, "remote TestRun NotFound-poll errored", "node", nodeID)
 				errored = append(errored, nodeID)

@@ -63,9 +63,14 @@ type Node interface {
 	// Ref is the status record for lt's TestRun on this node.
 	Ref(lt *dfaasv1.LoadTest) dfaasv1.TestRunRef
 	// MirrorConfigMap server-side-applies cm, same name, into the namespace
-	// the TestRun lives in. k6-operator resolves spec.script.configMap in its
-	// own cluster, so the script must exist there before Apply.
-	MirrorConfigMap(ctx context.Context, cm *corev1.ConfigMap) error
+	// the TestRun lives in, labelled with lt's UID (ScriptOwnerLabel).
+	// k6-operator resolves spec.script.configMap in its own cluster, so the
+	// script must exist there before Apply.
+	MirrorConfigMap(ctx context.Context, lt *dfaasv1.LoadTest, cm *corev1.ConfigMap) error
+	// DeleteScript deletes the script ConfigMap name that lt mirrored onto
+	// this node. A copy another LoadTest re-mirrored since is kept; an absent
+	// one is success.
+	DeleteScript(ctx context.Context, lt *dfaasv1.LoadTest, name string) error
 	// Apply server-side-applies lt's TestRun for perNode.
 	Apply(ctx context.Context, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad, env RunnerEnv) error
 	// Stage returns .status.stage of lt's TestRun. ErrNotFound when the
@@ -114,6 +119,23 @@ var TestRunGVK = schema.GroupVersionKind{
 // Suffix read off k6-operator v0.0.15, the version chart 3.7.0 installs
 // (setup-k6-nodes.yml; TestK6ChartVersionIsPinned holds the two together).
 const maxTestRunName = 63 - len("-initializer")
+
+// ScriptOwnerLabel carries the UID of the LoadTest that mirrored a script
+// ConfigMap onto a generator. Two LoadTests can share a script name (the YAML
+// import accepts any existing ConfigMap), so DeleteScript deletes only the
+// copy its own test put there.
+const ScriptOwnerLabel = "dfaas.io/loadtest-uid"
+
+// mirrorConfigMap is the remote copy of src for lt: same name and data, in the
+// namespace the TestRun lives in, labelled with lt's UID.
+func mirrorConfigMap(lt *dfaasv1.LoadTest, src *corev1.ConfigMap) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: src.Name, Namespace: remoteNamespace,
+			Labels: map[string]string{ScriptOwnerLabel: string(lt.UID)}},
+		Data: src.Data,
+	}
+}
 
 // TestRunName is the deterministic remote TestRun name for lt on nodeID.
 // k6-operator uses "<testrun>-<n>" as the runner pod's hostname, a DNS-1123
@@ -317,20 +339,38 @@ func (n *liveNode) remoteClient(ctx context.Context) (client.Client, error) {
 	return client.New(cfg, client.Options{})
 }
 
-func (n *liveNode) MirrorConfigMap(ctx context.Context, src *corev1.ConfigMap) error {
+func (n *liveNode) MirrorConfigMap(ctx context.Context, lt *dfaasv1.LoadTest, src *corev1.ConfigMap) error {
 	rc, err := n.remoteClient(ctx)
 	if err != nil {
 		return err
 	}
-	cm := &corev1.ConfigMap{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-		ObjectMeta: metav1.ObjectMeta{Name: src.Name, Namespace: remoteNamespace},
-		Data:       src.Data,
-	}
+	cm := mirrorConfigMap(lt, src)
 	if err := rc.Patch(ctx, cm, client.Apply, client.FieldOwner("dfaas-operator")); err != nil {
 		return fmt.Errorf("apply remote ConfigMap %s/%s: %w", remoteNamespace, src.Name, err)
 	}
 	return nil
+}
+
+func (n *liveNode) DeleteScript(ctx context.Context, lt *dfaasv1.LoadTest, name string) error {
+	rc, err := n.remoteClient(ctx)
+	if err != nil {
+		return err
+	}
+	var cm corev1.ConfigMap
+	if err := rc.Get(ctx, client.ObjectKey{Namespace: remoteNamespace, Name: name}, &cm); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	// Mirrored by another test (or by a release that did not label it).
+	if cm.Labels[ScriptOwnerLabel] != string(lt.UID) {
+		return nil
+	}
+	// The preconditions keep a copy re-mirrored between the Get and the
+	// Delete: server-side apply changes its resourceVersion.
+	err = rc.Delete(ctx, &cm, client.Preconditions{UID: &cm.UID, ResourceVersion: &cm.ResourceVersion})
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		return nil
+	}
+	return err
 }
 
 func (n *liveNode) Apply(ctx context.Context, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad, env RunnerEnv) error {

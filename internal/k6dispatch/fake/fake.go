@@ -19,6 +19,7 @@ import (
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/k6dispatch"
@@ -37,15 +38,17 @@ type Fleet struct {
 	mu       sync.Mutex
 	stages   map[string]string // TestRun key → stage; absent = NotFound
 	applied  []Applied
-	deleted  []string // TestRun keys, in order
-	mirrored []string // "<nodeID>/<cm name>"
+	deleted  []string             // TestRun keys, in order
+	mirrored []string             // "<nodeID>/<cm name>"
+	scripts  map[string]types.UID // "<nodeID>/<name>" → owner UID
 	logs     map[string]string
 	failNext map[string]error // "<nodeID>|<op>" → error, consumed on first use
 }
 
 // New returns an empty fleet.
 func New() *Fleet {
-	return &Fleet{stages: map[string]string{}, logs: map[string]string{}, failNext: map[string]error{}}
+	return &Fleet{stages: map[string]string{}, scripts: map[string]types.UID{},
+		logs: map[string]string{}, failNext: map[string]error{}}
 }
 
 func key(nodeID string, lt *dfaasv1.LoadTest) string {
@@ -76,8 +79,8 @@ func (f *Fleet) SetLogs(nodeID, logs string) {
 	f.logs[nodeID] = logs
 }
 
-// FailNext makes the next op ("mirror", "apply", "stage", "delete", "logs")
-// on nodeID return err, once.
+// FailNext makes the next op ("mirror", "apply", "stage", "delete", "logs",
+// "script") on nodeID return err, once.
 func (f *Fleet) FailNext(nodeID, op string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -113,6 +116,14 @@ func (f *Fleet) Exists(nodeID string, lt *dfaasv1.LoadTest) bool {
 	return ok
 }
 
+// ScriptExists reports whether a mirrored script is still on nodeID.
+func (f *Fleet) ScriptExists(nodeID, name string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.scripts[nodeID+"/"+name]
+	return ok
+}
+
 func (f *Fleet) takeFailure(nodeID, op string) error {
 	k := nodeID + "|" + op
 	if err, ok := f.failNext[k]; ok {
@@ -131,13 +142,26 @@ func (n *node) Ref(lt *dfaasv1.LoadTest) dfaasv1.TestRunRef {
 	return dfaasv1.TestRunRef{NodeID: n.nodeID, Name: k6dispatch.TestRunName(lt, n.nodeID), Namespace: "default"}
 }
 
-func (n *node) MirrorConfigMap(_ context.Context, cm *corev1.ConfigMap) error {
+func (n *node) MirrorConfigMap(_ context.Context, lt *dfaasv1.LoadTest, cm *corev1.ConfigMap) error {
 	n.f.mu.Lock()
 	defer n.f.mu.Unlock()
 	if err := n.f.takeFailure(n.nodeID, "mirror"); err != nil {
 		return err
 	}
 	n.f.mirrored = append(n.f.mirrored, n.nodeID+"/"+cm.Name)
+	n.f.scripts[n.nodeID+"/"+cm.Name] = lt.UID
+	return nil
+}
+
+func (n *node) DeleteScript(_ context.Context, lt *dfaasv1.LoadTest, name string) error {
+	n.f.mu.Lock()
+	defer n.f.mu.Unlock()
+	if err := n.f.takeFailure(n.nodeID, "script"); err != nil {
+		return err
+	}
+	if k := n.nodeID + "/" + name; n.f.scripts[k] == lt.UID {
+		delete(n.f.scripts, k)
+	}
 	return nil
 }
 

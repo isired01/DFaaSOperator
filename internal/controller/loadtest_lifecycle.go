@@ -212,7 +212,7 @@ func (r *LoadTestReconciler) dispatchOne(ctx context.Context, lt *dfaasv1.LoadTe
 		res, oerr := r.onDispatchError(ctx, lt, merr, dfaasv1.LTReasonScriptMirrorFailed)
 		return res, true, oerr
 	}
-	if merr := node.MirrorConfigMap(ctx, &src); merr != nil {
+	if merr := node.MirrorConfigMap(ctx, lt, &src); merr != nil {
 		logger.Error(merr, "remote script CM mirror failed", "node", nodeID)
 		res, oerr := r.onDispatchError(ctx, lt, merr, dfaasv1.LTReasonScriptMirrorFailed)
 		return res, true, oerr
