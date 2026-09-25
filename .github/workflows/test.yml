@@ -23,6 +23,17 @@ jobs:
           make manifests generate fmt
           git diff --exit-code
 
+      # An untidy go.mod builds and tests fine, so nothing else here notices:
+      # google.golang.org/api sat in it as a direct requirement nothing
+      # imported, and gopls marked the file red for the modules tidy would
+      # add. `tidy -diff` fails without rewriting; `verify` checks the module
+      # cache against go.sum. Three modules live in this repo.
+      - name: go.mod is tidy and verified
+        run: |
+          for m in . dataExporter imageFunction; do
+            (cd "$m" && go mod tidy -diff && go mod verify)
+          done
+
       # The chart ships its own copy of the CRDs; they are what a real install
       # applies. A stale copy prunes the field just as silently.
       - name: Chart CRDs match config/crd/bases
