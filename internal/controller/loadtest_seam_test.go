@@ -668,6 +668,112 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env))).To(BeTrue())
 		})
+
+		It("Environment deletion drains a finished test until its remote TestRun is gone", func() {
+			env := envReady("env", "gen-a")
+			scriptCM("script")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			env.Finalizers = append(env.Finalizers, environmentFinalizer)
+			Expect(k8sClient.Update(ctx, env)).To(Succeed())
+			sec := kubeconfigSecret("env-gen-a-kubeconfig", "env", "gen-a")
+			sec.Namespace = env.Namespace
+			Expect(k8sClient.Create(ctx, sec)).To(Succeed())
+
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			running.Status.Phase = dfaasv1.LoadTestCompleted
+			Expect(k8sClient.Status().Update(ctx, running)).To(Succeed())
+			Expect(fleet.Exists("gen-a", lt)).To(BeTrue()) // finished TestRuns stay: remote logs survive
+
+			Expect(k8sClient.Delete(ctx, env)).To(Succeed())
+			er := &EnvironmentReconciler{Client: k8sClient, Scheme: scheme.Scheme}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			res, err := er.handleEnvDeletion(ctx, env)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+
+			// Terminal is not enough: the test still exists, its finalizer has not run.
+			res, err = er.handleEnvDeletion(ctx, env)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(sec), sec)).To(Succeed())
+
+			Expect(reconcileUntil(lt, 6, func(*dfaasv1.LoadTest) bool { return false })).To(BeNil())
+			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+			_, err = er.handleEnvDeletion(ctx, env)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env))).To(BeTrue())
+		})
+
+		It("Environment deletion gives up on a test still finalizing after its drain budget", func() {
+			env := envReady("env", "gen-a")
+			scriptCM("script")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			env.Finalizers = append(env.Finalizers, environmentFinalizer)
+			Expect(k8sClient.Update(ctx, env)).To(Succeed())
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+
+			Expect(k8sClient.Delete(ctx, env)).To(Succeed())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			// The API server will not backdate a DeletionTimestamp: age the copy.
+			past := metav1.NewTime(time.Now().Add(-envDrainBudget - time.Second))
+			env.DeletionTimestamp = &past
+			er := &EnvironmentReconciler{Client: k8sClient, Scheme: scheme.Scheme}
+			res, err := er.handleEnvDeletion(ctx, env)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeZero())
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), &dfaasv1.Environment{}))).To(BeTrue())
+		})
+
+		It("Environment deletion with --cascade=orphan keeps finished tests", func() {
+			env := envReady("env", "gen-a")
+			scriptCM("script")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			env.Finalizers = append(env.Finalizers, environmentFinalizer)
+			Expect(k8sClient.Update(ctx, env)).To(Succeed())
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			running.Status.Phase = dfaasv1.LoadTestCompleted
+			Expect(k8sClient.Status().Update(ctx, running)).To(Succeed())
+
+			orphan := metav1.DeletePropagationOrphan
+			Expect(k8sClient.Delete(ctx, env, &client.DeleteOptions{PropagationPolicy: &orphan})).To(Succeed())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			er := &EnvironmentReconciler{Client: k8sClient, Scheme: scheme.Scheme}
+			_, err := er.handleEnvDeletion(ctx, env)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, keyOf(lt), lt)).To(Succeed())
+			Expect(lt.DeletionTimestamp).To(BeNil())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			Expect(env.Finalizers).NotTo(ContainElement(environmentFinalizer)) // "orphan" stays: no GC in envtest
+		})
+
+		It("a deleted test whose budget is spent is released with no remote call", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			running.Status.Phase = dfaasv1.LoadTestCompleted
+			Expect(k8sClient.Status().Update(ctx, running)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, lt)).To(Succeed())
+
+			var fresh dfaasv1.LoadTest
+			Expect(k8sClient.Get(ctx, keyOf(lt), &fresh)).To(Succeed())
+			past := metav1.NewTime(time.Now().Add(-deletionReclaimBudget - time.Second))
+			fresh.DeletionTimestamp = &past
+			// Dispatch itself made one stale-wipe Delete call before Apply; the
+			// budget-spent path must add none on top of it.
+			deletedBefore := len(fleet.Deleted())
+			_, err := r.handleLoadTestDeletion(ctx, &fresh)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fleet.Deleted()).To(HaveLen(deletedBefore))
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, keyOf(lt), &dfaasv1.LoadTest{}))).To(BeTrue())
+		})
 	})
 	// One fleet round per tick: every generator is polled once and the Retry
 	// counter is charged once per round. Before, a healthy generator's

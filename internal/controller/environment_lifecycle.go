@@ -40,9 +40,25 @@ const monitoringAttemptsAnnotation = "dfaas.dfaas.io/monitoring-attempts"
 // tolerated before the Environment is moved to EnvFailed (P4).
 const monitoringRetryBudget = 5
 
-// handleEnvDeletion drains per-environment cluster-wide state (Prometheus
-// targets) and removes the finalizer. Per-environment Jobs and ConfigMaps
+// envDrainBudget bounds how long the Environment finalizer waits for the
+// LoadTests it drains. Each LoadTest finalizer gives up remote calls after
+// deletionReclaimBudget; the extra minute covers its last passes. Past it the
+// Environment prunes its targets and Secrets anyway.
+const envDrainBudget = deletionReclaimBudget + time.Minute
+
+// handleEnvDeletion drains the LoadTests this Environment owns, then
+// per-environment cluster-wide state (Prometheus targets, kubeconfig
+// Secrets) and removes the finalizer. Per-environment Jobs and ConfigMaps
 // carry ControllerReferences and are garbage-collected automatically.
+//
+// The drain deletes every owned LoadTest that is live, unreclaimed, or
+// dispatched — finished ones included, since their TestRuns stay on the
+// generators until the LoadTest's own finalizer deletes them — and waits
+// until each is gone, at most envDrainBudget; past it the Environment
+// prunes its targets and Secrets with those LoadTests still finalizing.
+// --cascade=orphan keeps finished tests out of the drain; --cascade=foreground
+// still defeats the ordering below by letting GC delete the kubeconfig
+// Secrets in parallel (keep that ponytail).
 //
 // The finalizer is dropped only once CleanupTargets succeeds: it is the single
 // piece of state that does NOT cascade (the prometheus-targets ConfigMap is
@@ -56,22 +72,24 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 	logger := log.FromContext(ctx)
 
 	if controllerutil.ContainsFinalizer(env, environmentFinalizer) {
-		// Drain the LoadTests this Environment owns that may still have work on
-		// the generators, before the kubeconfig Secrets below are pruned: their
-		// finalizers need those Secrets to reach the remote k3s. At most one
-		// test per Environment can have live or held runners (Occupancy), so
-		// the wait is about one teardown pass plus the deletion budget.
-		// ponytail: kubectl delete --cascade=foreground lets GC delete the
-		// Secrets in parallel and defeats this ordering; background (the
-		// default, and what the gateway uses) keeps it.
 		var lts dfaasv1.LoadTestList
 		if err := r.List(ctx, &lts, client.InNamespace(env.Namespace)); err != nil {
 			return ctrl.Result{}, fmt.Errorf("list loadtests: %w", err)
 		}
+		// --cascade=orphan asks to keep the Environment's LoadTests: end only
+		// the ones that may still load the nodes.
+		orphaning := controllerutil.ContainsFinalizer(env, metav1.FinalizerOrphanDependents)
 		draining := 0
 		for i := range lts.Items {
 			lt := &lts.Items[i]
-			if !hasOwnerRef(lt, env) || (lt.Status.Phase.Terminal() && !runnersUnreclaimed(lt)) {
+			if !hasOwnerRef(lt, env) {
+				continue
+			}
+			// A finished test that never dispatched left nothing remote, and GC
+			// deletes it. One that dispatched keeps finished TestRuns on its
+			// generators until its own finalizer deletes them, which needs the
+			// kubeconfig Secrets pruned below.
+			if lt.Status.Phase.Terminal() && !runnersUnreclaimed(lt) && (!dispatchBegan(lt) || orphaning) {
 				continue
 			}
 			if lt.DeletionTimestamp.IsZero() {
@@ -82,8 +100,11 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 			draining++
 		}
 		if draining > 0 {
-			logger.Info("environment deletion: waiting for its load tests to reclaim their runners", "count", draining)
-			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+			if time.Since(env.DeletionTimestamp.Time) < envDrainBudget {
+				logger.Info("environment deletion: waiting for its load tests to delete their remote TestRuns", "count", draining)
+				return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+			}
+			logger.Info("environment deletion: drain budget spent, pruning with load tests still finalizing", "count", draining)
 		}
 
 		logger.Info("environment deletion: cleaning up Prometheus targets")

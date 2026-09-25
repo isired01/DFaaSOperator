@@ -80,6 +80,16 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 	}
 
 	if dispatchBegan(lt) {
+		// Past the budget, release without another remote call. With one
+		// LoadTest worker, a dead generator costs remoteRequestTimeout per
+		// Stage, and an Environment deletion drains every dispatched test at
+		// once: this caps the worst case at deletionReclaimBudget.
+		if time.Since(lt.DeletionTimestamp.Time) >= deletionReclaimBudget {
+			logger.Info("deletion budget spent — releasing with remote TestRuns unconfirmed")
+			r.sweepFilerObjects(ctx, lt, "loadtest deletion")
+			return ctrl.Result{}, r.removeLTFinalizer(ctx, lt)
+		}
+
 		var pending, errored []string
 		for _, nodeID := range k6dispatch.TargetNodeIDs(lt) {
 			node, nerr := r.Dispatcher.Node(ctx, &env, nodeID)

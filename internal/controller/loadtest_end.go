@@ -116,7 +116,8 @@ func dispatchBegan(lt *dfaasv1.LoadTest) bool {
 
 // runnersMayBeLive reports whether lt may still have k6 runners generating
 // load. Runners already observed done are not deleted, so their remote logs
-// survive AllFailed, PartialFailure and every Exporting exit.
+// survive AllFailed, PartialFailure and every Exporting exit — until the
+// LoadTest is deleted, directly or with its Environment.
 func runnersMayBeLive(lt *dfaasv1.LoadTest) bool {
 	if !dispatchBegan(lt) || lt.Status.Phase == dfaasv1.LoadTestExporting {
 		return false
