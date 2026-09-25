@@ -859,12 +859,46 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(k8sClient.Get(ctx, keyOf(lt), &fresh)).To(Succeed())
 			past := metav1.NewTime(time.Now().Add(-deletionReclaimBudget - time.Second))
 			fresh.DeletionTimestamp = &past
-			// Dispatch itself made one stale-wipe Delete call before Apply; the
-			// budget-spent path must add none on top of it.
+			// Dispatch itself made one stale-wipe Delete call and one Stage call
+			// (to confirm ErrNotFound) before Apply; the budget-spent path must
+			// add neither on top of them.
+			stagedBefore := len(fleet.Staged())
 			deletedBefore := len(fleet.Deleted())
 			_, err := r.handleLoadTestDeletion(ctx, &fresh)
 			Expect(err).NotTo(HaveOccurred())
+			Expect(fleet.Staged()).To(HaveLen(stagedBefore))
 			Expect(fleet.Deleted()).To(HaveLen(deletedBefore))
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, keyOf(lt), &dfaasv1.LoadTest{}))).To(BeTrue())
+		})
+
+		It("a RunnersUnreclaimed test past its budget still gets one Delete pass before releasing", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			// A terminal RunnersUnreclaimed test still holds its TestRun on the
+			// generator (Delete failed on it at run end) — Occupancy is what
+			// keeps the Environment busy on it, so at most one such test exists
+			// per Environment.
+			running.Status.Phase = dfaasv1.LoadTestFailed
+			meta.SetStatusCondition(&running.Status.Conditions, metav1.Condition{
+				Type: dfaasv1.LTCondK6Healthy, Status: metav1.ConditionFalse,
+				Reason: dfaasv1.LTReasonRunnersUnreclaimed, Message: "gen-a held its TestRun",
+			})
+			Expect(k8sClient.Status().Update(ctx, running)).To(Succeed())
+			Expect(fleet.Exists("gen-a", lt)).To(BeTrue())
+			Expect(k8sClient.Delete(ctx, lt)).To(Succeed())
+
+			var fresh dfaasv1.LoadTest
+			Expect(k8sClient.Get(ctx, keyOf(lt), &fresh)).To(Succeed())
+			past := metav1.NewTime(time.Now().Add(-deletionReclaimBudget - time.Second))
+			fresh.DeletionTimestamp = &past
+			deletedBefore := len(fleet.Deleted())
+			_, err := r.handleLoadTestDeletion(ctx, &fresh)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(fleet.Deleted()).To(HaveLen(deletedBefore + 1))
+			Expect(fleet.Deleted()[deletedBefore]).To(Equal("gen-a|lt-gen-a"))
 			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, keyOf(lt), &dfaasv1.LoadTest{}))).To(BeTrue())
 		})
 

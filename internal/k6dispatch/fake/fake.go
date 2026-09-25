@@ -38,6 +38,7 @@ type Fleet struct {
 	mu       sync.Mutex
 	stages   map[string]string // TestRun key → stage; absent = NotFound
 	applied  []Applied
+	staged   []string             // TestRun keys, in order (every Stage call)
 	deleted  []string             // TestRun keys, in order
 	mirrored []string             // "<nodeID>/<cm name>"
 	scripts  map[string]types.UID // "<nodeID>/<name>" → owner UID
@@ -92,6 +93,14 @@ func (f *Fleet) Applied() []Applied {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]Applied(nil), f.applied...)
+}
+
+// Staged returns every Stage call (TestRun keys) in order, whether or not the
+// TestRun was found.
+func (f *Fleet) Staged() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.staged...)
 }
 
 // Deleted returns every Delete call (TestRun keys) in order.
@@ -182,6 +191,7 @@ func (n *node) Apply(_ context.Context, lt *dfaasv1.LoadTest, perNode dfaasv1.Pe
 func (n *node) Stage(_ context.Context, lt *dfaasv1.LoadTest) (string, error) {
 	n.f.mu.Lock()
 	defer n.f.mu.Unlock()
+	n.f.staged = append(n.f.staged, key(n.nodeID, lt))
 	if err := n.f.takeFailure(n.nodeID, "stage"); err != nil {
 		return "", err
 	}
