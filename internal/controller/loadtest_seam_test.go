@@ -352,6 +352,17 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(fleet.Applied()).To(BeEmpty())
 		})
 
+		It("a test that fails admission is still owned by its Environment", func() {
+			env := envReady("env", "gen-a")
+			env.Status.Phase = dfaasv1.EnvProvisioningInfra
+			Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			failed := reconcileUntil(lt, 6, phaseIs(dfaasv1.LoadTestFailed))
+			Expect(hasOwnerRef(failed, env)).To(BeTrue())
+		})
+
 		It("a suspended draft parks at Pending and dispatches nothing", func() {
 			envReady("env", "gen-a")
 			scriptCM("script")
@@ -652,6 +663,7 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 
 			Expect(reconcileUntil(lt, 6, func(*dfaasv1.LoadTest) bool { return false })).To(BeNil())
 			Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+			Expect(reconcileUntil(lt3, 4, func(*dfaasv1.LoadTest) bool { return false })).To(BeNil())
 			_, err = er.handleEnvDeletion(ctx, env)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env))).To(BeTrue())
@@ -818,7 +830,7 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			scriptCM("script")
 			lt := newScheduled(time.Now().Add(time.Hour))
 			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
-			armed := reconcileUntil(lt, 4, func(l *dfaasv1.LoadTest) bool {
+			armed := reconcileUntil(lt, 6, func(l *dfaasv1.LoadTest) bool {
 				return scheduledReason(l) == dfaasv1.LTReasonScheduledArmed
 			})
 			Expect(armed.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
@@ -851,7 +863,7 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			scriptCM("script")
 			lt := newScheduled(time.Now().Add(-time.Minute))
 			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
-			delayed := reconcileUntil(lt, 4, func(l *dfaasv1.LoadTest) bool {
+			delayed := reconcileUntil(lt, 6, func(l *dfaasv1.LoadTest) bool {
 				return scheduledReason(l) == dfaasv1.LTReasonScheduledDelayedEnvNot
 			})
 			Expect(delayed.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
@@ -871,7 +883,7 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			scriptCM("script")
 			lt := newScheduled(time.Now().Add(time.Hour))
 			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
-			armed := reconcileUntil(lt, 4, func(l *dfaasv1.LoadTest) bool {
+			armed := reconcileUntil(lt, 6, func(l *dfaasv1.LoadTest) bool {
 				return scheduledReason(l) == dfaasv1.LTReasonScheduledArmed
 			})
 			Expect(armed.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
@@ -883,6 +895,57 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 				return l.Status.Phase == dfaasv1.LoadTestRunning || l.Status.Phase == dfaasv1.LoadTestFailed
 			})
 			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+		})
+
+		It("an armed scheduled test is owned by its Environment before it fires", func() {
+			env := envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newScheduled(time.Now().Add(time.Hour))
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			armed := reconcileUntil(lt, 6, func(l *dfaasv1.LoadTest) bool {
+				return scheduledReason(l) == dfaasv1.LTReasonScheduledArmed
+			})
+			Expect(armed.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
+			Expect(hasOwnerRef(armed, env)).To(BeTrue())
+			Expect(fleet.Applied()).To(BeEmpty())
+		})
+
+		It("a scheduled test delayed on a non-Ready Environment is owned by it", func() {
+			env := envReady("env", "gen-a")
+			env.Status.Phase = dfaasv1.EnvProvisioningInfra
+			Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
+			scriptCM("script")
+			lt := newScheduled(time.Now().Add(-time.Minute))
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			delayed := reconcileUntil(lt, 6, func(l *dfaasv1.LoadTest) bool {
+				return scheduledReason(l) == dfaasv1.LTReasonScheduledDelayedEnvNot
+			})
+			Expect(hasOwnerRef(delayed, env)).To(BeTrue())
+		})
+
+		It("Environment deletion drains an armed scheduled test with no remote call", func() {
+			env := envReady("env", "gen-a")
+			scriptCM("script")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			env.Finalizers = append(env.Finalizers, environmentFinalizer)
+			Expect(k8sClient.Update(ctx, env)).To(Succeed())
+			lt := newScheduled(time.Now().Add(time.Hour))
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 6, func(l *dfaasv1.LoadTest) bool {
+				return scheduledReason(l) == dfaasv1.LTReasonScheduledArmed
+			})
+
+			Expect(k8sClient.Delete(ctx, env)).To(Succeed())
+			er := &EnvironmentReconciler{Client: k8sClient, Scheme: scheme.Scheme}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env)).To(Succeed())
+			res, err := er.handleEnvDeletion(ctx, env)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(reconcileUntil(lt, 4, func(*dfaasv1.LoadTest) bool { return false })).To(BeNil())
+			Expect(fleet.Deleted()).To(BeEmpty())
+			_, err = er.handleEnvDeletion(ctx, env)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(env), env))).To(BeTrue())
 		})
 
 		It("still fails a test created with startAt but without suspended", func() {
@@ -915,7 +978,7 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			scriptCM("script")
 			lt := newLT("lt", "env", "gen-a")
 			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
-			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool { return l.Status.Phase != "" })
+			fresh := reconcileUntil(lt, 5, func(l *dfaasv1.LoadTest) bool { return l.Status.Phase != "" })
 			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestPending))
 			Expect(fleet.Applied()).To(BeEmpty())
 		})
