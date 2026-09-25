@@ -75,6 +75,8 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 		return r.failLoadTest(ctx, lt, "generator unusable: "+rd.describe(rd.unusable))
 	}
 
+	r.collectProbes(ctx, lt, env)
+
 	budget := r.budget(fetchMissesAnnotation, fetchRetryBudget)
 	if len(rd.missing) > 0 {
 		// ErrNotFound included: a TestRun that disappeared under a running test

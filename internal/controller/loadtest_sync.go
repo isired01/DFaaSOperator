@@ -69,6 +69,8 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 		return r.finishDispatch(ctx, lt, lt.Status.TestRuns)
 	}
 
+	r.collectProbes(ctx, lt, env)
+
 	total := len(lt.Status.TestRuns)
 	nodeIDs := make([]string, 0, total)
 	for _, ref := range lt.Status.TestRuns {

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -151,10 +152,15 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 		}
 	}
 
-	// All TestRuns dispatched.
-	r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched,
-		metav1.ConditionTrue, dfaasv1.LTReasonAllDispatched,
-		fmt.Sprintf("dispatched %d remote TestRun(s)", len(refs)))
+	// All TestRuns dispatched. Only on the transition: a syncStart test comes
+	// back here on every barrier poll, and a restamp would erase a
+	// DispatchedUnreachable warning (same status, so the budget is unaffected
+	// either way).
+	if c := meta.FindStatusCondition(lt.Status.Conditions, dfaasv1.LTCondK6Dispatched); c == nil || c.Status != metav1.ConditionTrue {
+		r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched,
+			metav1.ConditionTrue, dfaasv1.LTReasonAllDispatched,
+			fmt.Sprintf("dispatched %d remote TestRun(s)", len(refs)))
+	}
 
 	// Synchronized start: hold Running until every runner is parked on the
 	// script barrier, then publish the GO signal (loadtest_sync.go).
@@ -227,6 +233,8 @@ func (r *LoadTestReconciler) dispatchOne(ctx context.Context, lt *dfaasv1.LoadTe
 		res, oerr := r.onDispatchError(ctx, lt, derr, dfaasv1.LTReasonStaleCleanupFailed)
 		return res, true, oerr
 	}
+	// A probe Pod left by a previous run of this name would answer for it.
+	logStatusErr(ctx, "delete stale filer reachability probe", node.DeleteProbe(ctx, lt))
 	_, serr := node.Stage(ctx, lt)
 	switch {
 	case serr == nil:
@@ -243,6 +251,7 @@ func (r *LoadTestReconciler) dispatchOne(ctx context.Context, lt *dfaasv1.LoadTe
 		res, oerr := r.onDispatchError(ctx, lt, aerr, dfaasv1.LTReasonApplyFailed)
 		return res, true, oerr
 	}
+	r.startProbe(ctx, lt, node, nodeID)
 	return ctrl.Result{}, false, nil
 }
 

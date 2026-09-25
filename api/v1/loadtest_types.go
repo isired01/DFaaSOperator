@@ -78,17 +78,21 @@ const (
 	LTReasonScheduledDelayedEnvNot = "ScheduledDelayedEnvNotReady"
 	LTReasonInFlight               = "InFlight"
 	LTReasonAllDispatched          = "AllDispatched"
-	LTReasonDispatchFailed         = "DispatchFailed"
-	LTReasonPending                = "Pending"
-	LTReasonAllFinished            = "AllFinished"
-	LTReasonPartialFailure         = "PartialFailure"
-	LTReasonAllFailed              = "AllFailed"
-	LTReasonRunning                = "Running"
-	LTReasonExportCooldown         = "ExportCooldown"
-	LTReasonExporterRunning        = "ExporterRunning"
-	LTReasonExportSucceeded        = "ExportSucceeded"
-	LTReasonJobFailed              = "JobFailed"
-	LTReasonExportSkipped          = "Skipped"
+	// LTReasonDispatchedUnreachable keeps K6Dispatched True (the TestRuns are
+	// applied) and warns that at least one generator could not reach the
+	// VM-facing filer address: its GO signal and summary upload will fail.
+	LTReasonDispatchedUnreachable = "DispatchedUnreachable"
+	LTReasonDispatchFailed        = "DispatchFailed"
+	LTReasonPending               = "Pending"
+	LTReasonAllFinished           = "AllFinished"
+	LTReasonPartialFailure        = "PartialFailure"
+	LTReasonAllFailed             = "AllFailed"
+	LTReasonRunning               = "Running"
+	LTReasonExportCooldown        = "ExportCooldown"
+	LTReasonExporterRunning       = "ExporterRunning"
+	LTReasonExportSucceeded       = "ExportSucceeded"
+	LTReasonJobFailed             = "JobFailed"
+	LTReasonExportSkipped         = "Skipped"
 	// LTReasonRunnersReclaimed restamps K6Healthy when a run end confirmed
 	// every remote TestRun absent. Without it the condition keeps the last
 	// observed running count ("2 running") on a test whose runners are gone.

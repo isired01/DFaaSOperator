@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/k6dispatch"
 	"dfaas-operator/internal/k6dispatch/fake"
 	syncfake "dfaas-operator/internal/syncchannel/fake"
 )
@@ -314,6 +315,136 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 		gone := reconcileUntil(lt, 6, func(*dfaasv1.LoadTest) bool { return false })
 		Expect(gone).To(BeNil(), "LoadTest should be gone once the finalizer released it")
 		Expect(fleet.Exists("gen-a", lt)).To(BeFalse())
+	})
+
+	// A generator whose TestRun is applied may still be unable to reach the
+	// VM-facing filer: the GO signal and the end-of-test summary upload both
+	// go through it. startProbe asks each generator right after dispatch;
+	// collectProbes reads the verdicts once they have settled and folds an
+	// unreachable one into K6Dispatched as a warning that does not move the
+	// dispatch's own status or budget.
+	Context("filer reachability probe", func() {
+		// awaiting is the "fleet round" Context's helper, duplicated here: it
+		// is a closure over that Context's own scope, not a Describe-level
+		// helper, so a sibling Context cannot reach it.
+		awaiting := func(l *dfaasv1.LoadTest) bool {
+			c := cond(l, dfaasv1.LTCondSyncReady)
+			return c != nil && c.Reason == dfaasv1.LTReasonAwaitingRunners
+		}
+
+		// ageDispatched moves K6Dispatched's LastTransitionTime back by d, as
+		// the barrier-budget specs do, so the probe settle window can pass.
+		ageDispatched := func(lt *dfaasv1.LoadTest, d time.Duration) {
+			var fresh dfaasv1.LoadTest
+			Expect(k8sClient.Get(ctx, keyOf(lt), &fresh)).To(Succeed())
+			for i := range fresh.Status.Conditions {
+				if fresh.Status.Conditions[i].Type == dfaasv1.LTCondK6Dispatched {
+					fresh.Status.Conditions[i].LastTransitionTime = metav1.NewTime(time.Now().Add(-d))
+				}
+			}
+			Expect(k8sClient.Status().Update(ctx, &fresh)).To(Succeed())
+		}
+
+		It("starts one probe per generator with the summary URL it injects", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			for _, id := range []string{"gen-a", "gen-b"} {
+				Expect(fleet.ProbeURL(id, running)).To(Equal(channel.SummaryURL(running, id)))
+			}
+		})
+
+		It("an unreachable filer keeps K6Dispatched True, names generator, URL and error, and deletes the probes", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			before := cond(running, dfaasv1.LTCondK6Dispatched).LastTransitionTime
+			fleet.SetProbe("gen-a", running, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeUnreachable,
+				Detail: "can't connect to remote host (192.168.252.70): Connection timed out"})
+			fleet.SetProbe("gen-b", running, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeReachable})
+			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool {
+				return cond(l, dfaasv1.LTCondK6Dispatched).Reason == dfaasv1.LTReasonDispatchedUnreachable
+			})
+			c := cond(fresh, dfaasv1.LTCondK6Dispatched)
+			Expect(c.Status).To(Equal(metav1.ConditionTrue))
+			Expect(c.LastTransitionTime).To(Equal(before))
+			Expect(c.Message).To(ContainSubstring("gen-a"))
+			Expect(c.Message).To(ContainSubstring(channel.SummaryURL(fresh, "gen-a")))
+			Expect(c.Message).To(ContainSubstring("Connection timed out"))
+			Expect(c.Message).NotTo(ContainSubstring("gen-b"))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+			Expect(fleet.ProbeExists("gen-a", fresh)).To(BeFalse())
+			Expect(fleet.ProbeExists("gen-b", fresh)).To(BeFalse())
+		})
+
+		It("every generator reachable leaves AllDispatched and deletes the probes", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			fleet.SetProbe("gen-a", running, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeReachable})
+			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool { return !fleet.ProbeExists("gen-a", l) })
+			Expect(fleet.ProbeExists("gen-a", fresh)).To(BeFalse())
+			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Reason).To(Equal(dfaasv1.LTReasonAllDispatched))
+		})
+
+		It("a probe that did not run, or could not be created, leaves AllDispatched", func() {
+			envReady("env", "gen-a", "gen-b")
+			scriptCM("script")
+			fleet.FailNext("gen-b", "probe", fmt.Errorf("pods is forbidden"))
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(fleet.ProbeExists("gen-b", running)).To(BeFalse())
+			fleet.SetProbe("gen-a", running, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeDidNotRun, Detail: "DeadlineExceeded"})
+			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool { return !fleet.ProbeExists("gen-a", l) })
+			Expect(fleet.ProbeExists("gen-a", fresh)).To(BeFalse())
+			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Reason).To(Equal(dfaasv1.LTReasonAllDispatched))
+			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
+		})
+
+		It("a probe still pending after the settle time counts as not run and is deleted", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			ageDispatched(lt, probeSettleAfter+time.Second)
+			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool { return !fleet.ProbeExists("gen-a", l) })
+			Expect(fleet.ProbeExists("gen-a", fresh)).To(BeFalse())
+			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Reason).To(Equal(dfaasv1.LTReasonAllDispatched))
+		})
+
+		It("a syncStart test keeps the warning across barrier polls that re-enter the dispatch", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			waiting := reconcileUntil(lt, 10, awaiting)
+			fleet.SetProbe("gen-a", waiting, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeUnreachable, Detail: "download timed out"})
+			reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool {
+				return cond(l, dfaasv1.LTCondK6Dispatched).Reason == dfaasv1.LTReasonDispatchedUnreachable
+			})
+			fresh := reconcileUntil(lt, 4, func(*dfaasv1.LoadTest) bool { return false }) // more barrier polls
+			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Reason).To(Equal(dfaasv1.LTReasonDispatchedUnreachable))
+			Expect(cond(fresh, dfaasv1.LTCondK6Dispatched).Status).To(Equal(metav1.ConditionTrue))
+		})
+
+		It("a stale probe Pod is deleted before the TestRun is applied", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			fleet.SetProbe("gen-a", lt, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeUnreachable, URL: "http://old"})
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(fleet.ProbeURL("gen-a", running)).To(Equal(channel.SummaryURL(running, "gen-a")))
+		})
 	})
 
 	Context("ordering guards in Reconcile", func() {

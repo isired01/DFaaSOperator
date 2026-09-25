@@ -183,6 +183,7 @@ var terminalFailure = map[string]bool{
 	LTReasonScheduledDelayedEnvNot: false,
 	LTReasonInFlight:               false,
 	LTReasonAllDispatched:          false,
+	LTReasonDispatchedUnreachable:  false, // warning on K6Dispatched=True; the test runs on
 	LTReasonPending:                false,
 	LTReasonAllFinished:            false,
 	LTReasonRunning:                false,
