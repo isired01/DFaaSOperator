@@ -33,12 +33,13 @@ const probeDeadlineSeconds int64 = 30
 // probeScript asks the probe URL once. Any HTTP answer, a 404 included, means
 // reachable (exit 0); a connection, DNS or timeout error means unreachable
 // (exit 3, the error on stdout, which FallbackToLogsOnError turns into the
-// termination message). Anything else is no network verdict (exit 4): the
-// probe itself is broken, and that must not read as a network problem.
+// termination message). Anything else is no network verdict (exit 4, what the
+// shell or wget said on stdout, so the operator log says why): the probe
+// itself is broken, and that must not read as a network problem.
 const probeScript = `out=$(wget -q -O /dev/null -T 10 "$PROBE_URL" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && exit 0
 case "$out" in *"server returned error"*) exit 0 ;; esac
-[ "$rc" -eq 1 ] || exit 4
+[ "$rc" -eq 1 ] || { echo "$out"; exit 4; }
 echo "${out#wget: }"
 exit 3`
 
@@ -122,7 +123,11 @@ func probeOutcome(lt *dfaasv1.LoadTest, p *corev1.Pod) ProbeOutcome {
 				if t.ExitCode == 3 {
 					o.State = ProbeUnreachable
 				}
-				o.Detail = strings.TrimSpace(t.Message)
+				// A deadline kill leaves the message empty: keep the Pod's
+				// DeadlineExceeded then.
+				if m := strings.TrimSpace(t.Message); m != "" {
+					o.Detail = m
+				}
 			}
 		}
 	}

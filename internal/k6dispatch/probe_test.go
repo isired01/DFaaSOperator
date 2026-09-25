@@ -54,26 +54,33 @@ func TestProbeOutcomeReadsThePodStatus(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		phase  corev1.PodPhase
+		reason string // the Pod's own status.reason
 		status []corev1.ContainerStatus
 		uid    string
 		want   ProbeState
-		detail string
+		detail string // a substring of the wanted Detail
 	}{
-		{"any HTTP answer", corev1.PodSucceeded, []corev1.ContainerStatus{terminated(0, "")}, "uid-1", ProbeReachable, ""},
-		{"network error", corev1.PodFailed, []corev1.ContainerStatus{terminated(3, "download timed out\n")}, "uid-1", ProbeUnreachable, "download timed out"},
-		{"wget missing", corev1.PodFailed, []corev1.ContainerStatus{terminated(4, "")}, "uid-1", ProbeDidNotRun, ""},
-		{"deadline while pulling", corev1.PodFailed, nil, "uid-1", ProbeDidNotRun, ""},
-		{"still running", corev1.PodRunning, nil, "uid-1", ProbeRunning, ""},
-		{"pending", corev1.PodPending, nil, "uid-1", ProbeRunning, ""},
-		{"another test's pod", corev1.PodFailed, []corev1.ContainerStatus{terminated(3, "x")}, "uid-2", ProbeDidNotRun, ""},
+		{"any HTTP answer", corev1.PodSucceeded, "", []corev1.ContainerStatus{terminated(0, "")}, "uid-1", ProbeReachable, ""},
+		{"network error", corev1.PodFailed, "", []corev1.ContainerStatus{terminated(3, "download timed out\n")}, "uid-1", ProbeUnreachable, "download timed out"},
+		{"wget missing", corev1.PodFailed, "", []corev1.ContainerStatus{terminated(4, "sh: wget: not found\n")}, "uid-1", ProbeDidNotRun, "wget: not found"},
+		{"deadline while pulling", corev1.PodFailed, "", nil, "uid-1", ProbeDidNotRun, ""},
+		// A deadline kill leaves the container's termination message empty:
+		// the Pod's own reason is then the only detail there is.
+		{"deadline while running", corev1.PodFailed, "DeadlineExceeded", []corev1.ContainerStatus{terminated(137, "")}, "uid-1", ProbeDidNotRun, "DeadlineExceeded"},
+		{"still running", corev1.PodRunning, "", nil, "uid-1", ProbeRunning, ""},
+		{"pending", corev1.PodPending, "", nil, "uid-1", ProbeRunning, ""},
+		{"another test's pod", corev1.PodFailed, "", []corev1.ContainerStatus{terminated(3, "x")}, "uid-2", ProbeDidNotRun, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := probePod(lt, "gen-a", "http://u")
 			p.Labels[ScriptOwnerLabel] = tc.uid
-			p.Status.Phase, p.Status.ContainerStatuses = tc.phase, tc.status
+			p.Status.Phase, p.Status.Reason, p.Status.ContainerStatuses = tc.phase, tc.reason, tc.status
+			if tc.reason != "" {
+				p.Status.Message = "Pod was active on the node longer than the specified deadline"
+			}
 			got := probeOutcome(lt, p)
-			if got.State != tc.want || got.URL != "http://u" || (tc.detail != "" && got.Detail != tc.detail) {
-				t.Errorf("outcome = %+v, want state %v detail %q", got, tc.want, tc.detail)
+			if got.State != tc.want || got.URL != "http://u" || !strings.Contains(got.Detail, tc.detail) {
+				t.Errorf("outcome = %+v, want state %v detail containing %q", got, tc.want, tc.detail)
 			}
 		})
 	}
@@ -92,12 +99,17 @@ func TestProbeScriptTellsHTTPErrorsFromNetworkErrors(t *testing.T) {
 		wget   string // body of the fake wget; "" = no wget on PATH
 		code   int
 		stdout string
+		// has: substrings stdout must contain instead of equalling stdout, for
+		// a message whose wording is the shell's own.
+		has []string
 	}{
-		{"2xx", "exit 0", 0, ""},
-		{"404 is reachable", `echo "wget: server returned error: HTTP/1.1 404 Not Found" >&2; exit 1`, 0, ""},
-		{"refused", `echo "wget: can't connect to remote host (10.0.0.9): Connection refused" >&2; exit 1`, 3, "can't connect to remote host (10.0.0.9): Connection refused"},
-		{"timeout", `echo "wget: download timed out" >&2; exit 1`, 3, "download timed out"},
-		{"no wget", "", 4, ""},
+		{"2xx", "exit 0", 0, "", nil},
+		{"404 is reachable", `echo "wget: server returned error: HTTP/1.1 404 Not Found" >&2; exit 1`, 0, "", nil},
+		{"refused", `echo "wget: can't connect to remote host (10.0.0.9): Connection refused" >&2; exit 1`, 3, "can't connect to remote host (10.0.0.9): Connection refused", nil},
+		{"timeout", `echo "wget: download timed out" >&2; exit 1`, 3, "download timed out", nil},
+		// busybox and dash say "wget: not found", bash "wget: command not
+		// found": the detail is whatever the shell said, never empty.
+		{"no wget", "", 4, "", []string{"wget", "not found"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -109,8 +121,16 @@ func TestProbeScriptTellsHTTPErrorsFromNetworkErrors(t *testing.T) {
 			cmd := exec.Command(sh, "-c", probeScript)
 			cmd.Env = []string{"PATH=" + dir, "PROBE_URL=http://10.0.0.9:30901/x"}
 			out, _ := cmd.Output()
-			if code := cmd.ProcessState.ExitCode(); code != tc.code || strings.TrimSpace(string(out)) != tc.stdout {
-				t.Errorf("exit %d stdout %q, want %d %q", code, out, tc.code, tc.stdout)
+			got := strings.TrimSpace(string(out))
+			ok := got == tc.stdout
+			if tc.has != nil {
+				ok = true
+				for _, sub := range tc.has {
+					ok = ok && strings.Contains(got, sub)
+				}
+			}
+			if code := cmd.ProcessState.ExitCode(); code != tc.code || !ok {
+				t.Errorf("exit %d stdout %q, want %d %q (or containing %q)", code, out, tc.code, tc.stdout, tc.has)
 			}
 		})
 	}
