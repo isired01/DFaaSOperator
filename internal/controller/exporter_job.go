@@ -243,14 +243,15 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 						{
 							Name:  "exporter",
 							Image: exporterImage(),
-							// The default tag is a moving one: a merge to main
-							// republishes :latest. Under IfNotPresent a node that
-							// already holds a layer for that tag reuses it, so a
-							// LoadTest exports with a weeks-old build and nothing
-							// says so -- the CSV just keeps the old shape.
-							ImagePullPolicy: corev1.PullAlways,
-							Env:             envVars,
-							VolumeMounts:    volumeMounts,
+							// No ImagePullPolicy: left to the API server's own
+							// default, which keys off the image tag. Always for
+							// the :latest fallback above (make run only), so
+							// that path still gets a fresh pull on every merge
+							// to main; IfNotPresent for a fixed tag -- the
+							// chart's pinned appVersion, or one loaded onto the
+							// node by hand, which must run from that copy.
+							Env:          envVars,
+							VolumeMounts: volumeMounts,
 						},
 					},
 					Volumes: volumes,

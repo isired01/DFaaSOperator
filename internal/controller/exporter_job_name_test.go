@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -112,11 +111,16 @@ func TestExporterJobNamesTheRunWithoutS3(t *testing.T) {
 	}
 }
 
-// The exporter image is a moving tag: a merge to main republishes
-// ghcr.io/isired01/dfaas-exporter:latest. With the default IfNotPresent, a
-// node that already holds a layer for that tag reuses it, so a LoadTest can
-// export with a build from weeks ago and nothing says so.
-func TestExporterJobAlwaysPullsItsImage(t *testing.T) {
+// The exporter Job sets no ImagePullPolicy, leaving it to the API server's
+// own default: Always for the `:latest` fallback exporterImage() returns
+// when DFAAS_EXPORTER_IMAGE is unset (make run only -- a merge to main
+// republishes ghcr.io/isired01/dfaas-exporter:latest, so that path still gets
+// a fresh pull every time), and IfNotPresent for a fixed tag, such as the
+// chart's pinned appVersion or an image loaded onto the node by hand. A
+// hard-coded PullAlways would force even a hand-loaded fixed tag back to
+// ghcr, where it does not exist, and the exporter Job sits in ErrImagePull
+// until its ActiveDeadlineSeconds trips.
+func TestExporterJobLeavesThePullPolicyToTheImageTag(t *testing.T) {
 	sch := runtime.NewScheme()
 	if err := dfaasv1.AddToScheme(sch); err != nil {
 		t.Fatal(err)
@@ -136,7 +140,7 @@ func TestExporterJobAlwaysPullsItsImage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createExporterJob: %v", err)
 	}
-	if got := job.Spec.Template.Spec.Containers[0].ImagePullPolicy; got != corev1.PullAlways {
-		t.Errorf("ImagePullPolicy = %q, want %q", got, corev1.PullAlways)
+	if got := job.Spec.Template.Spec.Containers[0].ImagePullPolicy; got != "" {
+		t.Errorf("ImagePullPolicy = %q, want empty (left to the API server's default)", got)
 	}
 }
