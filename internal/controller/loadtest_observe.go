@@ -75,8 +75,6 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 		return r.failLoadTest(ctx, lt, "generator unusable: "+rd.describe(rd.unusable))
 	}
 
-	r.collectProbes(ctx, lt, env)
-
 	budget := r.budget(fetchMissesAnnotation, fetchRetryBudget)
 	if len(rd.missing) > 0 {
 		// ErrNotFound included: a TestRun that disappeared under a running test
@@ -99,6 +97,9 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 		}))
 		return ctrl.Result{RequeueAfter: r.retryInterval()}, nil
 	}
+	// Only on a complete round: one that missed a generator already cost a
+	// remote timeout, and reading the probes would add another.
+	r.collectProbes(ctx, lt, env)
 	// A complete round — reset the counter (a no-op at zero).
 	if rerr := budget.Clear(ctx, lt); rerr != nil {
 		logger.Error(rerr, "reset fetch-misses failed; non-fatal")

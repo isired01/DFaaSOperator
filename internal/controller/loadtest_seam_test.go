@@ -13,6 +13,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -435,6 +436,48 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(failed.Status.Phase).To(Equal(dfaasv1.LoadTestFailed))
 			Expect(fleet.Applied()).To(HaveLen(1))
 			Expect(fleet.ProbeExists("gen-a", failed)).To(BeFalse())
+		})
+
+		// probeReads is how many probe reads fleet.Calls() holds from index n on.
+		probeReads := func(n int) []string {
+			var reads []string
+			for _, c := range fleet.Calls()[n:] {
+				if strings.HasPrefix(c, "probe-read:") {
+					reads = append(reads, c)
+				}
+			}
+			return reads
+		}
+
+		// A generator the operator cannot reach already costs the round one
+		// remote timeout; reading the probes too would add another per poll.
+		It("an observe round that could not reach a generator reads no probe", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(fleet.ProbeExists("gen-a", lt)).To(BeTrue())
+			fleet.FailNext("gen-a", "stage", fmt.Errorf("dial tcp 10.0.1.1:6443: i/o timeout"))
+			n := len(fleet.Calls())
+			missed := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(cond(missed, dfaasv1.LTCondK6Healthy).Reason).To(Equal(dfaasv1.LTReasonFetchFailed))
+			Expect(probeReads(n)).To(BeEmpty())
+		})
+
+		It("a barrier poll that could not reach a generator reads no probe", func() {
+			envReady("env", "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			reconcileUntil(lt, 10, awaiting)
+			Expect(fleet.ProbeExists("gen-a", lt)).To(BeTrue())
+			fleet.FailNext("gen-a", "stage", fmt.Errorf("dial tcp 10.0.1.1:6443: i/o timeout"))
+			n := len(fleet.Calls())
+			polled := reconcileUntil(lt, 1, func(*dfaasv1.LoadTest) bool { return false })
+			Expect(cond(polled, dfaasv1.LTCondSyncReady).Message).To(ContainSubstring("no status from gen-a"))
+			Expect(probeReads(n)).To(BeEmpty())
 		})
 
 		It("an unreachable filer keeps K6Dispatched True, names generator, URL and error, and deletes the probes", func() {

@@ -69,14 +69,18 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 		return r.finishDispatch(ctx, lt, lt.Status.TestRuns)
 	}
 
-	r.collectProbes(ctx, lt, env)
-
 	total := len(lt.Status.TestRuns)
 	nodeIDs := make([]string, 0, total)
 	for _, ref := range lt.Status.TestRuns {
 		nodeIDs = append(nodeIDs, ref.NodeID)
 	}
 	rd := r.survey(ctx, lt, env, nodeIDs)
+	// A round that missed a generator already cost a remote timeout; the probes
+	// wait for a complete one (a runner at stage=error answered). Before the
+	// fail checks, so a verdict landing in this pass reaches their message.
+	if len(rd.missing) == 0 {
+		r.collectProbes(ctx, lt, env)
+	}
 	fail := func(ready, detail string) (ctrl.Result, error) {
 		note := probeNote(lt)
 		logger.Info("sync barrier: aborting all", "cause", detail+note)
