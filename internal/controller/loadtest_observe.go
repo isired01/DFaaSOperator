@@ -97,6 +97,9 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 		}))
 		return ctrl.Result{RequeueAfter: r.retryInterval()}, nil
 	}
+	// Only on a complete round: one that missed a generator already cost a
+	// remote timeout, and reading the probes would add another.
+	r.collectProbes(ctx, lt, env)
 	// A complete round — reset the counter (a no-op at zero).
 	if rerr := budget.Clear(ctx, lt); rerr != nil {
 		logger.Error(rerr, "reset fetch-misses failed; non-fatal")

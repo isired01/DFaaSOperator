@@ -75,11 +75,18 @@ func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 		nodeIDs = append(nodeIDs, ref.NodeID)
 	}
 	rd := r.survey(ctx, lt, env, nodeIDs)
+	// A round that missed a generator already cost a remote timeout; the probes
+	// wait for a complete one (a runner at stage=error answered). Before the
+	// fail checks, so a verdict landing in this pass reaches their message.
+	if len(rd.missing) == 0 {
+		r.collectProbes(ctx, lt, env)
+	}
 	fail := func(ready, detail string) (ctrl.Result, error) {
-		logger.Info("sync barrier: aborting all", "cause", detail)
-		return r.failLoadTest(ctx, lt, "synchronized start: "+ready, statuswriter.Cond{
+		note := probeNote(lt)
+		logger.Info("sync barrier: aborting all", "cause", detail+note)
+		return r.failLoadTest(ctx, lt, "synchronized start: "+ready+note, statuswriter.Cond{
 			Type: dfaasv1.LTCondSyncReady, Status: metav1.ConditionFalse,
-			Reason: dfaasv1.LTReasonSyncTimeout, Message: detail})
+			Reason: dfaasv1.LTReasonSyncTimeout, Message: detail + note})
 	}
 
 	// A generator that left the Environment will never report "started": fail

@@ -117,6 +117,7 @@ func (r *LoadTestReconciler) handleLoadTestDeletion(ctx context.Context,
 							node.DeleteScript(ctx, lt, pn.ScriptConfigMap.Name))
 					}
 				}
+				logStatusErr(ctx, "delete filer reachability probe (loadtest deletion)", node.DeleteProbe(ctx, lt))
 			case serr != nil:
 				logger.Error(serr, "remote TestRun NotFound-poll errored", "node", nodeID)
 				errored = append(errored, nodeID)

@@ -19,6 +19,7 @@ import (
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 
 	dfaasv1 "dfaas-operator/api/v1"
@@ -43,13 +44,16 @@ type Fleet struct {
 	mirrored []string             // "<nodeID>/<cm name>"
 	scripts  map[string]types.UID // "<nodeID>/<name>" → owner UID
 	logs     map[string]string
-	failNext map[string]error // "<nodeID>|<op>" → error, consumed on first use
+	probes   map[string]k6dispatch.ProbeOutcome // key(nodeID, lt) → probe verdict
+	failNext map[string]error                   // "<nodeID>|<op>" → error, consumed on first use
+	calls    []string                           // "<op>:<nodeID>", in order (see Calls)
 }
 
 // New returns an empty fleet.
 func New() *Fleet {
 	return &Fleet{stages: map[string]string{}, scripts: map[string]types.UID{},
-		logs: map[string]string{}, failNext: map[string]error{}}
+		logs: map[string]string{}, probes: map[string]k6dispatch.ProbeOutcome{},
+		failNext: map[string]error{}}
 }
 
 func key(nodeID string, lt *dfaasv1.LoadTest) string {
@@ -81,7 +85,7 @@ func (f *Fleet) SetLogs(nodeID, logs string) {
 }
 
 // FailNext makes the next op ("mirror", "apply", "stage", "delete", "logs",
-// "script") on nodeID return err, once.
+// "script", "probe", "probe-read", "probe-delete") on nodeID return err, once.
 func (f *Fleet) FailNext(nodeID, op string, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -117,6 +121,16 @@ func (f *Fleet) Mirrored() []string {
 	return append([]string(nil), f.mirrored...)
 }
 
+// Calls returns, in order, every Apply, StartProbe, ProbeResult and
+// DeleteProbe call as "<op>:<nodeID>", op spelled as FailNext names it
+// ("apply", "probe", "probe-read", "probe-delete"). A call that failed is
+// still a call made, so it is recorded too.
+func (f *Fleet) Calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
 // Exists reports whether lt's TestRun is present on nodeID.
 func (f *Fleet) Exists(nodeID string, lt *dfaasv1.LoadTest) bool {
 	f.mu.Lock()
@@ -131,6 +145,32 @@ func (f *Fleet) ScriptExists(nodeID, name string) bool {
 	defer f.mu.Unlock()
 	_, ok := f.scripts[nodeID+"/"+name]
 	return ok
+}
+
+// SetProbe scripts nodeID's probe verdict, keeping the URL it was started with.
+func (f *Fleet) SetProbe(nodeID string, lt *dfaasv1.LoadTest, o k6dispatch.ProbeOutcome) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := key(nodeID, lt)
+	if o.URL == "" {
+		o.URL = f.probes[k].URL
+	}
+	f.probes[k] = o
+}
+
+// ProbeExists reports whether nodeID still has a probe Pod for lt.
+func (f *Fleet) ProbeExists(nodeID string, lt *dfaasv1.LoadTest) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.probes[key(nodeID, lt)]
+	return ok
+}
+
+// ProbeURL is the URL nodeID's probe was started with ("" if none).
+func (f *Fleet) ProbeURL(nodeID string, lt *dfaasv1.LoadTest) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.probes[key(nodeID, lt)].URL
 }
 
 func (f *Fleet) takeFailure(nodeID, op string) error {
@@ -177,6 +217,7 @@ func (n *node) DeleteScript(_ context.Context, lt *dfaasv1.LoadTest, name string
 func (n *node) Apply(_ context.Context, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad, env k6dispatch.RunnerEnv) error {
 	n.f.mu.Lock()
 	defer n.f.mu.Unlock()
+	n.f.calls = append(n.f.calls, "apply:"+n.nodeID)
 	if err := n.f.takeFailure(n.nodeID, "apply"); err != nil {
 		return err
 	}
@@ -221,4 +262,42 @@ func (n *node) Logs(_ context.Context, _ *dfaasv1.LoadTest) (string, error) {
 		return "", err
 	}
 	return n.f.logs[n.nodeID], nil
+}
+
+// StartProbe refuses a probe already present under the name, as the live
+// Create does: only DeleteProbe clears a leftover.
+func (n *node) StartProbe(_ context.Context, lt *dfaasv1.LoadTest, url string) error {
+	n.f.mu.Lock()
+	defer n.f.mu.Unlock()
+	n.f.calls = append(n.f.calls, "probe:"+n.nodeID)
+	if err := n.f.takeFailure(n.nodeID, "probe"); err != nil {
+		return err
+	}
+	k := key(n.nodeID, lt)
+	if _, ok := n.f.probes[k]; ok {
+		return apierrors.NewAlreadyExists(corev1.Resource("pods"), k6dispatch.ProbeName(lt, n.nodeID))
+	}
+	n.f.probes[k] = k6dispatch.ProbeOutcome{State: k6dispatch.ProbeRunning, URL: url}
+	return nil
+}
+
+func (n *node) ProbeResult(_ context.Context, lt *dfaasv1.LoadTest) (k6dispatch.ProbeOutcome, error) {
+	n.f.mu.Lock()
+	defer n.f.mu.Unlock()
+	n.f.calls = append(n.f.calls, "probe-read:"+n.nodeID)
+	if err := n.f.takeFailure(n.nodeID, "probe-read"); err != nil {
+		return k6dispatch.ProbeOutcome{}, err
+	}
+	return n.f.probes[key(n.nodeID, lt)], nil // zero value = ProbeAbsent
+}
+
+func (n *node) DeleteProbe(_ context.Context, lt *dfaasv1.LoadTest) error {
+	n.f.mu.Lock()
+	defer n.f.mu.Unlock()
+	n.f.calls = append(n.f.calls, "probe-delete:"+n.nodeID)
+	if err := n.f.takeFailure(n.nodeID, "probe-delete"); err != nil {
+		return err
+	}
+	delete(n.f.probes, key(n.nodeID, lt))
+	return nil
 }

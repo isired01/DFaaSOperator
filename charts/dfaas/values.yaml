@@ -26,6 +26,11 @@ operator:
   leaderElection:
     enabled: true
   extraEnv: []                    # list of {name, value}
+                                  # DFAAS_SYNC_PUBLIC_URL: the GO-signal filer address handed to
+                                  #   every k6 generator; default: http://<manager hostIP>:30901.
+                                  #   Must be reachable from every generator — on a lab spread over
+                                  #   several sites, that is the management node's tailnet IP, not a
+                                  #   local bridge address.
   nodeSelector: {}
   tolerations: []
   affinity: {}
@@ -65,6 +70,9 @@ ui:
     # SEAWEEDFS_ENDPOINT: ""      # override gateway→SeaweedFS dial endpoint; default: auto
                                   #   (in-cluster → seaweedfs-all-in-one.monitoring.svc…:8333, dev → <nodeIP>:30900)
     # SEAWEEDFS_PUBLIC_URL: ""    # override the asset URL handed to k6; default: <nodeIP>:30900
+                                  #   Must be reachable from every generator — on a lab spread over
+                                  #   several sites, that is the management node's tailnet IP, not a
+                                  #   local bridge address.
     # SEAWEEDFS_FILER_PUBLIC_URL: ""
                                   # override the base of the result links shown after a
                                   # LoadTest; default: <nodeIP>:30901 (filer NodePort)

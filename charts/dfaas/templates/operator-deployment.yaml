@@ -33,6 +33,9 @@ spec:
             # LoadTest starts (http://<HOST_IP>:30901, SeaweedFS filer
             # NodePort). Override via operator.extraEnv DFAAS_SYNC_PUBLIC_URL
             # when k6 VMs reach the management node on a different address.
+            # Must be reachable from every generator: on a lab spread over
+            # several sites, that is the management node's tailnet IP, not a
+            # local bridge address.
             - name: HOST_IP
               valueFrom:
                 fieldRef:

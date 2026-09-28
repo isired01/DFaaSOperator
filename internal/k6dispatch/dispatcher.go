@@ -80,6 +80,14 @@ type Node interface {
 	Delete(ctx context.Context, lt *dfaasv1.LoadTest) error
 	// Logs returns the k6 runner Pod log(s) of lt's TestRun.
 	Logs(ctx context.Context, lt *dfaasv1.LoadTest) (string, error)
+	// StartProbe creates this node's reachability probe for lt: a short-lived
+	// Pod that asks url once from the generator's own network. It does not
+	// wait for the answer; ProbeResult reads it later.
+	StartProbe(ctx context.Context, lt *dfaasv1.LoadTest, url string) error
+	// ProbeResult reads the probe Pod's verdict; ProbeAbsent when there is none.
+	ProbeResult(ctx context.Context, lt *dfaasv1.LoadTest) (ProbeOutcome, error)
+	// DeleteProbe deletes the probe Pod; an absent one is success.
+	DeleteProbe(ctx context.Context, lt *dfaasv1.LoadTest) error
 }
 
 // RunnerEnv is what the reconciler decides and the adapter injects into the k6
@@ -371,6 +379,41 @@ func (n *liveNode) DeleteScript(ctx context.Context, lt *dfaasv1.LoadTest, name 
 		return nil
 	}
 	return err
+}
+
+func (n *liveNode) StartProbe(ctx context.Context, lt *dfaasv1.LoadTest, url string) error {
+	rc, err := n.remoteClient(ctx)
+	if err != nil {
+		return err
+	}
+	if err := rc.Create(ctx, probePod(lt, n.nodeID, url)); err != nil {
+		return fmt.Errorf("create probe Pod %s/%s: %w", remoteNamespace, ProbeName(lt, n.nodeID), err)
+	}
+	return nil
+}
+
+func (n *liveNode) ProbeResult(ctx context.Context, lt *dfaasv1.LoadTest) (ProbeOutcome, error) {
+	rc, err := n.remoteClient(ctx)
+	if err != nil {
+		return ProbeOutcome{}, err
+	}
+	var p corev1.Pod
+	if err := rc.Get(ctx, client.ObjectKey{Namespace: remoteNamespace, Name: ProbeName(lt, n.nodeID)}, &p); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ProbeOutcome{State: ProbeAbsent}, nil
+		}
+		return ProbeOutcome{}, err
+	}
+	return probeOutcome(lt, &p), nil
+}
+
+func (n *liveNode) DeleteProbe(ctx context.Context, lt *dfaasv1.LoadTest) error {
+	rc, err := n.remoteClient(ctx)
+	if err != nil {
+		return err
+	}
+	p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: remoteNamespace, Name: ProbeName(lt, n.nodeID)}}
+	return client.IgnoreNotFound(rc.Delete(ctx, p))
 }
 
 func (n *liveNode) Apply(ctx context.Context, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad, env RunnerEnv) error {
