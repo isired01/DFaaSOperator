@@ -61,15 +61,21 @@ jobs:
           docker build -t dfaas-imgproc:ci imageFunction
 
   # The exporter image is the one that moves with every change to the export
-  # format, and the cluster pulls it by :latest. Publishing it from main makes
-  # the merge the delivery, instead of a buildx run on a laptop that happens to
-  # have Docker up. Deliberately only this image: the operator and imgproc
-  # images still ship from release.yml on a v* tag, and the job above still
-  # only *builds* all three, on every PR, as the Dockerfile gate.
+  # format. A Helm install never pulls it by :latest -- the chart pins a fixed
+  # tag (appVersion, or operator.exporterImage.tag) via DFAAS_EXPORTER_IMAGE on
+  # the operator Deployment; :latest is only exporterImage()'s fallback in
+  # internal/controller/exporter_job.go, used by an operator started with
+  # `make run` and no DFAAS_EXPORTER_IMAGE set. Publishing it from main makes
+  # that local dev path built from real export code, instead of a buildx run
+  # on a laptop that happens to have Docker up. Deliberately only this image:
+  # the operator and imgproc images still ship from release.yml on a v* tag,
+  # and the job above still only *builds* all three, on every PR, as the
+  # Dockerfile gate.
   #
   # Consequence to keep in mind: :latest now means "current main" for the
-  # exporter, not "last release". A fresh install of an older release pulls
-  # unreleased exporter code unless it pins a version tag.
+  # exporter, not "last release" -- a `make run` operator started right after
+  # a merge to main picks up unreleased exporter code, with no version pin of
+  # its own to fall back on.
   publish-exporter:
     needs: test
     # test.yml runs on pull_request too; only a push to main publishes.
