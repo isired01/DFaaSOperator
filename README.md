@@ -17,16 +17,16 @@ The chart packages the CRDs, so `helm install` applies them for you. (`helm upgr
 
 ```bash
 helm install dfaas oci://ghcr.io/isired01/charts/dfaas \
-  --version 3.5.0 \
+  --version 4.0.0 \
   --create-namespace \
   --namespace dfaas-operator-system
 
 # Alternatively, install the chart straight from a repo checkout. Chart.yaml ships
 # appVersion 0.0.0, and every image tag defaults to it, so pin a real one:
 # helm install dfaas ./charts/dfaas --create-namespace --namespace dfaas-operator-system \
-#   --set operator.image.tag=3.5.0 \
-#   --set operator.exporterImage.tag=3.5.0 \
-#   --set ui.image.tag=3.5.0
+#   --set operator.image.tag=4.0.0 \
+#   --set operator.exporterImage.tag=4.0.0 \
+#   --set ui.image.tag=4.0.0
 ```
 
 The UI Service defaults to NodePort `30800`, so the control plane is reachable at
@@ -73,7 +73,7 @@ kubectl apply -f config/samples/dfaas_v1_loadtest.yaml
 ### Override values
 
 ```bash
-helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 3.5.0 \
+helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 4.0.0 \
   --create-namespace \
   --namespace dfaas-operator-system \
   --set operator.replicas=2 \
@@ -85,7 +85,7 @@ helm install dfaas oci://ghcr.io/isired01/charts/dfaas --version 3.5.0 \
 
 ```bash
 # Helm applies CRDs on install but never on upgrade. Apply the target release's
-# CRDs FIRST (replace <version> with it, e.g. 3.5.0):
+# CRDs FIRST (replace <version> with it, e.g. 4.0.0):
 kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_environments.yaml
 kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_loadtests.yaml
 
@@ -96,7 +96,7 @@ helm upgrade dfaas oci://ghcr.io/isired01/charts/dfaas --version <version> \
 
 v3.5.0 adds `status.provisioningGeneration` to the `Environment` CRD. Upgrade the chart without applying the CRD first and the API server prunes that field from every status write: the operator keeps working, but an edit that lands while an Environment is provisioning is no longer detected, and the run settles as if it had installed the new spec.
 
-Releases after v3.6.0 add `status.k6Nodes[].managementAddress` to the `Environment` CRD: the address each generator reaches the management node on, detected at provisioning. Apply the CRD before the new operator starts. Against the old CRD the API server prunes the field from every status write, every generator falls back to `DFAAS_SYNC_PUBLIC_URL` / `HOST_IP` without notice, and no runner gets `DFAAS_ASSET_BASE`. An Environment provisioned before the upgrade gets its addresses only on its next provisioning run, so edit its spec once to re-provision it.
+v4.0.0 adds `status.k6Nodes[].managementAddress` to the `Environment` CRD: the address each generator reaches the management node on, detected at provisioning. Apply the CRD before the new operator starts. Against the old CRD the API server prunes the field from every status write, every generator falls back to `DFAAS_SYNC_PUBLIC_URL` / `HOST_IP` without notice, and no runner gets `DFAAS_ASSET_BASE`. An Environment provisioned before the upgrade gets its addresses only on its next provisioning run, so edit its spec once to re-provision it.
 
 ### Uninstall
 
