@@ -23,6 +23,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/monitoring"
 	"dfaas-operator/internal/controller/roles"
 )
 
@@ -240,9 +241,13 @@ func buildInventory(env *dfaasv1.Environment, spec roles.Spec,
 			// kubeconfig Secret it pushes back to the management cluster, so
 			// that Secret is garbage-collected with the Environment instead of
 			// lingering with dead credentials after a role flip.
+			// filer_node_port is the port the playbook probes the management
+			// address it detects on, so the playbook carries no copy of
+			// monitoring.FilerNodePort of its own.
 			inv += fmt.Sprintf(
-				"%s ansible_user=%s ansible_password=%s node_id='%s' env_name='%s' env_namespace='%s' env_uid='%s'\n",
+				"%s ansible_user=%s ansible_password=%s node_id='%s' env_name='%s' env_namespace='%s' env_uid='%s' filer_node_port=%d\n",
 				n.IPAddress, n.Username, n.Password, n.NodeID, env.Name, env.Namespace, env.UID,
+				monitoring.FilerNodePort,
 			)
 		}
 	default:
@@ -321,15 +326,34 @@ const (
 	LabelGeneration  = "dfaas.io/generation"
 )
 
-// Label keys the k6 playbook stamps on the per-node kubeconfig Secret it
-// pushes back into the management cluster. Note these are NOT LabelEnvironment
+// Keys the k6 playbook stamps on the per-node kubeconfig Secret it pushes
+// back into the management cluster. Note the env label is NOT LabelEnvironment
 // above: that one tags Jobs and inventory Secrets with "dfaas.io/environment",
-// while the kubeconfig Secret uses the shorter "dfaas.io/env". Both halves are
-// hand-synced with templates/setup-k6-nodes.yml, which is the source of truth.
+// while the kubeconfig Secret uses the shorter "dfaas.io/env". All three are
+// hand-synced with templates/setup-k6-nodes.yml, which is the source of truth;
+// k6_playbook_test.go checks that the push body carries each of them.
 const (
 	LabelKubeconfigEnv    = "dfaas.io/env"
 	LabelKubeconfigNodeID = "dfaas.io/node-id"
+
+	// AnnotationKubeconfigManagementAddress carries the management node
+	// address as the generator sees it (first field of $SSH_CONNECTION during
+	// the play), recorded only when it is IPv4 and the generator reached the
+	// filer NodePort with it; "" when nothing was detected. Always written, so
+	// a re-run overwrites a stale value. The EnvironmentReconciler validates
+	// it with k6dispatch.ParseManagementAddress before copying it into
+	// status.k6Nodes[].managementAddress.
+	AnnotationKubeconfigManagementAddress = "dfaas.io/management-address"
 )
+
+// KubeconfigSecretName is the name of the Secret the k6 playbook pushes
+// nodeID's kubeconfig into (mgmt_secret_name in templates/setup-k6-nodes.yml,
+// the source of truth). The EnvironmentReconciler records it in
+// status.k6Nodes[].kubeconfigSecret and reads the detected management address
+// off it.
+func KubeconfigSecretName(envName, nodeID string) string {
+	return envName + "-" + nodeID + "-kubeconfig"
+}
 
 // jobLabels returns the canonical label set for an Ansible Job + its
 // inventory Secret. Includes env.Name, role and env.Generation so the

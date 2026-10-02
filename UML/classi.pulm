@@ -76,6 +76,7 @@ class K6NodeStatus {
     + String nodeID
     + String ipAddress
     + String kubeconfigSecret
+    + String managementAddress
 }
 
 ' =====================================================================
@@ -266,9 +267,8 @@ MetricExportEntry -- MetricsExportType
 
 ' =====================================================================
 ' Cross-CRD soft reference (resolved at reconcile time by name,
-' namespace-local; OwnerRef stamped on the first pass after admission,
-' for a scheduled test only when it fires; a test that ends before that
-' gets none and outlives the Environment).
+' namespace-local; OwnerRef stamped on the first pass that finds the
+' Environment, for every test, scheduled and failed-at-admission included).
 ' =====================================================================
 LoadTest ..> Environment : targetEnvironment
 

@@ -16,9 +16,12 @@ package fake
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/monitoring"
+	"dfaas-operator/internal/k6dispatch"
 	"dfaas-operator/internal/syncchannel"
 )
 
@@ -33,8 +36,11 @@ type Channel struct {
 	DeleteGoErr        error
 	DeleteSummariesErr error
 
-	// Public is the VM-facing base. Empty means unresolvable, which is what
-	// makes GoURL return "" and the dispatch fail loudly.
+	// Public is the process-wide fallback base, what a generator with no
+	// detected management address dials (DFAAS_SYNC_PUBLIC_URL, else HOST_IP,
+	// in production). A generator with one gets the filer NodePort on it
+	// whatever Public says. Empty Public and no address mean unresolvable,
+	// which is what makes GoURL return "" and a syncStart dispatch fail loudly.
 	Public string
 
 	calls []string
@@ -82,18 +88,31 @@ func (c *Channel) DeleteSummaries(_ context.Context, _ *dfaasv1.LoadTest) error 
 	return c.DeleteSummariesErr
 }
 
-func (c *Channel) GoURL(lt *dfaasv1.LoadTest) string {
-	if c.Public == "" {
+// GoURL and SummaryURL follow the production precedence (detected address,
+// else Public, else ""). Like the Filer's, they are getters, not operations:
+// they are not recorded in Calls.
+func (c *Channel) GoURL(lt *dfaasv1.LoadTest, g k6dispatch.Generator) string {
+	base := c.vmBase(g)
+	if base == "" {
 		return ""
 	}
-	return c.Public + "/dfaas-sync/" + lt.Namespace + "/" + lt.Name + ".go"
+	return base + syncchannel.GoPath(lt)
 }
 
-func (c *Channel) SummaryURL(lt *dfaasv1.LoadTest, nodeID string) string {
-	if c.Public == "" {
+func (c *Channel) SummaryURL(lt *dfaasv1.LoadTest, g k6dispatch.Generator) string {
+	base := c.vmBase(g)
+	if base == "" {
 		return ""
 	}
-	return c.Public + syncchannel.SummaryPath(lt, nodeID)
+	return base + syncchannel.SummaryPath(lt, g.NodeID)
+}
+
+// vmBase mirrors Filer.vmBase, with Public as the fallback.
+func (c *Channel) vmBase(g k6dispatch.Generator) string {
+	if g.MgmtAddr != "" {
+		return monitoring.FilerPublicBase(g.MgmtAddr)
+	}
+	return strings.TrimRight(c.Public, "/")
 }
 
 func (c *Channel) InClusterSummaryURL(lt *dfaasv1.LoadTest, nodeID string) string {

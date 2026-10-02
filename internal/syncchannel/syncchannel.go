@@ -18,17 +18,22 @@ You may obtain a copy of the License at
 // DFAAS_SYNC_PUBLIC_URL-or-HOST_IP function for what the VMs poll. Every
 // operation picked one by hand.
 //
-// The bases are resolved ONCE, at construction. That is the whole point: the
-// three publish/delete functions were previously reachable in tests only by
-// mutating process-global state with bare os.Setenv, which meant the specs
-// could not run in parallel and a crashed spec leaked the variables into every
-// later spec in the package.
+// The process-wide bases are resolved ONCE, at construction. That is the whole
+// point: the three publish/delete functions were previously reachable in tests
+// only by mutating process-global state with bare os.Setenv, which meant the
+// specs could not run in parallel and a crashed spec leaked the variables into
+// every later spec in the package.
+//
+// What a VM dials is per generator: the management address detected for it at
+// provisioning (status.k6Nodes[].managementAddress, carried in by the caller as
+// a k6dispatch.Generator) when there is one, else the process-wide fallback
+// (DFAAS_SYNC_PUBLIC_URL, else HOST_IP). The address is call-time data from the
+// Environment's status, never read from the process environment.
 package syncchannel
 
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -44,6 +49,13 @@ const requestTimeout = 10 * time.Second
 
 // Channel is the object channel. Every method takes the LoadTest rather than a
 // path, so no caller ever spells a filer path or picks a base.
+//
+// The VM-facing URLs take the generator they are for. Their base is, in order:
+// the filer NodePort on g.MgmtAddr (the address detected for g at
+// provisioning); the process-wide fallback (DFAAS_SYNC_PUBLIC_URL, else
+// HOST_IP plus the filer NodePort); else none, and the URL is "". The caller
+// passes the detected address -- a fact -- rather than a base, so this
+// precedence lives in the adapter and no caller ever picks a base.
 type Channel interface {
 	// PublishGo makes the GO object visible to every parked runner within one
 	// poll interval. Idempotent: a re-PUT rewrites the object.
@@ -52,13 +64,15 @@ type Channel interface {
 	// object is success, so a 404 is not an error.
 	DeleteGo(ctx context.Context, lt *dfaasv1.LoadTest) error
 	DeleteSummaries(ctx context.Context, lt *dfaasv1.LoadTest) error
-	// GoURL is injected into the runner as DFAAS_SYNC_URL. Empty means no
-	// public base is resolvable -- the caller MUST fail the LoadTest loudly
-	// rather than dispatch a barrier nobody can open.
-	GoURL(lt *dfaasv1.LoadTest) string
-	// SummaryURL is injected as DFAAS_SUMMARY_URL. Empty means "no upload",
-	// never an error: a missing summary only degrades data richness.
-	SummaryURL(lt *dfaasv1.LoadTest, nodeID string) string
+	// GoURL is injected into g's runner as DFAAS_SYNC_URL. Empty means no
+	// VM-facing base is resolvable for g -- the caller MUST fail the LoadTest
+	// loudly rather than dispatch a barrier nobody can open. The path is the
+	// same for every generator, so one PublishGo opens every barrier.
+	GoURL(lt *dfaasv1.LoadTest, g k6dispatch.Generator) string
+	// SummaryURL is injected into g's runner as DFAAS_SUMMARY_URL. Empty means
+	// "no upload", never an error: a missing summary only degrades data
+	// richness.
+	SummaryURL(lt *dfaasv1.LoadTest, g k6dispatch.Generator) string
 	// InClusterSummaryURL is what the exporter Job fetches. Always the
 	// in-cluster base, never the public one.
 	InClusterSummaryURL(lt *dfaasv1.LoadTest, nodeID string) string
@@ -68,8 +82,9 @@ type Channel interface {
 type Filer struct {
 	// operatorBase is what the operator itself dials.
 	operatorBase string
-	// publicBase is what the k6 VMs dial. Empty when unresolvable.
-	publicBase string
+	// fallbackBase is what the k6 VMs dial when no management address was
+	// detected for their generator. Empty when unresolvable.
+	fallbackBase string
 	// inClusterBase is what the exporter Job dials -- always in-cluster DNS,
 	// even when the operator itself is reaching the filer another way.
 	inClusterBase string
@@ -79,9 +94,10 @@ type Filer struct {
 var _ Channel = (*Filer)(nil)
 
 // NewFiler builds a Filer over two resolved bases. An empty operatorBase falls
-// back to the in-cluster filer Service; an empty publicBase means the VM-facing
-// URLs are unavailable, which GoURL and SummaryURL report as "".
-func NewFiler(operatorBase, publicBase string) *Filer {
+// back to the in-cluster filer Service; an empty fallbackBase means the
+// VM-facing URLs are unavailable for a generator with no detected management
+// address, which GoURL and SummaryURL report as "".
+func NewFiler(operatorBase, fallbackBase string) *Filer {
 	inCluster := monitoring.FilerInClusterBase()
 	op := strings.TrimRight(operatorBase, "/")
 	if op == "" {
@@ -89,34 +105,35 @@ func NewFiler(operatorBase, publicBase string) *Filer {
 	}
 	return &Filer{
 		operatorBase:  op,
-		publicBase:    strings.TrimRight(publicBase, "/"),
+		fallbackBase:  strings.TrimRight(fallbackBase, "/"),
 		inClusterBase: inCluster,
 		client:        &http.Client{},
 	}
 }
 
-// FromEnv resolves both bases from the process environment. Call it once, in
-// cmd/main.go -- never per operation.
+// FromEnv resolves both process-wide bases from the process environment. Call
+// it once, in cmd/main.go -- never per operation.
 //
 //   - DFAAS_FILER_URL overrides what the operator dials. In-cluster the Service
 //     DNS works; under `make run` outside the cluster it does not resolve, so
 //     the override points at the filer NodePort instead.
-//   - DFAAS_SYNC_PUBLIC_URL overrides what the VMs dial (Helm-injectable, for
+//   - DFAAS_SYNC_PUBLIC_URL sets the fallback the VMs dial when no management
+//     address was detected for their generator (Helm-injectable, for
 //     multi-subnet labs), else HOST_IP (downward API, status.hostIP on the
 //     manager Deployment) plus the filer NodePort.
 func FromEnv() *Filer {
-	public := strings.TrimRight(os.Getenv("DFAAS_SYNC_PUBLIC_URL"), "/")
-	if public == "" {
+	fallback := strings.TrimRight(os.Getenv("DFAAS_SYNC_PUBLIC_URL"), "/")
+	if fallback == "" {
 		if ip := os.Getenv("HOST_IP"); ip != "" {
-			public = "http://" + net.JoinHostPort(ip, fmt.Sprint(monitoring.FilerNodePort))
+			fallback = monitoring.FilerPublicBase(ip)
 		}
 	}
-	return NewFiler(os.Getenv("DFAAS_FILER_URL"), public)
+	return NewFiler(os.Getenv("DFAAS_FILER_URL"), fallback)
 }
 
-// goPath is the filer path of the GO object. Outside /buckets, so it never
+// GoPath is the filer path of the GO object. Outside /buckets, so it never
 // shows up as an S3 bucket.
-func goPath(lt *dfaasv1.LoadTest) string {
+func GoPath(lt *dfaasv1.LoadTest) string {
 	return fmt.Sprintf("/dfaas-sync/%s/%s.go", lt.Namespace, lt.Name)
 }
 
@@ -133,18 +150,30 @@ func SummaryPath(lt *dfaasv1.LoadTest, nodeID string) string {
 	return fmt.Sprintf("%s/%s.json", SummaryDirPath(lt), k6dispatch.Sanitize(nodeID))
 }
 
-func (f *Filer) GoURL(lt *dfaasv1.LoadTest) string {
-	if f.publicBase == "" {
-		return ""
+// vmBase is the filer base a generator's runner dials: the filer NodePort on
+// the management address detected for it, else the process-wide fallback,
+// else "" (no VM-facing URL). The one place the precedence lives.
+func (f *Filer) vmBase(mgmtAddr string) string {
+	if mgmtAddr != "" {
+		return monitoring.FilerPublicBase(mgmtAddr)
 	}
-	return f.publicBase + goPath(lt)
+	return f.fallbackBase
 }
 
-func (f *Filer) SummaryURL(lt *dfaasv1.LoadTest, nodeID string) string {
-	if f.publicBase == "" {
+func (f *Filer) GoURL(lt *dfaasv1.LoadTest, g k6dispatch.Generator) string {
+	base := f.vmBase(g.MgmtAddr)
+	if base == "" {
 		return ""
 	}
-	return f.publicBase + SummaryPath(lt, nodeID)
+	return base + GoPath(lt)
+}
+
+func (f *Filer) SummaryURL(lt *dfaasv1.LoadTest, g k6dispatch.Generator) string {
+	base := f.vmBase(g.MgmtAddr)
+	if base == "" {
+		return ""
+	}
+	return base + SummaryPath(lt, g.NodeID)
 }
 
 func (f *Filer) InClusterSummaryURL(lt *dfaasv1.LoadTest, nodeID string) string {
@@ -152,7 +181,7 @@ func (f *Filer) InClusterSummaryURL(lt *dfaasv1.LoadTest, nodeID string) string 
 }
 
 func (f *Filer) PublishGo(ctx context.Context, lt *dfaasv1.LoadTest) error {
-	resp, err := f.do(ctx, http.MethodPut, f.operatorBase+goPath(lt), strings.NewReader("go"))
+	resp, err := f.do(ctx, http.MethodPut, f.operatorBase+GoPath(lt), strings.NewReader("go"))
 	if err != nil {
 		return fmt.Errorf("put GO signal: %w", err)
 	}
@@ -164,7 +193,7 @@ func (f *Filer) PublishGo(ctx context.Context, lt *dfaasv1.LoadTest) error {
 }
 
 func (f *Filer) DeleteGo(ctx context.Context, lt *dfaasv1.LoadTest) error {
-	return f.deleteBestEffort(ctx, f.operatorBase+goPath(lt), "delete GO signal")
+	return f.deleteBestEffort(ctx, f.operatorBase+GoPath(lt), "delete GO signal")
 }
 
 func (f *Filer) DeleteSummaries(ctx context.Context, lt *dfaasv1.LoadTest) error {

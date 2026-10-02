@@ -13,10 +13,20 @@ package monitoring
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	sigsyaml "sigs.k8s.io/yaml"
 )
+
+// Prometheus refuses a scrape_timeout longer than scrape_interval, and these
+// values leave scrape_timeout at the chart's 10s default: an interval below
+// 10s keeps the management Prometheus from loading its config at all.
+func TestFederationIntervalIsNotBelowTheScrapeTimeout(t *testing.T) {
+	if FederationInterval < 10*time.Second {
+		t.Errorf("server.global.scrape_interval = %v: below the chart's 10s scrape_timeout", FederationInterval)
+	}
+}
 
 // Retention lives in prometheus.yml (server.tsdb), which the config-reload
 // sidecar hot-reloads, so changing it never restarts the shared Prometheus.

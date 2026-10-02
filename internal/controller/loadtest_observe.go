@@ -25,19 +25,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/monitoring"
 	"dfaas-operator/internal/controller/statuswriter"
 	"dfaas-operator/internal/k6dispatch"
 )
 
-// federationInterval is how often the management Prometheus pulls worker
-// metrics through /federate: server.global.scrape_interval in
-// internal/controller/monitoring/values/prometheus-values.yaml. Both constants
-// below derive from it, so changing the interval in that file means changing it
-// here -- and federation_interval_test.go fails when the two disagree.
-const federationInterval = 15 * time.Second
-
-// exportTailWindow extends the export query past the LoadTest's EndTime.
-// Federation gives the mgmt instance one sample per node per interval, and
+// exportTailWindow extends the export query past the LoadTest's EndTime by one
+// federation interval: how often the management Prometheus pulls worker
+// metrics through /federate (monitoring.FederationInterval, read from its
+// embedded values). Federation gives the mgmt instance one sample per node per interval, and
 // each node is pulled at its own offset, so the last sample *inside* the k6
 // window can be up to one full interval older than EndTime — and no amount of
 // waiting adds samples to a window that has already closed. A smoke test on
@@ -47,12 +43,14 @@ const federationInterval = 15 * time.Second
 // Extending the window by one interval puts at least one sample at or after
 // EndTime for every node. The extra samples are flat: k6 has stopped, and
 // every metric here is a counter.
-const exportTailWindow = federationInterval
+var exportTailWindow = monitoring.FederationInterval
 
 // exportCooldown is how long the reconciler waits, after k6 finishes, before
-// creating the exporter Job. It covers the widened window: one interval for
-// the last in-window pull, one more for the pull that lands after EndTime.
-const exportCooldown = federationInterval + exportTailWindow
+// creating the exporter Job: one minute, by the author's decision. It must
+// cover the widened window, one interval for the last in-window pull and one
+// more for the pull that lands after EndTime; federation_interval_test.go
+// fails when two intervals no longer fit.
+const exportCooldown = time.Minute
 
 // observeK6 polls every remote TestRun. When all have reached a terminal
 // stage (finished/stopped) it transitions to Exporting; on any error it
@@ -240,7 +238,7 @@ func (r *LoadTestReconciler) runExporter(ctx context.Context,
 
 		// Cool-down before querying. The management Prometheus does not scrape
 		// the workers directly — it federates from each worker's own Prometheus
-		// every federationInterval (15s), so at the instant k6 stops, the tail
+		// once per federation interval, so at the instant k6 stops, the tail
 		// of the run may not have been pulled across yet. Exporting immediately
 		// truncates the CSV by up to one federation period, and by a different
 		// amount on every run (it depends where EndTime lands in the cycle),

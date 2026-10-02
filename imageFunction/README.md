@@ -92,9 +92,12 @@ Symptoms of an oversized payload or excessive rate under load:
 slipped through — guarded against in current scripts) and `500/504` (node /
 gateway saturated). Keep the arrival rate sane.
 
-Reachability: the asset URL handed to k6 must be reachable **from the k6 VMs**
-(`SEAWEEDFS_PUBLIC_URL` on the UI gateway; SeaweedFS S3 API port **30900**); the
-target URL is the DFaaS node's OpenFaaS entrypoint
+Reachability: the runner fetches the image over the SeaweedFS S3 API port
+**30900**. For an image on the in-cluster SeaweedFS it uses `DFAAS_ASSET_BASE`
+when the operator set it (the management address detected for its generator at
+provisioning); otherwise it uses the URL the UI gateway baked at upload
+(`SEAWEEDFS_PUBLIC_URL`, else a cluster node's IP), which must then be reachable
+**from that k6 VM**. The target URL is the DFaaS node's OpenFaaS entrypoint
 `http://<dfaas-node-ip>:30080/function/<name>` (HAProxy NodePort).
 
 ## Ready-made test functions (no payload needed)

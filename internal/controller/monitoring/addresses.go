@@ -10,7 +10,11 @@ You may obtain a copy of the License at
 
 package monitoring
 
-import "fmt"
+import (
+	"fmt"
+	"net"
+	"strconv"
+)
 
 // Where the one SeaweedFS instance is. These live in this package because this
 // is where the Helm values that create it live (values/seaweedfs-values.yaml,
@@ -49,4 +53,19 @@ func FilerInClusterBase() string {
 // cluster.
 func S3InClusterEndpoint() string {
 	return fmt.Sprintf("http://%s:%d", SeaweedFSService, S3Port)
+}
+
+// FilerPublicBase is the filer base URL from outside the Management cluster,
+// for a client that reaches the Management node at host (an IP or a name, an
+// IPv6 literal unbracketed): the filer NodePort on that address. The k6
+// runners poll the GO signal and upload their summaries through it.
+func FilerPublicBase(host string) string {
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(FilerNodePort))
+}
+
+// S3PublicBase is the S3 gateway base URL from outside the Management cluster,
+// for a client that reaches the Management node at host: the S3 NodePort on
+// that address. The k6 runners fetch their payload assets through it.
+func S3PublicBase(host string) string {
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(S3NodePort))
 }

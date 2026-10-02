@@ -126,7 +126,8 @@ func (r *LoadTestReconciler) collectProbes(ctx context.Context, lt *dfaasv1.Load
 		nodes[ref.NodeID], outcomes[ref.NodeID] = node, o
 	}
 
-	var failed []string
+	var failed, detected []string
+	fellBack := false // some failing generator dialled the process-wide fallback
 	for _, ref := range lt.Status.TestRuns {
 		o, ok := outcomes[ref.NodeID]
 		if !ok {
@@ -136,6 +137,13 @@ func (r *LoadTestReconciler) collectProbes(ctx context.Context, lt *dfaasv1.Load
 		case k6dispatch.ProbeUnreachable:
 			logger.Info("generator cannot reach the filer", "node", ref.NodeID, "url", o.URL, "error", o.Detail)
 			failed = append(failed, fmt.Sprintf("%s tried %s: %s", ref.NodeID, o.URL, o.Detail))
+			// The remedy depends on where the URL came from: the address
+			// detected for this generator, or the process-wide fallback.
+			if k6dispatch.GeneratorOf(env, ref.NodeID).MgmtAddr != "" {
+				detected = append(detected, ref.NodeID)
+			} else {
+				fellBack = true
+			}
 		case k6dispatch.ProbeDidNotRun:
 			logger.Info("filer reachability probe did not run", "node", ref.NodeID, "detail", o.Detail)
 		}
@@ -152,8 +160,16 @@ func (r *LoadTestReconciler) collectProbes(ctx context.Context, lt *dfaasv1.Load
 			cannot = "fetch the GO signal or upload the end-of-test summaries"
 		}
 		msg := fmt.Sprintf("dispatched %d remote TestRun(s), but %d generator(s) cannot reach the SeaweedFS filer: %s. "+
-			"Their runners cannot %s. DFAAS_SYNC_PUBLIC_URL must be an address every generator can reach.",
+			"Their runners cannot %s.",
 			len(lt.Status.TestRuns), len(failed), strings.Join(failed, "; "), cannot)
+		for _, id := range detected {
+			msg += fmt.Sprintf(" The management address detected for %s at provisioning "+
+				"(status.k6Nodes[].managementAddress) does not answer on the filer NodePort; "+
+				"open the port or re-provision the Environment.", id)
+		}
+		if fellBack {
+			msg += " DFAAS_SYNC_PUBLIC_URL must be an address every generator can reach."
+		}
 		if err := r.condErr(ctx, lt, dfaasv1.LTCondK6Dispatched, metav1.ConditionTrue,
 			dfaasv1.LTReasonDispatchedUnreachable, msg); err != nil {
 			logger.Error(err, "filer reachability warning not stored; probe Pods kept for the next pass")
