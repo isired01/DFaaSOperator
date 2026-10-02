@@ -27,9 +27,8 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 )
 
-// The management Prometheus federates worker metrics every federationInterval
-// (15s), so the
-// tail of a run lands after k6 stops. runExporter must therefore hold for
+// The management Prometheus federates worker metrics once per federation
+// interval, so the tail of a run lands after k6 stops. runExporter must therefore hold for
 // exportCooldown before creating the exporter Job — otherwise the CSV is
 // truncated by up to one federation period, by a different amount each run.
 var _ = Describe("Export cool-down", func() {

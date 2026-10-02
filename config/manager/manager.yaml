@@ -65,10 +65,10 @@ spec:
         image: controller:latest
         name: manager
         env:
-        # Node IP hosting this pod — fallback base for the VM-facing GO-signal
-        # URL of synchronized LoadTest starts (http://<HOST_IP>:30901, SeaweedFS
-        # filer NodePort). Override with DFAAS_SYNC_PUBLIC_URL when the k6 VMs
-        # reach the management node on a different address (multi-subnet labs).
+        # Node IP hosting this pod — last fallback for the VM-facing filer base
+        # (GO signal and summary upload, http://<HOST_IP>:30901, SeaweedFS filer
+        # NodePort) of a generator with no management address detected at
+        # provisioning and no DFAAS_SYNC_PUBLIC_URL.
         - name: HOST_IP
           valueFrom:
             fieldRef:

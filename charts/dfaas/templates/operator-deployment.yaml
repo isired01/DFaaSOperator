@@ -29,13 +29,13 @@ spec:
           env:
             - name: DFAAS_EXPORTER_IMAGE
               value: {{ include "dfaas.exporter.image" . }}
-            # Fallback base for the VM-facing GO-signal URL of synchronized
-            # LoadTest starts (http://<HOST_IP>:30901, SeaweedFS filer
-            # NodePort). Override via operator.extraEnv DFAAS_SYNC_PUBLIC_URL
-            # when k6 VMs reach the management node on a different address.
-            # Must be reachable from every generator: on a lab spread over
-            # several sites, that is the management node's tailnet IP, not a
-            # local bridge address.
+            # Last fallback for the VM-facing filer base (GO signal and
+            # summary upload, http://<HOST_IP>:30901, SeaweedFS filer
+            # NodePort) of a generator with no management address detected at
+            # provisioning and no DFAAS_SYNC_PUBLIC_URL (operator.extraEnv).
+            # Only those generators dial it, and they must reach it: on a lab
+            # spread over several sites, HOST_IP is often a local bridge
+            # address, so set DFAAS_SYNC_PUBLIC_URL to the tailnet IP instead.
             - name: HOST_IP
               valueFrom:
                 fieldRef:

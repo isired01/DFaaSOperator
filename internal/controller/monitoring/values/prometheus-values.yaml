@@ -33,14 +33,16 @@ server:
     # How often the management Prometheus federates every worker. The chart
     # default is 1m, which on a five-minute load test gives five points per
     # series -- a dashboard that moves once a minute, and a CSV whose shape
-    # depends on where the run fell in the cycle. 15s is four points a minute
-    # and still leaves the chart's 10s scrape_timeout valid.
+    # depends on where the run fell in the cycle. 10s is six points a minute.
     #
-    # It is pinned against federationInterval in
-    # internal/controller/loadtest_observe.go by a test: the export cool-down
-    # derives from this number, so the two move together or the CSV loses its
-    # tail again.
-    scrape_interval: 15s
+    # This line is the only place the interval is set: the operator reads it
+    # from the embedded file (monitoring.FederationInterval) and widens the
+    # export window by one interval. Two tests bound it: the one-minute export
+    # cool-down must cover two intervals (federation_interval_test.go), and the
+    # interval cannot go below the chart's 10s scrape_timeout
+    # (prometheus_values_test.go). A new value reaches the running Prometheus
+    # at the next Environment provisioning, when Deploy upgrades the release.
+    scrape_interval: 10s
   # The operator ServiceAccount deliberately has no clusterroles/clusterrolebindings
   # verbs, so it cannot let this chart create its own cluster-scoped RBAC. The dfaas
   # chart ships that ClusterRole + ClusterRoleBinding instead

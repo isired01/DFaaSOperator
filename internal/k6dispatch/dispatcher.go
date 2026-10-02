@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"net/netip"
 	"sort"
 	"strings"
 	"time"
@@ -91,14 +92,21 @@ type Node interface {
 }
 
 // RunnerEnv is what the reconciler decides and the adapter injects into the k6
-// runner: the URLs the generated script talks to. The reconciler owns their
-// computation (it knows the filer topology); the adapter owns where they go.
+// runner: the URLs the generated script talks to. Every value is per
+// generator, built on the management address detected for it when there is
+// one (Generator.MgmtAddr). The reconciler owns their computation (it knows
+// the filer topology); the adapter owns where they go.
 type RunnerEnv struct {
 	// SummaryURL is always injected, even empty: scripts without handleSummary
 	// ignore it and an unresolvable public base is "no upload", not an error.
 	SummaryURL string
 	// SyncURL is injected only when non-empty (syncStart tests).
 	SyncURL string
+	// AssetBase is injected as DFAAS_ASSET_BASE only when non-empty: the S3
+	// NodePort base on the management address detected for this generator.
+	// Empty means none was detected, and the script fetches its payload
+	// assets from the absolute URL the gateway baked into it.
+	AssetBase string
 }
 
 // ErrNotFound is returned by Node.Stage when the remote TestRun is absent.
@@ -221,22 +229,81 @@ func Sanitize(s string) string {
 	return b.String()
 }
 
+// k6NodeStatus is nodeID's entry in env.Status.K6Nodes: the one lookup both
+// ResolveKubeconfig and GeneratorOf read the fleet through.
+func k6NodeStatus(env *dfaasv1.Environment, nodeID string) (dfaasv1.K6NodeStatus, bool) {
+	for _, n := range env.Status.K6Nodes {
+		if n.NodeID == nodeID {
+			return n, true
+		}
+	}
+	return dfaasv1.K6NodeStatus{}, false
+}
+
 // ResolveKubeconfig applies the node-usability policy and returns the
 // management-cluster Secret holding nodeID's kubeconfig. Shared by Live and
 // the fake so both adapters agree on what "unusable" means. The Secret lives
 // in the Environment's namespace — the playbook pushes it there — which the
-// old call sites approximated with the LoadTest's namespace.
+// old call sites approximated with the LoadTest's namespace. An empty
+// managementAddress is not part of the policy: it only moves that
+// generator's URLs onto the fallback base (GeneratorOf).
 func ResolveKubeconfig(env *dfaasv1.Environment, nodeID string) (types.NamespacedName, error) {
-	for _, n := range env.Status.K6Nodes {
-		if n.NodeID != nodeID {
-			continue
-		}
-		if n.KubeconfigSecret == "" {
-			return types.NamespacedName{}, fmt.Errorf("k6 node %q has no kubeconfig Secret on the environment", nodeID)
-		}
-		return types.NamespacedName{Name: n.KubeconfigSecret, Namespace: env.Namespace}, nil
+	n, ok := k6NodeStatus(env, nodeID)
+	if !ok {
+		return types.NamespacedName{}, fmt.Errorf("k6 node %q is no longer part of the environment", nodeID)
 	}
-	return types.NamespacedName{}, fmt.Errorf("k6 node %q is no longer part of the environment", nodeID)
+	if n.KubeconfigSecret == "" {
+		return types.NamespacedName{}, fmt.Errorf("k6 node %q has no kubeconfig Secret on the environment", nodeID)
+	}
+	return types.NamespacedName{Name: n.KubeconfigSecret, Namespace: env.Namespace}, nil
+}
+
+// Generator is one k6-load-generator as the URLs its runner dials back are
+// built for it: its nodeID and the management address detected for it at
+// provisioning (status.k6Nodes[].managementAddress), already validated. A
+// value type rather than two strings, so a caller cannot swap them.
+type Generator struct {
+	NodeID string
+	// MgmtAddr is the canonical management address, or "" when none was
+	// detected or the recorded one is not usable (ParseManagementAddress):
+	// the URLs then fall back to the process-wide base.
+	MgmtAddr string
+}
+
+// GeneratorOf reads nodeID's management address off env's status. A node
+// absent from status, or one whose address fails ParseManagementAddress, gets
+// MgmtAddr "": a fallback URL, never a broken one in the TestRun or probe env.
+func GeneratorOf(env *dfaasv1.Environment, nodeID string) Generator {
+	g := Generator{NodeID: nodeID}
+	if n, ok := k6NodeStatus(env, nodeID); ok {
+		g.MgmtAddr, _ = ParseManagementAddress(n.ManagementAddress)
+	}
+	return g
+}
+
+// ParseManagementAddress validates a recorded management address and returns
+// its canonical spelling. Only a bare IP literal a remote generator can dial
+// back passes: no zone (a URL carrying "%eth0" is one the k6 runner's URL
+// parser rejects), no port, no brackets (the URL builders add them), and no
+// unspecified, loopback, multicast or link-local address. A v4-mapped IPv6
+// address is unmapped to its IPv4 form. Shared with the Environment side,
+// which reads the value off the kubeconfig Secret annotation.
+func ParseManagementAddress(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	// ParseAddr already refuses a port and brackets; it accepts a zone.
+	addr, err := netip.ParseAddr(s)
+	if err != nil || addr.Zone() != "" {
+		return "", false
+	}
+	addr = addr.Unmap()
+	if addr.IsUnspecified() || addr.IsLoopback() || addr.IsMulticast() ||
+		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
+		return "", false
+	}
+	return addr.String(), true
 }
 
 // StageOf reads .status.stage from an unstructured TestRun.
@@ -282,6 +349,12 @@ func buildTestRun(name string, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad
 		// simply ignore the env var.
 		runnerEnv = append(runnerEnv,
 			map[string]interface{}{"name": "DFAAS_SYNC_URL", "value": env.SyncURL})
+	}
+	if env.AssetBase != "" {
+		// The generated script fetches a relocatable payload asset from this
+		// base plus the object's path; without it, from the URL baked in.
+		runnerEnv = append(runnerEnv,
+			map[string]interface{}{"name": "DFAAS_ASSET_BASE", "value": env.AssetBase})
 	}
 	spec["runner"] = map[string]interface{}{"env": runnerEnv}
 	if err := unstructured.SetNestedMap(tr.Object, spec, "spec"); err != nil {

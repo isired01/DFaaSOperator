@@ -26,11 +26,13 @@ operator:
   leaderElection:
     enabled: true
   extraEnv: []                    # list of {name, value}
-                                  # DFAAS_SYNC_PUBLIC_URL: the GO-signal filer address handed to
-                                  #   every k6 generator; default: http://<manager hostIP>:30901.
-                                  #   Must be reachable from every generator — on a lab spread over
-                                  #   several sites, that is the management node's tailnet IP, not a
-                                  #   local bridge address.
+                                  # DFAAS_SYNC_PUBLIC_URL: fallback filer base (GO signal, summary
+                                  #   upload) for a generator with no management address detected at
+                                  #   provisioning (status.k6Nodes[].managementAddress wins when set);
+                                  #   default when unset: http://<manager hostIP>:30901. Must be
+                                  #   reachable from those generators — on a lab spread over several
+                                  #   sites, that is the management node's tailnet IP, not a local
+                                  #   bridge address.
   nodeSelector: {}
   tolerations: []
   affinity: {}
@@ -68,14 +70,21 @@ ui:
                                   # PORT is derived from ui.service.port — do not set it here
     CORS_ORIGINS: ""              # csv; empty = same-origin only
     # SEAWEEDFS_ENDPOINT: ""      # override gateway→SeaweedFS dial endpoint; default: auto
-                                  #   (in-cluster → seaweedfs-all-in-one.monitoring.svc…:8333, dev → <nodeIP>:30900)
-    # SEAWEEDFS_PUBLIC_URL: ""    # override the asset URL handed to k6; default: <nodeIP>:30900
-                                  #   Must be reachable from every generator — on a lab spread over
-                                  #   several sites, that is the management node's tailnet IP, not a
-                                  #   local bridge address.
+                                  #   (in-cluster → seaweedfs-all-in-one.monitoring.svc…:8333, dev → <nodeIP>:30900).
+                                  #   Applies to seaweedfs-default only; an external S3 config keeps its own endpoint.
+    # SEAWEEDFS_PUBLIC_URL: ""    # base of the asset URL baked into the k6 script; default: <nodeIP>:30900.
+                                  #   Applies to seaweedfs-default only. A runner the operator gave
+                                  #   DFAAS_ASSET_BASE (its generator's detected management address)
+                                  #   fetches from that instead, so this is the fallback: it must be
+                                  #   reachable from generators without a detected address — on a lab
+                                  #   spread over several sites, the management node's tailnet IP, not
+                                  #   a local bridge address.
     # SEAWEEDFS_FILER_PUBLIC_URL: ""
                                   # override the base of the result links shown after a
-                                  # LoadTest; default: <nodeIP>:30901 (filer NodePort)
+                                  # LoadTest; default: the host the browser opened the UI on,
+                                  # port 30901 (filer NodePort), or <nodeIP>:30901 when that host
+                                  # is loopback or unusable. Set it behind an Ingress or proxy
+                                  # whose host does not expose the NodePorts.
 
 # CRDs ship in the chart's crds/ directory, so `helm install` applies them for
 # you. Helm never touches them again: `helm upgrade` does NOT update a CRD, and

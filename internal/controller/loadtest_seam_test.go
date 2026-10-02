@@ -36,6 +36,7 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/k6dispatch"
 	"dfaas-operator/internal/k6dispatch/fake"
+	"dfaas-operator/internal/syncchannel"
 	syncfake "dfaas-operator/internal/syncchannel/fake"
 )
 
@@ -59,7 +60,10 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 	)
 	var nsCounter atomic.Int32
 
-	envReady := func(name string, k6Nodes ...string) *dfaasv1.Environment {
+	// envReadyAt is envReady with a management address recorded for some of
+	// the generators (nodeID → status.k6Nodes[].managementAddress), as
+	// syncNodeStatus records the one each detected at provisioning.
+	envReadyAt := func(name string, mgmt map[string]string, k6Nodes ...string) *dfaasv1.Environment {
 		env := &dfaasv1.Environment{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: dfaasv1.EnvironmentSpec{Nodes: []dfaasv1.EnvironmentNode{
@@ -79,10 +83,14 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 		env.Status.Phase = dfaasv1.EnvReady
 		for i, id := range k6Nodes {
 			env.Status.K6Nodes = append(env.Status.K6Nodes, dfaasv1.K6NodeStatus{
-				NodeID: id, IPAddress: fmt.Sprintf("10.0.1.%d", i+1), KubeconfigSecret: name + "-" + id + "-kubeconfig"})
+				NodeID: id, IPAddress: fmt.Sprintf("10.0.1.%d", i+1), KubeconfigSecret: name + "-" + id + "-kubeconfig",
+				ManagementAddress: mgmt[id]})
 		}
 		Expect(k8sClient.Status().Update(ctx, env)).To(Succeed())
 		return env
+	}
+	envReady := func(name string, k6Nodes ...string) *dfaasv1.Environment {
+		return envReadyAt(name, nil, k6Nodes...)
 	}
 
 	scriptCM := func(name string) {
@@ -531,7 +539,7 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(c.Status).To(Equal(metav1.ConditionTrue))
 			Expect(c.LastTransitionTime).To(Equal(before))
 			Expect(c.Message).To(ContainSubstring("gen-a"))
-			Expect(c.Message).To(ContainSubstring(channel.SummaryURL(fresh, "gen-a")))
+			Expect(c.Message).To(ContainSubstring(channel.SummaryURL(fresh, k6dispatch.Generator{NodeID: "gen-a"})))
 			Expect(c.Message).To(ContainSubstring("Connection timed out"))
 			Expect(c.Message).NotTo(ContainSubstring("gen-b"))
 			// The runners upload to the filer; a plain test has no GO signal
@@ -542,6 +550,55 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(fresh.Status.Phase).To(Equal(dfaasv1.LoadTestRunning))
 			Expect(fleet.ProbeExists("gen-a", fresh)).To(BeFalse())
 			Expect(fleet.ProbeExists("gen-b", fresh)).To(BeFalse())
+		})
+
+		// A generator whose URL was built on its detected management address
+		// gets nothing from DFAAS_SYNC_PUBLIC_URL: the remedy is that address,
+		// its port, or a re-provision that detects it again.
+		detectedRemedy := func(nodeID string) string {
+			return "The management address detected for " + nodeID + " at provisioning " +
+				"(status.k6Nodes[].managementAddress) does not answer on the filer NodePort; " +
+				"open the port or re-provision the Environment."
+		}
+
+		It("an unreachable generator on its detected address names that address, not DFAAS_SYNC_PUBLIC_URL", func() {
+			envReadyAt("env", map[string]string{"gen-a": "100.64.0.11"}, "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			fleet.SetProbe("gen-a", running, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeUnreachable,
+				Detail: "Connection timed out"})
+			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool {
+				return cond(l, dfaasv1.LTCondK6Dispatched).Reason == dfaasv1.LTReasonDispatchedUnreachable
+			})
+			c := cond(fresh, dfaasv1.LTCondK6Dispatched)
+			Expect(c.Status).To(Equal(metav1.ConditionTrue))
+			Expect(c.Message).To(ContainSubstring("gen-a tried http://100.64.0.11:30901" + syncchannel.SummaryPath(fresh, "gen-a")))
+			Expect(c.Message).To(ContainSubstring(detectedRemedy("gen-a")))
+			Expect(c.Message).NotTo(ContainSubstring("DFAAS_SYNC_PUBLIC_URL"))
+		})
+
+		It("a mixed fleet gets each failing generator's own remedy", func() {
+			envReadyAt("env", map[string]string{"gen-a": "100.64.0.11"}, "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			for _, id := range []string{"gen-a", "gen-b"} {
+				fleet.SetProbe(id, running, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeUnreachable,
+					Detail: "Connection timed out"})
+			}
+			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool {
+				return cond(l, dfaasv1.LTCondK6Dispatched).Reason == dfaasv1.LTReasonDispatchedUnreachable
+			})
+			c := cond(fresh, dfaasv1.LTCondK6Dispatched)
+			Expect(c.Message).To(ContainSubstring("2 generator(s) cannot reach the SeaweedFS filer"))
+			Expect(c.Message).To(ContainSubstring(detectedRemedy("gen-a")))
+			Expect(c.Message).NotTo(ContainSubstring("detected for gen-b"))
+			// gen-b dialled the process-wide fallback.
+			Expect(c.Message).To(ContainSubstring("gen-b tried http://vm-facing.test:30901/"))
+			Expect(c.Message).To(ContainSubstring("DFAAS_SYNC_PUBLIC_URL must be an address every generator can reach"))
 		})
 
 		It("a warning whose status write fails keeps the probes, and the next pass records it", func() {
@@ -580,7 +637,7 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			Expect(fleet.ProbeExists("gen-a", fresh)).To(BeFalse())
 			// The verdict reached the log while no Condition held it yet.
 			Expect(*lines).To(ContainElement(SatisfyAll(ContainSubstring(`"node"="gen-a"`),
-				ContainSubstring(channel.SummaryURL(fresh, "gen-a")), ContainSubstring("Connection timed out"))))
+				ContainSubstring(channel.SummaryURL(fresh, k6dispatch.Generator{NodeID: "gen-a"})), ContainSubstring("Connection timed out"))))
 		})
 
 		It("every generator reachable leaves AllDispatched and deletes the probes", func() {
@@ -661,7 +718,7 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			fleet.SetProbe("gen-a", lt, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeUnreachable, URL: "http://old"})
 			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
 			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
-			Expect(fleet.ProbeURL("gen-a", running)).To(Equal(channel.SummaryURL(running, "gen-a")))
+			Expect(fleet.ProbeURL("gen-a", running)).To(Equal(channel.SummaryURL(running, k6dispatch.Generator{NodeID: "gen-a"})))
 		})
 
 		It("a SyncTimeout names the failed probe", func() {
@@ -838,6 +895,117 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			completed := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestCompleted))
 			Expect(completed.Status.Phase).To(Equal(dfaasv1.LoadTestCompleted))
 			Expect(fleet.ProbeExists("gen-a", completed)).To(BeFalse())
+		})
+	})
+
+	// Each generator's runner dials back on the management address detected
+	// for it at provisioning (status.k6Nodes[].managementAddress): the filer
+	// NodePort for the summary and the GO signal, the S3 NodePort for assets.
+	// A generator without one keeps the process-wide fallback for the filer
+	// URLs and gets no asset base, so its script keeps the URL baked in.
+	Context("per-generator management address", func() {
+		awaiting := func(l *dfaasv1.LoadTest) bool {
+			c := cond(l, dfaasv1.LTCondSyncReady)
+			return c != nil && c.Reason == dfaasv1.LTReasonAwaitingRunners
+		}
+		appliedTo := func(nodeID string) fake.Applied {
+			for _, a := range fleet.Applied() {
+				if a.NodeID == nodeID {
+					return a
+				}
+			}
+			Fail("no Apply recorded for " + nodeID)
+			return fake.Applied{}
+		}
+
+		// envtest serves the generated CRD (config/crd/bases): a field missing
+		// from it would be pruned here exactly as on a real cluster, and every
+		// generator would silently fall back.
+		It("the managementAddress status field survives the API server", func() {
+			envReadyAt("env", map[string]string{"gen-a": "fd7a:115c:a1e0::11"}, "gen-a", "gen-b")
+			var env dfaasv1.Environment
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "env", Namespace: ns}, &env)).To(Succeed())
+			Expect(env.Status.K6Nodes).To(HaveLen(2))
+			Expect(env.Status.K6Nodes[0].ManagementAddress).To(Equal("fd7a:115c:a1e0::11"))
+			Expect(env.Status.K6Nodes[1].ManagementAddress).To(BeEmpty())
+		})
+
+		It("a detected generator dials back on its own address, an undetected one on the fallback", func() {
+			envReadyAt("env", map[string]string{"gen-a": "100.64.0.11"}, "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			waiting := reconcileUntil(lt, 10, awaiting)
+			Expect(fleet.Applied()).To(HaveLen(2))
+
+			a := appliedTo("gen-a")
+			Expect(a.Env.SummaryURL).To(Equal("http://100.64.0.11:30901" + syncchannel.SummaryPath(waiting, "gen-a")))
+			Expect(a.Env.SyncURL).To(Equal("http://100.64.0.11:30901" + syncchannel.GoPath(waiting)))
+			Expect(a.Env.AssetBase).To(Equal("http://100.64.0.11:30900"))
+
+			b := appliedTo("gen-b")
+			Expect(b.Env.SummaryURL).To(Equal("http://vm-facing.test:30901" + syncchannel.SummaryPath(waiting, "gen-b")))
+			Expect(b.Env.SyncURL).To(Equal("http://vm-facing.test:30901" + syncchannel.GoPath(waiting)))
+			Expect(b.Env.AssetBase).To(BeEmpty())
+
+			// The probe checks the URL each runner was given.
+			Expect(fleet.ProbeURL("gen-a", waiting)).To(Equal(a.Env.SummaryURL))
+			Expect(fleet.ProbeURL("gen-b", waiting)).To(Equal(b.Env.SummaryURL))
+		})
+
+		// The k6 playbook records an IPv4 address only (the generator's k3s is
+		// single-stack), so it never writes this status today. The field and
+		// ParseManagementAddress admit IPv6, and the URLs must stay well-formed.
+		It("a detected IPv6 address is bracketed in every URL", func() {
+			envReadyAt("env", map[string]string{"gen-a": "fd7a:115c:a1e0::11"}, "gen-a")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			waiting := reconcileUntil(lt, 10, awaiting)
+			a := appliedTo("gen-a")
+			Expect(a.Env.SummaryURL).To(Equal("http://[fd7a:115c:a1e0::11]:30901" + syncchannel.SummaryPath(waiting, "gen-a")))
+			Expect(a.Env.SyncURL).To(Equal("http://[fd7a:115c:a1e0::11]:30901" + syncchannel.GoPath(waiting)))
+			Expect(a.Env.AssetBase).To(Equal("http://[fd7a:115c:a1e0::11]:30900"))
+			Expect(fleet.ProbeURL("gen-a", waiting)).To(Equal(a.Env.SummaryURL))
+		})
+
+		// The case the detection exists for: no DFAAS_SYNC_PUBLIC_URL, no
+		// usable HOST_IP, and still every generator can see the barrier open.
+		It("a syncStart test with no fallback dispatches when every generator has an address", func() {
+			channel.Public = ""
+			envReadyAt("env", map[string]string{"gen-a": "100.64.0.11", "gen-b": "100.64.0.12"}, "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			lt.Spec.SyncStart = true
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			waiting := reconcileUntil(lt, 10, awaiting)
+			Expect(waiting.Status.Phase).NotTo(Equal(dfaasv1.LoadTestFailed))
+			Expect(fleet.Applied()).To(HaveLen(2))
+			Expect(appliedTo("gen-b").Env.SyncURL).To(Equal("http://100.64.0.12:30901" + syncchannel.GoPath(waiting)))
+
+			fleet.SetStage("gen-a", lt, "started")
+			fleet.SetStage("gen-b", lt, "started")
+			fresh := reconcileUntil(lt, 4, phaseIs(dfaasv1.LoadTestRunning))
+			Expect(cond(fresh, dfaasv1.LTCondSyncReady).Reason).To(Equal(dfaasv1.LTReasonGoPublished))
+			Expect(channel.Count("PublishGo")).To(Equal(1))
+		})
+
+		// The CRD bounds the field's length only, so a value that is not a bare
+		// dialable IP can reach status: it must fall back, never end up in a
+		// runner URL.
+		It("a malformed address falls back", func() {
+			envReadyAt("env", map[string]string{"gen-a": "100.64.0.11:30901", "gen-b": "fe80::1%eth0"}, "gen-a", "gen-b")
+			scriptCM("script")
+			lt := newLT("lt", "env", "gen-a", "gen-b")
+			Expect(k8sClient.Create(ctx, lt)).To(Succeed())
+			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
+			for _, id := range []string{"gen-a", "gen-b"} {
+				a := appliedTo(id)
+				Expect(a.Env.SummaryURL).To(Equal("http://vm-facing.test:30901" + syncchannel.SummaryPath(running, id)))
+				Expect(a.Env.AssetBase).To(BeEmpty())
+			}
 		})
 	})
 
@@ -1865,6 +2033,6 @@ type perCallChannel struct {
 	calls atomic.Int32
 }
 
-func (c *perCallChannel) SummaryURL(lt *dfaasv1.LoadTest, nodeID string) string {
-	return fmt.Sprintf("%s?call=%d", c.Channel.SummaryURL(lt, nodeID), c.calls.Add(1))
+func (c *perCallChannel) SummaryURL(lt *dfaasv1.LoadTest, g k6dispatch.Generator) string {
+	return fmt.Sprintf("%s?call=%d", c.Channel.SummaryURL(lt, g), c.calls.Add(1))
 }

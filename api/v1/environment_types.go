@@ -209,6 +209,23 @@ type K6NodeStatus struct {
 	NodeID           string `json:"nodeID"`
 	IPAddress        string `json:"ipAddress"`
 	KubeconfigSecret string `json:"kubeconfigSecret"`
+
+	// ManagementAddress is the management node's address as this generator
+	// sees it: the first field of $SSH_CONNECTION during the k6 playbook. The
+	// playbook records it only when it is an IPv4 address (the generator's k3s
+	// is single-stack, so its runner pods cannot dial IPv6) and the generator
+	// could reach the filer NodePort with it (an HTTP answer, or connection
+	// refused because SeaweedFS is installed later, in ProvisioningMonitoring),
+	// and syncNodeStatus copies it from the kubeconfig Secret annotation
+	// dfaas.io/management-address. The LoadTest reconciler builds every URL
+	// this generator's runner dials back on it: the filer NodePort (summary
+	// upload, GO signal) and the S3 NodePort (assets). Empty means not detected
+	// (an older playbook, a generator reached over IPv6, detection failed, or
+	// unverified): the filer URLs then fall back to DFAAS_SYNC_PUBLIC_URL, else
+	// HOST_IP, and the runner gets no asset base.
+	// +optional
+	// +kubebuilder:validation:MaxLength=45
+	ManagementAddress string `json:"managementAddress,omitempty"`
 }
 
 // EnvironmentStatus tracks the infrastructure phase observed by the controller.

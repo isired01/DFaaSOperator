@@ -35,21 +35,26 @@ import (
 // SyncReady=False/AwaitingRunners for the whole five-minute budget, and only
 // then fails.
 
-func syncStartLT(t *testing.T, syncStart bool) (client.Client, *dfaasv1.LoadTest) {
+// syncStartLT is a LoadTest on nodeIDs, gen-a when none is given.
+func syncStartLT(t *testing.T, syncStart bool, nodeIDs ...string) (client.Client, *dfaasv1.LoadTest) {
 	t.Helper()
 	s := runtime.NewScheme()
 	if err := dfaasv1.AddToScheme(s); err != nil {
 		t.Fatal(err)
+	}
+	if len(nodeIDs) == 0 {
+		nodeIDs = []string{"gen-a"}
 	}
 	lt := &dfaasv1.LoadTest{
 		ObjectMeta: metav1.ObjectMeta{Name: "lt-sample", Namespace: "default", Generation: 1},
 		Spec: dfaasv1.LoadTestSpec{
 			TargetEnvironment: "env",
 			SyncStart:         syncStart,
-			PerNodeLoad: []dfaasv1.PerNodeLoad{
-				{NodeID: "gen-a", VUs: 1, Duration: "10s", ScriptConfigMap: corev1.LocalObjectReference{Name: "script"}},
-			},
 		},
+	}
+	for _, id := range nodeIDs {
+		lt.Spec.PerNodeLoad = append(lt.Spec.PerNodeLoad, dfaasv1.PerNodeLoad{
+			NodeID: id, VUs: 1, Duration: "10s", ScriptConfigMap: corev1.LocalObjectReference{Name: "script"}})
 	}
 	c := crfake.NewClientBuilder().WithScheme(s).WithStatusSubresource(lt).WithObjects(lt).Build()
 	return c, lt
@@ -79,6 +84,49 @@ func TestStartK6FailsLoudlyWithNoPublicBase(t *testing.T) {
 		t.Errorf("the message must name the missing override, got %q", ready.Message)
 	}
 	// The point of failing here rather than later: nothing was dispatched.
+	if applied := fleet.Applied(); len(applied) != 0 {
+		t.Errorf("dispatched %d TestRuns before failing; want none", len(applied))
+	}
+}
+
+// The GO URL is per generator: one with a management address detected at
+// provisioning needs no fallback, one without still does. With no fallback the
+// test fails before any Apply, naming only the generators that resolve none --
+// a partly opened barrier is no better than a closed one.
+func TestStartK6NamesTheGeneratorsWithNoGoURL(t *testing.T) {
+	c, lt := syncStartLT(t, true, "gen-a", "gen-b")
+	fleet := k6fake.New()
+	r := &LoadTestReconciler{Client: c, Dispatcher: fleet, Sync: &syncfake.Channel{}}
+
+	if _, err := r.startK6(context.Background(), lt, &dfaasv1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "default"},
+		Status: dfaasv1.EnvironmentStatus{K6Nodes: []dfaasv1.K6NodeStatus{
+			{NodeID: "gen-a", KubeconfigSecret: "env-gen-a-kubeconfig", ManagementAddress: "100.64.0.11"},
+			{NodeID: "gen-b", KubeconfigSecret: "env-gen-b-kubeconfig"},
+		}},
+	}); err != nil {
+		t.Fatalf("startK6: %v", err)
+	}
+
+	var got dfaasv1.LoadTest
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(lt), &got); err != nil {
+		t.Fatalf("get loadtest: %v", err)
+	}
+	if got.Status.Phase != dfaasv1.LoadTestFailed {
+		t.Errorf("phase: want %s, got %s", dfaasv1.LoadTestFailed, got.Status.Phase)
+	}
+	ready := meta.FindStatusCondition(got.Status.Conditions, dfaasv1.LTCondReady)
+	if ready == nil {
+		t.Fatal("no Ready condition")
+	}
+	for _, want := range []string{"generator(s) gen-b", "no management address was detected", "DFAAS_SYNC_PUBLIC_URL"} {
+		if !strings.Contains(ready.Message, want) {
+			t.Errorf("message must contain %q, got %q", want, ready.Message)
+		}
+	}
+	if strings.Contains(ready.Message, "gen-a") {
+		t.Errorf("gen-a has a detected address and must not be named, got %q", ready.Message)
+	}
 	if applied := fleet.Applied(); len(applied) != 0 {
 		t.Errorf("dispatched %d TestRuns before failing; want none", len(applied))
 	}

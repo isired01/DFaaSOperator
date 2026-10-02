@@ -22,12 +22,19 @@ import (
 
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/controller/monitoring"
+	"dfaas-operator/internal/k6dispatch"
 )
 
 func testLT() *dfaasv1.LoadTest {
 	return &dfaasv1.LoadTest{
 		ObjectMeta: metav1.ObjectMeta{Name: "lt-sample", Namespace: "default"},
 	}
+}
+
+// undetected is a generator with no management address: its URLs come from
+// the process-wide fallback.
+func undetected(nodeID string) k6dispatch.Generator {
+	return k6dispatch.Generator{NodeID: nodeID}
 }
 
 // recorder answers like the filer and records what it was asked.
@@ -91,10 +98,10 @@ func TestFilerPicksTheRightBasePerOperation(t *testing.T) {
 	f := NewFiler("http://operator.test:30901", "http://vm-facing.test:30901")
 	lt := testLT()
 
-	if got, want := f.GoURL(lt), "http://vm-facing.test:30901/dfaas-sync/default/lt-sample.go"; got != want {
+	if got, want := f.GoURL(lt, undetected("node-1")), "http://vm-facing.test:30901/dfaas-sync/default/lt-sample.go"; got != want {
 		t.Errorf("GoURL = %q, want %q (the VM-facing base)", got, want)
 	}
-	if got, want := f.SummaryURL(lt, "node-1"),
+	if got, want := f.SummaryURL(lt, undetected("node-1")),
 		"http://vm-facing.test:30901/dfaas-k6-summary/default/lt-sample/node-1.json"; got != want {
 		t.Errorf("SummaryURL = %q, want %q (the VM-facing base)", got, want)
 	}
@@ -111,12 +118,17 @@ func TestNoPublicBaseMeansNoVMFacingURLs(t *testing.T) {
 
 	// GoURL empty is the signal startK6 must fail the LoadTest on, rather than
 	// parking every runner on a barrier nobody can open.
-	if got := f.GoURL(lt); got != "" {
+	if got := f.GoURL(lt, undetected("node-1")); got != "" {
 		t.Errorf("GoURL = %q, want empty when no public base is resolvable", got)
 	}
 	// SummaryURL empty means "no upload" -- never an error.
-	if got := f.SummaryURL(lt, "node-1"); got != "" {
+	if got := f.SummaryURL(lt, undetected("node-1")); got != "" {
 		t.Errorf("SummaryURL = %q, want empty", got)
+	}
+	// A generator with a detected management address needs no fallback.
+	detected := k6dispatch.Generator{NodeID: "node-1", MgmtAddr: "100.64.0.11"}
+	if got := f.GoURL(lt, detected); got != "http://100.64.0.11:30901/dfaas-sync/default/lt-sample.go" {
+		t.Errorf("GoURL = %q, want the detected address on the filer NodePort", got)
 	}
 	// The exporter's URL does not depend on the public base at all.
 	if got := f.InClusterSummaryURL(lt, "node-1"); got == "" {
@@ -133,8 +145,50 @@ func TestEmptyOperatorBaseFallsBackToInCluster(t *testing.T) {
 
 func TestTrailingSlashesAreNormalised(t *testing.T) {
 	f := NewFiler("http://operator.test:30901/", "http://vm.test:30901/")
-	if got, want := f.GoURL(testLT()), "http://vm.test:30901/dfaas-sync/default/lt-sample.go"; got != want {
+	if got, want := f.GoURL(testLT(), undetected("node-1")), "http://vm.test:30901/dfaas-sync/default/lt-sample.go"; got != want {
 		t.Errorf("GoURL = %q, want %q", got, want)
+	}
+}
+
+// The VM-facing base is per generator: the detected management address beats
+// the process-wide fallback, and only with neither is there no URL. Both URLs
+// of one generator share its base, and the GO path is the same for every
+// generator, so one PublishGo still opens every barrier.
+func TestVMFacingBasePrecedence(t *testing.T) {
+	lt := testLT()
+	const goPath = "/dfaas-sync/default/lt-sample.go"
+	const summaryPath = "/dfaas-k6-summary/default/lt-sample/gen-a.json"
+	cases := []struct {
+		name     string
+		fallback string
+		mgmtAddr string
+		wantBase string
+	}{
+		{"detected address beats the fallback", "http://vm-facing.test:30901", "100.64.0.11", "http://100.64.0.11:30901"},
+		{"detected address with no fallback", "", "100.64.0.11", "http://100.64.0.11:30901"},
+		{"detected IPv6 address is bracketed", "http://vm-facing.test:30901", "fd7a:115c:a1e0::11", "http://[fd7a:115c:a1e0::11]:30901"},
+		{"no address uses the fallback", "http://vm-facing.test:30901", "", "http://vm-facing.test:30901"},
+		{"neither gives no URL", "", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := NewFiler("http://operator.test:30901", c.fallback)
+			g := k6dispatch.Generator{NodeID: "gen-a", MgmtAddr: c.mgmtAddr}
+			wantGo, wantSummary := "", ""
+			if c.wantBase != "" {
+				wantGo, wantSummary = c.wantBase+goPath, c.wantBase+summaryPath
+			}
+			if got := f.GoURL(lt, g); got != wantGo {
+				t.Errorf("GoURL = %q, want %q", got, wantGo)
+			}
+			if got := f.SummaryURL(lt, g); got != wantSummary {
+				t.Errorf("SummaryURL = %q, want %q", got, wantSummary)
+			}
+			// The exporter reads in-cluster whatever the generator dials.
+			if got := f.InClusterSummaryURL(lt, "gen-a"); got != monitoring.FilerInClusterBase()+summaryPath {
+				t.Errorf("InClusterSummaryURL = %q, want the in-cluster base", got)
+			}
+		})
 	}
 }
 
@@ -215,7 +269,7 @@ func TestDeleteSummariesIsRecursive(t *testing.T) {
 // an S3 bucket.
 func TestObjectsLiveOutsideBuckets(t *testing.T) {
 	lt := testLT()
-	for _, p := range []string{goPath(lt), SummaryDirPath(lt), SummaryPath(lt, "node-1")} {
+	for _, p := range []string{GoPath(lt), SummaryDirPath(lt), SummaryPath(lt, "node-1")} {
 		if strings.HasPrefix(p, "/buckets") {
 			t.Errorf("%q must not live under /buckets", p)
 		}
@@ -229,9 +283,20 @@ func TestFromEnv(t *testing.T) {
 		t.Setenv("DFAAS_SYNC_PUBLIC_URL", "http://lab.example:30901")
 		t.Setenv("HOST_IP", "192.0.2.10")
 		t.Setenv("DFAAS_FILER_URL", "")
-		if got, want := FromEnv().GoURL(testLT()),
+		if got, want := FromEnv().GoURL(testLT(), undetected("node-1")),
 			"http://lab.example:30901/dfaas-sync/default/lt-sample.go"; got != want {
 			t.Errorf("GoURL = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("a detected management address beats both", func(t *testing.T) {
+		t.Setenv("DFAAS_SYNC_PUBLIC_URL", "http://lab.example:30901")
+		t.Setenv("HOST_IP", "192.0.2.10")
+		t.Setenv("DFAAS_FILER_URL", "")
+		g := k6dispatch.Generator{NodeID: "node-1", MgmtAddr: "fd7a:115c:a1e0::11"}
+		if got, want := FromEnv().SummaryURL(testLT(), g),
+			"http://[fd7a:115c:a1e0::11]:30901/dfaas-k6-summary/default/lt-sample/node-1.json"; got != want {
+			t.Errorf("SummaryURL = %q, want %q", got, want)
 		}
 	})
 
@@ -240,7 +305,7 @@ func TestFromEnv(t *testing.T) {
 		t.Setenv("HOST_IP", "192.0.2.10")
 		t.Setenv("DFAAS_FILER_URL", "")
 		want := "http://192.0.2.10:30901/dfaas-sync/default/lt-sample.go"
-		if got := FromEnv().GoURL(testLT()); got != want {
+		if got := FromEnv().GoURL(testLT(), undetected("node-1")); got != want {
 			t.Errorf("GoURL = %q, want %q", got, want)
 		}
 		// And that port is the one the Helm values file pins.
@@ -250,12 +315,22 @@ func TestFromEnv(t *testing.T) {
 		}
 	})
 
+	t.Run("an IPv6 HOST_IP is bracketed", func(t *testing.T) {
+		t.Setenv("DFAAS_SYNC_PUBLIC_URL", "")
+		t.Setenv("HOST_IP", "2001:db8::10")
+		t.Setenv("DFAAS_FILER_URL", "")
+		want := "http://[2001:db8::10]:30901/dfaas-sync/default/lt-sample.go"
+		if got := FromEnv().GoURL(testLT(), undetected("node-1")); got != want {
+			t.Errorf("GoURL = %q, want %q", got, want)
+		}
+	})
+
 	t.Run("neither leaves the VM-facing URLs empty", func(t *testing.T) {
 		t.Setenv("DFAAS_SYNC_PUBLIC_URL", "")
 		t.Setenv("HOST_IP", "")
 		t.Setenv("DFAAS_FILER_URL", "")
 		f := FromEnv()
-		if got := f.GoURL(testLT()); got != "" {
+		if got := f.GoURL(testLT(), undetected("node-1")); got != "" {
 			t.Errorf("GoURL = %q, want empty", got)
 		}
 		// The operator still knows where to write: in-cluster DNS.

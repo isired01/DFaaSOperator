@@ -1,6 +1,12 @@
 package monitoring
 
-import _ "embed"
+import (
+	_ "embed"
+	"fmt"
+	"time"
+
+	sigsyaml "sigs.k8s.io/yaml"
+)
 
 //go:embed charts/prometheus-29.6.0.tgz
 var prometheusChartTGZ []byte
@@ -10,6 +16,34 @@ var grafanaChartTGZ []byte
 
 //go:embed values/prometheus-values.yaml
 var prometheusValuesYAML []byte
+
+// FederationInterval is how often the management Prometheus pulls every DFaaS
+// node through /federate: server.global.scrape_interval in the values above,
+// read from the embedded file so that no Go constant restates it. The export
+// widens its query window by one interval (loadtest_observe.go).
+var FederationInterval = mustScrapeInterval(prometheusValuesYAML)
+
+// mustScrapeInterval panics on values without a Go-parseable
+// server.global.scrape_interval. The file is compiled in, so every test of
+// this package fails on it before such a build ships; an unset interval fails
+// too, since the chart default (1m) would then apply unnoticed.
+func mustScrapeInterval(values []byte) time.Duration {
+	var v struct {
+		Server struct {
+			Global struct {
+				ScrapeInterval string `json:"scrape_interval"`
+			} `json:"global"`
+		} `json:"server"`
+	}
+	if err := sigsyaml.Unmarshal(values, &v); err != nil {
+		panic(fmt.Sprintf("embedded prometheus values: %v", err))
+	}
+	d, err := time.ParseDuration(v.Server.Global.ScrapeInterval)
+	if err != nil {
+		panic(fmt.Sprintf("embedded prometheus values: server.global.scrape_interval: %v", err))
+	}
+	return d
+}
 
 //go:embed values/grafana-values.yaml
 var grafanaValuesYAML []byte

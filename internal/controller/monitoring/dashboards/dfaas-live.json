@@ -1,7 +1,7 @@
 {
   "uid": "dfaas-live",
   "title": "dFaaS — run in corso",
-  "description": "Andamento di un LoadTest mentre gira. Una sola datasource: il Prometheus di management, che federa i nodi ogni 15s.",
+  "description": "Andamento di un LoadTest mentre gira. Una sola datasource: il Prometheus di management, che federa i nodi.",
   "tags": [
     "dfaas"
   ],

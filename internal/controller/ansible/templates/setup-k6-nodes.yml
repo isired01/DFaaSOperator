@@ -19,6 +19,100 @@
 
   tasks:
 
+    # --- Management address detection -------------------------------------
+    # The runners on this generator dial back to the management node: summary
+    # upload and GO signal over the filer NodePort, payload assets over the S3
+    # NodePort. They need the address THIS generator sees the management node
+    # at, which the management side cannot know on its own (on a multi-site lab
+    # each site reaches it over a different interface). The SSH session running
+    # this play comes from the management node, so the first field of sshd's
+    # SSH_CONNECTION is that address. It is kept only when the generator
+    # reaches the filer NodePort with it, then pushed as the
+    # dfaas.io/management-address annotation on the kubeconfig Secret below,
+    # and the operator copies it into status.k6Nodes[].managementAddress.
+    #
+    # Detection never fails the play: an empty value leaves this generator's
+    # runners where they were before detection existed, on the operator's
+    # filer fallback (DFAAS_SYNC_PUBLIC_URL, else HOST_IP) and on the asset URL
+    # the gateway baked into the script. It runs first, before anything on the
+    # node changes, and takes seconds.
+    #
+    # become: false on the two tasks that run on the generator: neither needs
+    # root, and sudo's env_reset would drop SSH_CONNECTION from the first.
+    # ansible_env was gathered under sudo, so it does not carry it either.
+    - name: Read the SSH session addresses on the generator
+      become: false
+      ansible.builtin.command: printenv SSH_CONNECTION
+      register: dfaas_ssh_connection
+      changed_when: false
+      failed_when: false
+
+    # A bare IPv4 literal, or nothing: the value is spliced into the probe URL
+    # below. The operator validates it again before using it. IPv4 only,
+    # because the k3s installed below is single-stack IPv4: the runner pods
+    # that dial this address have no IPv6 route, while the probe runs on the
+    # host network and would pass for an IPv6 one. A generator reached over
+    # IPv6 records nothing and keeps the fallback. Widen this only together
+    # with a dual-stack INSTALL_K3S_EXEC.
+    - name: Take the management node address from the SSH session
+      vars:
+        dfaas_ssh_client: "{{ ((dfaas_ssh_connection.stdout | default('') | trim).split() + [''])[0] }}"
+      ansible.builtin.set_fact:
+        dfaas_mgmt_candidate: "{{ dfaas_ssh_client if dfaas_ssh_client is match('^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$') else '' }}"
+
+    # Any HTTP status proves the address reaches the filer NodePort. A refused
+    # connection is accepted too: on a fresh management cluster SeaweedFS is
+    # installed in ProvisioningMonitoring, after this Job, so nothing listens on
+    # the port yet, but the refusal still came from a host answering on that
+    # address. A timeout or no route keeps nothing. failed_when: false rather
+    # than ignore_errors, so a tolerated outcome prints no FAILED! line in the
+    # pod log. use_proxy: false, because the runners dial direct and an
+    # http_proxy on the generator must not be what gets tested. filer_node_port
+    # comes from the inventory (monitoring.FilerNodePort on the Go side) and is
+    # deliberately not a play var: play vars outrank inventory host vars. The
+    # URL already brackets an IPv6 literal, so widening the candidate filter
+    # above needs no change here.
+    - name: Probe the management filer NodePort from the generator
+      become: false
+      ansible.builtin.uri:
+        url: "http://{{ ('[' ~ dfaas_mgmt_candidate ~ ']') if (':' in dfaas_mgmt_candidate) else dfaas_mgmt_candidate }}:{{ filer_node_port }}/"
+        method: GET
+        timeout: 10
+        use_proxy: false
+        follow_redirects: none
+        status_code: "{{ range(100, 600) | list }}"
+      register: dfaas_mgmt_probe
+      failed_when: false
+      when:
+        - dfaas_mgmt_candidate | length > 0
+        - filer_node_port is defined
+
+    - name: Keep the management node address only when the generator reaches it
+      ansible.builtin.set_fact:
+        dfaas_mgmt_addr: >-
+          {{ dfaas_mgmt_candidate
+             if (dfaas_mgmt_probe is not skipped
+                 and ((dfaas_mgmt_probe.status | default(-1) | int) > 0
+                      or 'Connection refused' in (dfaas_mgmt_probe.msg | default(''))))
+             else '' }}
+
+    # The Secret push below is no_log, so this is where the pod log says what
+    # was detected and why.
+    - name: Report the management node address detection
+      vars:
+        dfaas_mgmt_verdict: >-
+          {{ 'skipped' if (dfaas_mgmt_probe is skipped)
+          else ('HTTP ' ~ dfaas_mgmt_probe.status) if ((dfaas_mgmt_probe.status | default(-1) | int) > 0)
+          else (dfaas_mgmt_probe.msg | default('no answer') | regex_replace('^Status code was [^:]*: ', '')) }}
+      ansible.builtin.debug:
+        msg: >-
+          SSH_CONNECTION {{ (dfaas_ssh_connection.stdout | default('') | trim) or 'unset' }};
+          IPv4 client address {{ dfaas_mgmt_candidate if dfaas_mgmt_candidate else 'none' }};
+          filer NodePort probe {{ dfaas_mgmt_verdict }};
+          {{ ('recorded ' ~ dfaas_mgmt_addr ~ ' as the management address') if dfaas_mgmt_addr
+          else 'nothing recorded, the runners use the operator fallback (DFAAS_SYNC_PUBLIC_URL, else HOST_IP) and the baked asset URL' }}
+    # --- end management address detection --------------------------------
+
     # --- Role-flip repave -------------------------------------------------
     # The node records its own role in {{ dfaas_role_marker }} as the last task
     # of a successful run. A mismatch means this machine was provisioned for the
@@ -122,6 +216,8 @@
         path: /usr/local/bin/k3s
       register: k3s_bin
 
+    # Single-stack IPv4 (no dual-stack --cluster-cidr): the management address
+    # detection at the top keeps only an IPv4 address because of it.
     - name: Install k3s (single-node, no Traefik, no ServiceLB)
       ansible.builtin.shell:
         cmd: |
@@ -258,6 +354,10 @@
         sa_token: "{{ lookup('file', '/var/run/secrets/kubernetes.io/serviceaccount/token') | trim }}"
       no_log: true
 
+    # The dfaas.io/management-address annotation is always written, empty when
+    # nothing was detected: the apply is forced and this field manager owns it,
+    # so a re-run overwrites a stale address. to_json quotes the value, so
+    # whatever the generator reported stays a single YAML scalar.
     - name: "Push kubeconfig Secret to management cluster (server-side apply)"
       delegate_to: localhost
       become: false
@@ -285,6 +385,8 @@
             labels:
               dfaas.io/env: {{ env_name }}
               dfaas.io/node-id: "{{ node_id }}"
+            annotations:
+              dfaas.io/management-address: {{ dfaas_mgmt_addr | default('') | to_json }}
           data:
             kubeconfig: {{ kubeconfig_rendered | b64encode }}
         status_code: [200, 201]

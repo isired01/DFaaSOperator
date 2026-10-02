@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/monitoring"
 	"dfaas-operator/internal/controller/roles"
 )
 
@@ -61,6 +62,36 @@ func TestBuildInventoryK6EmitsEnvUID(t *testing.T) {
 	}
 	if !strings.Contains(inv, "env_uid='1f0c9c8e-uid'") {
 		t.Errorf("inventory missing env_uid host var:\n%s", inv)
+	}
+}
+
+// The k6 playbook probes the management address it detects on the filer
+// NodePort, and the port reaches it only through this host var: the playbook
+// holds no copy of its own (a play var would also shadow this one). Without it
+// the probe is skipped and no generator ever gets a detected address.
+func TestBuildInventoryK6EmitsFilerNodePort(t *testing.T) {
+	env := &dfaasv1.Environment{
+		ObjectMeta: metav1.ObjectMeta{Name: "env-demo", Namespace: "default", UID: "1f0c9c8e-uid"},
+	}
+	nodes := []dfaasv1.EnvironmentNode{
+		{NodeID: "gen-a", IPAddress: "10.0.0.9", Role: dfaasv1.RoleK6LoadGenerator, Username: "ubuntu", Password: "pw"},
+		{NodeID: "gen-b", IPAddress: "10.0.0.10", Role: dfaasv1.RoleK6LoadGenerator, Username: "ubuntu", Password: "pw"},
+	}
+
+	k6, _ := roles.For(dfaasv1.RoleK6LoadGenerator)
+	inv, err := buildInventory(env, k6, nodes, nil)
+	if err != nil {
+		t.Fatalf("buildInventory: %v", err)
+	}
+	want := fmt.Sprintf(" filer_node_port=%d", monitoring.FilerNodePort)
+	lines := strings.Split(strings.TrimSpace(inv), "\n")[1:] // drop the [group] header
+	if len(lines) != len(nodes) {
+		t.Fatalf("expected %d host lines, got %d:\n%s", len(nodes), len(lines), inv)
+	}
+	for i, line := range lines {
+		if !strings.Contains(line, want) {
+			t.Errorf("host line for %s missing%s:\n%s", nodes[i].NodeID, want, line)
+		}
 	}
 }
 

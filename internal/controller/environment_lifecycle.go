@@ -29,6 +29,7 @@ import (
 	"dfaas-operator/internal/controller/ansible"
 	"dfaas-operator/internal/controller/roles"
 	"dfaas-operator/internal/controller/statuswriter"
+	"dfaas-operator/internal/k6dispatch"
 )
 
 // monitoringAttemptsAnnotation persists the consecutive-error counter for
@@ -377,8 +378,13 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 }
 
 // syncNodeStatus surfaces k6/dfaas node info into status, for fast lookup by
-// the LoadTestReconciler.
+// the LoadTestReconciler. The management addresses are read before the
+// write: the Touch reruns on every conflict retry, so it holds no API calls.
 func (r *EnvironmentReconciler) syncNodeStatus(ctx context.Context, env *dfaasv1.Environment) error {
+	addrs, err := r.k6ManagementAddresses(ctx, env)
+	if err != nil {
+		return err
+	}
 	return r.writer().Record(ctx, env, envTransition{Touch: func(latest *dfaasv1.Environment) error {
 		var k6 []dfaasv1.K6NodeStatus
 		var dfaas []string
@@ -386,9 +392,10 @@ func (r *EnvironmentReconciler) syncNodeStatus(ctx context.Context, env *dfaasv1
 			switch n.Role {
 			case dfaasv1.RoleK6LoadGenerator:
 				k6 = append(k6, dfaasv1.K6NodeStatus{
-					NodeID:           n.NodeID,
-					IPAddress:        n.IPAddress,
-					KubeconfigSecret: latest.Name + "-" + n.NodeID + "-kubeconfig",
+					NodeID:            n.NodeID,
+					IPAddress:         n.IPAddress,
+					KubeconfigSecret:  ansible.KubeconfigSecretName(latest.Name, n.NodeID),
+					ManagementAddress: addrs[n.NodeID],
 				})
 			case dfaasv1.RoleDfaasWorker:
 				dfaas = append(dfaas, n.NodeID)
@@ -398,6 +405,42 @@ func (r *EnvironmentReconciler) syncNodeStatus(ctx context.Context, env *dfaasv1
 		latest.Status.DfaasNodes = dfaas
 		return nil
 	}})
+}
+
+// k6ManagementAddresses returns, per k6-load-generator nodeID, the management
+// address the k6 playbook detected for that generator and stamped on its own
+// kubeconfig Secret (ansible.AnnotationKubeconfigManagementAddress), in
+// canonical form. A node is left out, so its URLs fall back to the
+// process-wide base, when its Secret does not exist (yet) or the annotation is
+// absent, empty or fails k6dispatch.ParseManagementAddress. Any other read
+// error is returned: the caller requeues rather than write a status that
+// silently dropped a detected address.
+func (r *EnvironmentReconciler) k6ManagementAddresses(ctx context.Context,
+	env *dfaasv1.Environment) (map[string]string, error) {
+
+	addrs := map[string]string{}
+	for _, n := range env.NodesWithRole(dfaasv1.RoleK6LoadGenerator) {
+		key := client.ObjectKey{Namespace: env.Namespace, Name: ansible.KubeconfigSecretName(env.Name, n.NodeID)}
+		var sec corev1.Secret
+		if err := r.Get(ctx, key, &sec); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("read kubeconfig secret %s for k6 node %q: %w", key.Name, n.NodeID, err)
+		}
+		raw := sec.Annotations[ansible.AnnotationKubeconfigManagementAddress]
+		addr, ok := k6dispatch.ParseManagementAddress(raw)
+		if !ok {
+			if strings.TrimSpace(raw) != "" {
+				log.FromContext(ctx).Info("ignoring an unusable management address on the kubeconfig Secret; "+
+					"this generator's runners use the fallback base",
+					"nodeID", n.NodeID, "secret", key.Name, "value", raw)
+			}
+			continue
+		}
+		addrs[n.NodeID] = addr
+	}
+	return addrs, nil
 }
 
 // pruneK6Kubeconfigs deletes the per-node kubeconfig Secrets of env whose

@@ -6,16 +6,16 @@ metadata:
 spec:
   targetEnvironment: env-sample
   # suspended: true   # Save-as-Draft: holds phase=Pending (read the draft
-                      # state from spec.suspended — there is no Suspended
-                      # condition), no k6 dispatch. PATCH to false to
-                      # activate. UI sets this on create; default false for
-                      # plain `kubectl apply`. Required if you set startAt.
+  # state from spec.suspended — there is no Suspended
+  # condition), no k6 dispatch. PATCH to false to
+  # activate. UI sets this on create; default false for
+  # plain `kubectl apply`. Required if you set startAt.
   # stop: true        # Abort: PATCH spec.stop=true to delete every remote
-                      # TestRun across k6 nodes and transition the CR to
-                      # the terminal "Aborted" phase (CR persists as
-                      # historical record). Only honored from Pending or
-                      # Running. Stamps Conditions[Ready]=False
-                      # reason=UserAborted on completion.
+  # TestRun across k6 nodes and transition the CR to
+  # the terminal "Aborted" phase (CR persists as
+  # historical record). Only honored from Pending or
+  # Running. Stamps Conditions[Ready]=False
+  # reason=UserAborted on completion.
   perNodeLoad:
     - nodeID: k6-gen-1
       vus: 50
@@ -29,10 +29,10 @@ spec:
         metricName: mem_available
         query: node_memory_MemAvailable_bytes
         comment: "Free memory per node (bare metric)"
-      # Rate windows must be >= 4x the federation interval. The management
-      # Prometheus federates from each worker once a minute, so rate(...[1m])
-      # sees at most one sample and silently returns NOTHING; [5m] is the
-      # smallest window that reliably yields data here.
+      # Rate windows must be >= 4x the federation interval (the management
+      # Prometheus's server.global.scrape_interval, in the operator's embedded
+      # prometheus-values.yaml): rate() needs two samples inside its window
+      # and returns nothing whenever one is late. [5m] reliably yields data.
       - type: custom-promql
         metricName: cpu_rate
         query: rate(node_cpu_seconds_total[5m])

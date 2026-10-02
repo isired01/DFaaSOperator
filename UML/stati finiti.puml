@@ -108,7 +108,8 @@ state "LoadTest FSM" as LTFSM <<LTRoot>> #CE93D8 ##[bold]4A148C {
   Pending : il dispatch avviene qui (K6Dispatched)
 
   state Running
-  Running : K6Dispatched=True/AllDispatched
+  Running : K6Dispatched=True/AllDispatched|DispatchedUnreachable
+  Running : (DispatchedUnreachable: un generatore non raggiunge il filer, solo avviso)
 
   state Exporting
   Exporting : K6Healthy=True/AllFinished
@@ -124,7 +125,7 @@ state "LoadTest FSM" as LTFSM <<LTRoot>> #CE93D8 ##[bold]4A148C {
 
   state Aborted
   Aborted : MetricsExported=False/Skipped
-Aborted : (da Exporting resta ExportCooldown|ExporterRunning)
+  Aborted : (da Exporting, solo con delete: Job fermato, export forse parziale)
   Aborted : Ready=False/UserAborted
 
   Pending --> Pending : suspended=true (draft) | startAt>now (Scheduled/ScheduledArmed)\n| in coda (Queued) | env non Ready, nulla applicato\n| barriera sync (SyncReady=False/AwaitingRunners)

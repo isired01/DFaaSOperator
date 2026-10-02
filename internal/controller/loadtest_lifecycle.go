@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -25,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
+	"dfaas-operator/internal/controller/monitoring"
 	"dfaas-operator/internal/controller/statuswriter"
 	"dfaas-operator/internal/k6dispatch"
 )
@@ -90,12 +92,27 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 // k6-load-generator node's k3s cluster, then transitions LoadTest → Running.
 func (r *LoadTestReconciler) startK6(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
-	// Synchronized start needs a VM-facing GO URL before anything is
-	// dispatched — fail loudly instead of parking every runner on a barrier
-	// nobody can open (e.g. `make run` without DFAAS_SYNC_PUBLIC_URL).
-	if lt.Spec.SyncStart && r.syncChannel().GoURL(lt) == "" {
-		return r.failLoadTest(ctx, lt,
-			"synchronized start: cannot resolve the VM-facing GO URL — set DFAAS_SYNC_PUBLIC_URL (or run in-cluster with HOST_IP injected)")
+	// Synchronized start needs a VM-facing GO URL for every generator before
+	// anything is dispatched — fail loudly instead of parking runners on a
+	// barrier they cannot see open. A generator has one when a management
+	// address was detected for it at provisioning, or else when the
+	// process-wide fallback resolved (it does not under `make run` without
+	// DFAAS_SYNC_PUBLIC_URL, against an Environment provisioned before the
+	// detection existed).
+	if lt.Spec.SyncStart {
+		var unresolved []string
+		for _, perNode := range lt.Spec.PerNodeLoad {
+			if r.syncChannel().GoURL(lt, k6dispatch.GeneratorOf(env, perNode.NodeID)) == "" {
+				unresolved = append(unresolved, perNode.NodeID)
+			}
+		}
+		if len(unresolved) > 0 {
+			return r.failLoadTest(ctx, lt, fmt.Sprintf(
+				"synchronized start: cannot resolve the VM-facing GO URL for generator(s) %s — no management address "+
+					"was detected for them at provisioning (re-provision the Environment by editing its spec), and no "+
+					"fallback is set: set DFAAS_SYNC_PUBLIC_URL (or run in-cluster with HOST_IP injected)",
+				strings.Join(unresolved, ", ")))
+		}
 	}
 
 	// P9: first observation — nothing dispatched yet, status is Unknown.
@@ -134,7 +151,7 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 				fmt.Sprintf("perNodeLoad %q on env %q: %v", perNode.NodeID, env.Name, nerr))
 		}
 		// Computed once: the probe must check the URL the runner is given.
-		renv := r.runnerEnv(lt, perNode.NodeID)
+		renv := r.runnerEnv(lt, env, perNode.NodeID)
 		if res, stop, err := r.dispatchOne(ctx, lt, node, perNode, renv); stop {
 			return res, err
 		}
@@ -263,14 +280,23 @@ func (r *LoadTestReconciler) dispatchOne(ctx context.Context, lt *dfaasv1.LoadTe
 	return ctrl.Result{}, false, nil
 }
 
-// runnerEnv is what the reconciler decides about the k6 runner's environment:
-// the URLs the generated script talks to. The dispatcher only carries them.
-func (r *LoadTestReconciler) runnerEnv(lt *dfaasv1.LoadTest, nodeID string) k6dispatch.RunnerEnv {
-	env := k6dispatch.RunnerEnv{SummaryURL: r.syncChannel().SummaryURL(lt, nodeID)}
+// runnerEnv is what the reconciler decides about nodeID's k6 runner
+// environment: the URLs the generated script talks to, built on the management
+// address detected for that generator when there is one. The dispatcher only
+// carries them.
+func (r *LoadTestReconciler) runnerEnv(lt *dfaasv1.LoadTest, env *dfaasv1.Environment, nodeID string) k6dispatch.RunnerEnv {
+	g := k6dispatch.GeneratorOf(env, nodeID)
+	renv := k6dispatch.RunnerEnv{SummaryURL: r.syncChannel().SummaryURL(lt, g)}
 	if lt.Spec.SyncStart {
-		env.SyncURL = r.syncChannel().GoURL(lt)
+		renv.SyncURL = r.syncChannel().GoURL(lt, g)
 	}
-	return env
+	// Only on a detected address, with no HOST_IP fallback: HOST_IP can be an
+	// address only the local site reaches, and an asset base built on it would
+	// override the URL the gateway baked from SEAWEEDFS_PUBLIC_URL.
+	if g.MgmtAddr != "" {
+		renv.AssetBase = monitoring.S3PublicBase(g.MgmtAddr)
+	}
+	return renv
 }
 
 // persistTestRuns writes the cumulative TestRunRef slice into
