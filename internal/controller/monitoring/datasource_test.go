@@ -59,8 +59,7 @@ func TestGrafanaDatasourceURLCarriesThePrometheusPort(t *testing.T) {
 	}
 }
 
-// The UI deep-links a running LoadTest into the live dashboard; with a login
-// page in between the link lands on the form instead. Keys with a dot are
+// Grafana opens on the dashboards, not on a login form. Keys with a dot are
 // grafana.ini section names, so a typo there is ignored by Grafana silently.
 func TestGrafanaOpensWithoutLogin(t *testing.T) {
 	var graf struct {

@@ -48,9 +48,9 @@ func mustScrapeInterval(values []byte) time.Duration {
 //go:embed values/grafana-values.yaml
 var grafanaValuesYAML []byte
 
-// liveDashboardUID is the dashboard's stable id: the UI deep-links a running
-// LoadTest to /d/<uid> with the run's window and the Environment preselected,
-// so changing it breaks those links.
+// liveDashboardUID is the dashboard's stable id: a bookmarked /d/<uid> URL
+// keeps working across Grafana restarts, so changing it breaks those links.
+// Nothing in the UI links to Grafana yet.
 const liveDashboardUID = "dfaas-live"
 
 // The dashboard is provisioned from this file rather than created through the
