@@ -16,7 +16,7 @@ func TestLiveDashboardIsValidAndDynamic(t *testing.T) {
 		t.Fatalf("dashboard JSON does not parse: %v", err)
 	}
 	if dash["uid"] != liveDashboardUID {
-		t.Errorf("uid = %v, want %q — the UI deep-links this uid", dash["uid"], liveDashboardUID)
+		t.Errorf("uid = %v, want %q — every saved /d/<uid> link would break", dash["uid"], liveDashboardUID)
 	}
 
 	// Template variables are what make one dashboard answer both questions:
