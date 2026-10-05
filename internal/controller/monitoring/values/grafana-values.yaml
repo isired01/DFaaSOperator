@@ -1,5 +1,5 @@
 # Override values for the grafana/grafana chart.
-# PoC: no PVC, admin/admin credentials, Prometheus datasource
+# PoC: no PVC, no login, Prometheus datasource
 # pre-configured pointing at the "prometheus" release in the monitoring namespace.
 
 persistence:
@@ -7,6 +7,16 @@ persistence:
 
 adminUser: admin
 adminPassword: admin
+
+# No login page: every visitor is an anonymous Admin, so the UI's deep link to
+# the live dashboard opens straight away. Lab-grade, like the filer UI on
+# 30901: anyone who reaches 30300 can edit dashboards and datasources.
+grafana.ini:
+  auth.anonymous:
+    enabled: true
+    org_role: Admin
+  auth:
+    disable_login_form: true
 
 service:
   type: NodePort
