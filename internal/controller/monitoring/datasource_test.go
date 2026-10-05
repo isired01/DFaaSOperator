@@ -58,3 +58,29 @@ func TestGrafanaDatasourceURLCarriesThePrometheusPort(t *testing.T) {
 		t.Error("no Prometheus datasource in the grafana values")
 	}
 }
+
+// The UI deep-links a running LoadTest into the live dashboard; with a login
+// page in between the link lands on the form instead. Keys with a dot are
+// grafana.ini section names, so a typo there is ignored by Grafana silently.
+func TestGrafanaOpensWithoutLogin(t *testing.T) {
+	var graf struct {
+		Ini struct {
+			Anonymous struct {
+				Enabled bool   `json:"enabled"`
+				OrgRole string `json:"org_role"`
+			} `json:"auth.anonymous"`
+			Auth struct {
+				DisableLoginForm bool `json:"disable_login_form"`
+			} `json:"auth"`
+		} `json:"grafana.ini"`
+	}
+	if err := sigsyaml.Unmarshal(grafanaValuesYAML, &graf); err != nil {
+		t.Fatalf("parse grafana values: %v", err)
+	}
+	if !graf.Ini.Anonymous.Enabled || graf.Ini.Anonymous.OrgRole != "Admin" {
+		t.Errorf("grafana.ini auth.anonymous = %+v, want enabled with org_role Admin", graf.Ini.Anonymous)
+	}
+	if !graf.Ini.Auth.DisableLoginForm {
+		t.Error("grafana.ini auth.disable_login_form is not true; the login page is back")
+	}
+}
