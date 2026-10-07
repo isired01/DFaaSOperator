@@ -61,11 +61,3 @@ func (n *Nodes) Rounds() [][]string {
 	copy(out, n.rounds)
 	return out
 }
-
-// SetDown replaces the down set. Use it to bring a Node back between
-// reconciles.
-func (n *Nodes) SetDown(ids ...string) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.Down = ids
-}

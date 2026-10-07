@@ -29,12 +29,10 @@ import (
 type Channel struct {
 	mu sync.Mutex
 
-	// PublishErr, DeleteGoErr and DeleteSummariesErr are returned by the
-	// matching operation. A filer that refuses the GO PUT is the case the old
-	// httptest handler could not express: it answered 204 to everything.
-	PublishErr         error
-	DeleteGoErr        error
-	DeleteSummariesErr error
+	// PublishErr is returned by PublishGo. A filer that refuses the GO PUT is
+	// the case the old httptest handler could not express: it answered 204 to
+	// everything.
+	PublishErr error
 
 	// Public is the process-wide fallback base, what a generator with no
 	// detected management address dials (DFAAS_SYNC_PUBLIC_URL, else HOST_IP,
@@ -80,12 +78,12 @@ func (c *Channel) PublishGo(_ context.Context, _ *dfaasv1.LoadTest) error {
 
 func (c *Channel) DeleteGo(_ context.Context, _ *dfaasv1.LoadTest) error {
 	c.record("DeleteGo")
-	return c.DeleteGoErr
+	return nil
 }
 
 func (c *Channel) DeleteSummaries(_ context.Context, _ *dfaasv1.LoadTest) error {
 	c.record("DeleteSummaries")
-	return c.DeleteSummariesErr
+	return nil
 }
 
 // GoURL and SummaryURL follow the production precedence (detected address,
