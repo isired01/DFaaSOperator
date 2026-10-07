@@ -12,7 +12,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: '1.26.x'
+          check-latest: true
           cache: true
 
       # A CRD field that exists only in Go compiles, passes every unit test,
@@ -42,11 +43,24 @@ jobs:
             diff -u "config/crd/bases/$f" "charts/dfaas/crds/$f"
           done
 
+      - uses: azure/setup-helm@v5
+        with:
+          version: v3.15.4
+      - name: Chart lints and renders
+        run: |
+          helm lint charts/dfaas
+          helm template dfaas charts/dfaas > /dev/null
+
       # make test = manifests + generate + fmt + vet + envtest assets + go test
-      # over `go list ./... | grep -v /e2e`. Never run ./test/e2e here: it
-      # applies cert-manager and the prometheus-operator bundle to whatever
-      # kubeconfig context is active, with no guard.
+      # ./..., then go test in dataExporter/ and imageFunction/ (separate
+      # modules).
       - run: make test
+
+      - name: Vet dataExporter and imageFunction
+        run: |
+          for m in dataExporter imageFunction; do
+            (cd "$m" && go vet ./...)
+          done
 
       # A Dockerfile is source no Go check reads. Two real breakages got past
       # everything above: the operator image omitted internal/reach and
@@ -66,11 +80,11 @@ jobs:
   # the operator Deployment; :latest is only exporterImage()'s fallback in
   # internal/controller/exporter_job.go, used by an operator started with
   # `make run` and no DFAAS_EXPORTER_IMAGE set. Publishing it from main makes
-  # that local dev path built from real export code, instead of a buildx run
-  # on a laptop that happens to have Docker up. Deliberately only this image:
-  # the operator and imgproc images still ship from release.yml on a v* tag,
-  # and the job above still only *builds* all three, on every PR, as the
-  # Dockerfile gate.
+  # that local dev path built from real export code, instead of a manual
+  # buildx run. Deliberately only this image: release.yml publishes the
+  # operator, exporter and imgproc images under the version tags on a v* tag,
+  # and the job above only *builds* all three, on every PR, as the Dockerfile
+  # gate.
   #
   # Consequence to keep in mind: :latest now means "current main" for the
   # exporter, not "last release" -- a `make run` operator started right after
@@ -96,9 +110,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Multi-arch, like release.yml: the management cluster runs on arm64 on
-      # the laptop and on amd64 elsewhere, and a single-arch image fails there
-      # with "exec format error" only once the Job starts.
+      # Multi-arch, like release.yml: management clusters run on arm64 or
+      # amd64, and a single-arch image fails there with "exec format error"
+      # only once the Job starts.
       - name: Build & push exporter image
         uses: docker/build-push-action@v7
         with:
