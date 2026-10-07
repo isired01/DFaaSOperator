@@ -79,7 +79,6 @@ var envSyncChannel = sync.OnceValue(func() syncchannel.Channel {
 	return syncchannel.FromEnv()
 })
 
-// syncChannel is the nil-safe accessor for Sync.
 // budget builds one named Retry counter with its ceiling.
 func (r *LoadTestReconciler) budget(counter string, limit int) statuswriter.Budget[*dfaasv1.LoadTest, dfaasv1.LoadTestPhase] {
 	return statuswriter.Budget[*dfaasv1.LoadTest, dfaasv1.LoadTestPhase]{
@@ -87,6 +86,7 @@ func (r *LoadTestReconciler) budget(counter string, limit int) statuswriter.Budg
 	}
 }
 
+// syncChannel is the nil-safe accessor for Sync.
 func (r *LoadTestReconciler) syncChannel() syncchannel.Channel {
 	if r.Sync != nil {
 		return r.Sync
@@ -140,7 +140,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	envKey := types.NamespacedName{Name: lt.Spec.TargetEnvironment, Namespace: lt.Namespace}
 	if err := r.Get(ctx, envKey, &env); err != nil {
 		if apierrors.IsNotFound(err) {
-			// P9: surface link state on EnvironmentLinked, in the same write.
+			// Surface link state on EnvironmentLinked, in the same write.
 			msg := fmt.Sprintf("environment %q not found in namespace %s",
 				lt.Spec.TargetEnvironment, lt.Namespace)
 			return r.failLoadTest(ctx, &lt, msg, statuswriter.Cond{Type: dfaasv1.LTCondEnvironmentLinked,
@@ -166,7 +166,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// P9: env exists — stamp EnvironmentLinked.
+	// Env exists — stamp EnvironmentLinked.
 	switch env.Status.Phase {
 	case dfaasv1.EnvFailed:
 		r.cond(ctx, &lt, dfaasv1.LTCondEnvironmentLinked,
@@ -184,7 +184,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			lt.Status.Phase == dfaasv1.LoadTestRunning
 		if inAbortWindow {
 			return r.abortLoadTest(ctx, &lt, dfaasv1.LTReasonUserAborted,
-				"The test was manually aborted from the UI.")
+				"Aborted: spec.stop was set to true.")
 		}
 	}
 
@@ -223,7 +223,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.phase(ctx, &lt, dfaasv1.LoadTestPending, "", "")
 	}
 
-	// Scheduled-start branch (P9: stamps LTCondScheduled).
+	// Scheduled-start branch (stamps LTCondScheduled).
 	if lt.Spec.StartAt != nil && lt.Status.Phase.PreExecution() && lt.Spec.Suspended && len(lt.Status.TestRuns) == 0 {
 
 		fireT := lt.Spec.StartAt.Time
@@ -307,7 +307,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	return ctrl.Result{}, nil
 }
 
-// stampLTAggregate writes the LTCondReady aggregator (P9) onto the in-memory
+// stampLTAggregate writes the LTCondReady aggregator onto the in-memory
 // LoadTest. Pure function; caller persists via Status().Update. A non-empty
 // reasonOverride / msgOverride replaces the generic per-phase value.
 func stampLTAggregate(lt *dfaasv1.LoadTest, phase dfaasv1.LoadTestPhase, reasonOverride, msgOverride string) {
@@ -451,7 +451,8 @@ func (r *LoadTestReconciler) SetupWithManager(mgr ctrl.Manager) error {
 //     holds the env until terminal and bypasses the gate so a partial dispatch
 //     is never handed off mid-flight.
 //   - "Busy"   = a sibling LoadTest on the same env in phase Running OR Exporting,
-//     OR still "" / Pending but already holding remote TestRuns (partial dispatch).
+//     OR still "" / Pending but already holding remote TestRuns (partial dispatch),
+//     OR terminal with K6Healthy=RunnersUnreclaimed.
 //   - "Waiting" = siblings (incl. self) with phase ∈ {"", Pending}, no TestRuns yet,
 //     not suspended, and whose schedule has already fired (startAt nil or past).
 //   - "Front"   = the waiting sibling with the oldest creationTimestamp
@@ -534,7 +535,7 @@ func (r *LoadTestReconciler) envOccupancyGate(ctx context.Context,
 		if sib.Spec.Suspended {
 			continue
 		}
-		// ponytail: an un-suspended test still carrying a future startAt
+		// Known limitation: an un-suspended test still carrying a future startAt
 		// (kubectl, or a pre-fix gateway's Start) is skipped here too, so younger
 		// waiting tests may go first until its startAt passes. Bounded priority
 		// inversion; it still dispatches once none waits.

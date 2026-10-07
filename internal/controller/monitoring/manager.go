@@ -1,10 +1,8 @@
-// Package monitoring encapsulates management of the monitoring stack
-// (Prometheus + Grafana via Helm) and the dynamic configuration of the
-// file-based service discovery targets.
+// Package monitoring manages the monitoring stack (Prometheus, Grafana and
+// SeaweedFS via Helm) and the file-based service discovery targets.
 //
-// Helm assets (chart .tgz and values.yaml) are bundled into the binary via
-// go:embed (see assets.go). Install/upgrade operations are delegated to the
-// SDK wrapper in internal/helm/.
+// The chart archives and values files are embedded in the binary (see
+// assets.go). Install and upgrade go through the SDK wrapper in internal/helm/.
 package monitoring
 
 import (
@@ -15,14 +13,7 @@ import (
 	dfaasv1 "dfaas-operator/api/v1"
 )
 
-// Stack is the monitoring stack as the Environment reconciler needs it. It
-// exists because the reconciler used to build a *Manager inside its own body,
-// and Manager.Deploy reaches helm.InstallOrUpgradeFromArchive -> cli.New(),
-// which resolves $KUBECONFIG or the in-cluster config and performs a real Helm
-// install. Nothing could be substituted, so ensureMonitoring -- five distinct
-// outcomes, including the deliberate distinction between "readiness could not
-// be evaluated" and "not ready yet" -- was referenced in zero test files.
-//
+// Stack is the monitoring stack as the Environment reconciler needs it.
 // Manager satisfies this interface verbatim; monitoring/fake records the calls.
 type Stack interface {
 	Deploy(ctx context.Context) error
@@ -33,7 +24,7 @@ type Stack interface {
 
 var _ Stack = (*Manager)(nil)
 
-// Manager runs the monitoring provisioning operations (Prometheus + Grafana)
+// Manager runs the monitoring provisioning operations (Prometheus, Grafana and SeaweedFS)
 // and the reconciliation of Prometheus targets for an environment.
 type Manager struct {
 	client.Client

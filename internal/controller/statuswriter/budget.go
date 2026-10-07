@@ -19,27 +19,17 @@ import (
 
 // Budget is one named Retry counter with a ceiling.
 //
-// Four counters ran the identical five-step protocol -- Bump, compare to a
-// budget, on exhaustion stamp a Condition and go terminal, otherwise stamp a
-// progress Condition and requeue, Reset on the next success -- with four
-// budgets, four terminal targets, and THREE different answers to "what if the
-// Bump itself failed":
+// A round is Attempt (bump, compare to the Limit), then either a terminal
+// Condition and Phase on exhaustion or a progress Condition and a requeue;
+// Clear on the next success. When the counter write itself fails, Attempt
+// reports CounterUnavailable instead of a count of zero.
 //
-//   - onDispatchError logged and returned a requeue immediately, skipping the
-//     Condition stamp entirely. On a persistently conflicting annotation Update
-//     the LoadTest requeued every 10s forever with no K6Dispatched Condition
-//     ever stamped -- the SPA saw nothing and the only diagnostic was an
-//     operator log line.
-//   - two sites logged and continued with count == 0, and one of them then
-//     formatted "attempt 0/3" into a user-visible Condition message.
-//   - ensureMonitoring logged and continued with count == 0, silently breaking
-//     its own documented invariant: count == 1 means "first ever observation,
-//     stamp Unknown", and count == 0 fell through to False.
-//
-// Counters stay generation-scoped, "<generation>:<count>" (ADR-0003); Budget
-// owns only the policy on top, and inherits the encoding untouched through
-// Writer.Bump. Per ADR-0002 Attempt returns no ctrl.Result: each caller keeps
-// its own requeue and its own terminal Phase.
+// Counters stay generation-scoped, "<generation>:<count>" (ADR-0003,
+// docs/adr/0003-all-retry-counters-generation-scoped.md); Budget owns only the
+// policy on top, and inherits the encoding untouched through Writer.Bump. Per
+// ADR-0002 (docs/adr/0002-status-writer-never-decides-requeue.md) Attempt
+// returns no ctrl.Result: each caller keeps its own requeue and its own
+// terminal Phase.
 type Budget[T client.Object, P ~string] struct {
 	Writer  Writer[T, P]
 	Counter string
@@ -67,8 +57,7 @@ type Outcome struct {
 //
 // The error return is for a caller that wants to propagate it; every current
 // caller treats a counter write failure as non-fatal and branches on
-// CounterUnavailable instead, which is exactly the point: one answer rather
-// than three.
+// CounterUnavailable instead.
 func (b Budget[T, P]) Attempt(ctx context.Context, obj T) (Outcome, error) {
 	count, err := b.Writer.Bump(ctx, obj, b.Counter)
 	if err != nil {
@@ -88,9 +77,8 @@ func (b Budget[T, P]) Clear(ctx context.Context, obj T) error {
 }
 
 // Attempts renders the attempt count for a Condition message: "2/3", or "?/3"
-// when the counter could not be written. It exists because one call site used
-// to format the unavailable case as "attempt 0/3", which reads as a real
-// measurement of zero.
+// when the counter could not be written, never "0/3", which would read as a
+// real measurement of zero.
 func (b Budget[T, P]) Attempts(o Outcome) string {
 	if o.CounterUnavailable {
 		return fmt.Sprintf("?/%d", b.Limit)

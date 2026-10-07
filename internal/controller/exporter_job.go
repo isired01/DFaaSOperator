@@ -71,7 +71,7 @@ const k6LogMountPath = "/var/run/k6logs"
 // k6SummarySource pairs a k6-load-generator nodeID with the in-cluster filer
 // URL its handleSummary JSON was uploaded to. JSON-encoded into the exporter
 // Job's K6_SUMMARY_SOURCES env var — the operator composes full URLs so the
-// exporter never re-implements sanitize() (drift would 404 every fetch).
+// exporter never re-implements k6dispatch.Sanitize (drift would 404 every fetch).
 type k6SummarySource struct {
 	NodeID string `json:"nodeId"`
 	URL    string `json:"url"`
@@ -119,10 +119,9 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 		{Name: "STEP", Value: step},
 		{Name: "EXP_NAME", Value: lt.Name},
 		// Both name the run inside every CSV row and in the object keys, so
-		// they belong to the base block: on the stdout path (no S3 config)
-		// they used to be empty, which left the keys built from an empty
-		// LoadTest name and the k6 CSV unable to say which Environment it
-		// measured.
+		// they belong to the base block: on the stdout path (no S3 config) they
+		// must be set too, or the keys are built from an empty LoadTest name and
+		// the k6 CSV cannot say which Environment it measured.
 		{Name: "LOADTEST_NAME", Value: lt.Name},
 		{Name: "ENV_NAME", Value: env.Name},
 	}
@@ -223,7 +222,8 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 
 	// PodReplacementPolicy=Failed retains failed Pods for post-mortem debug:
 	// Job controller waits for full Pod termination before replacing and does
-	// not delete failed Pods on BackoffLimit exceeded (TTL handles cleanup).
+	// not delete failed Pods on BackoffLimit exceeded (the Job and its Pods are
+	// garbage-collected with the LoadTest through the controller reference).
 	prFailed := batchv1.Failed
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -234,7 +234,7 @@ func (r *LoadTestReconciler) createExporterJob(lt *dfaasv1.LoadTest,
 			BackoffLimit: ptr.To[int32](2),
 			// Cap runtime so a hung Prometheus query or S3 upload can't wedge the
 			// LoadTest in Exporting forever (BackoffLimit never trips on a hang).
-			// ponytail: fixed 10-min ceiling; raise it if exports legitimately run longer.
+			// Known limitation: fixed 10-min ceiling; raise it if exports legitimately run longer.
 			ActiveDeadlineSeconds: ptr.To[int64](600),
 			PodReplacementPolicy:  &prFailed,
 			Template: corev1.PodTemplateSpec{

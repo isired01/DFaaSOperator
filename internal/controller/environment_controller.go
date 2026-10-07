@@ -34,8 +34,9 @@ const environmentFinalizer = "dfaas.dfaas.io/environment-finalizer"
 // EnvironmentReconciler owns the Environment CRD lifecycle: it walks the
 // infrastructure FSM (ProvisioningVMs → ProvisioningInfra → ProvisioningMonitoring
 // → Ready) by delegating each phase to the helpers in the ansible/ and
-// monitoring/ subpackages. Once an Environment is Ready it stays idle until
-// the spec changes (detected via generation drift).
+// monitoring/ subpackages. Once Ready it re-probes every node on :22 each minute
+// (reconcileReadyHealth, which can move it to Unreachable) and re-provisions
+// when the spec changes (generation drift).
 type EnvironmentReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
@@ -129,10 +130,11 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.reconcileReadyHealth(ctx, &env)
 	}
 
-	// Generation drift: spec was edited after a settled run. Restart the FSM
-	// from ProvisioningVMs (see handleGenerationDrift). Done in one place so the
-	// stale-Job cleanup runs once per drift, not on every reconcile of the
-	// subsequent re-provisioning window.
+	// Generation drift: the spec was edited after the run that is installed or
+	// in progress. Restart the FSM from ProvisioningVMs (see
+	// handleGenerationDrift). Done in one place so the stale-Job cleanup runs
+	// once per drift, not on every reconcile of the subsequent re-provisioning
+	// window.
 	if handled, res, err := r.handleGenerationDrift(ctx, &env); handled || err != nil {
 		return res, err
 	}
@@ -172,11 +174,12 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{}, nil
 }
 
-// handleGenerationDrift detects a spec edit applied after a settled run
-// (observedGeneration older than the current generation) and restarts the FSM:
-// it deletes stale-generation Ansible Jobs, resets the transient Conditions, and
-// moves the phase back to ProvisioningVMs. Returns handled=true when it took over
-// the reconcile — the caller must return res/err immediately.
+// handleGenerationDrift detects a spec edit (generation ahead of
+// observedGeneration in a settled phase, of provisioningGeneration otherwise)
+// and restarts the FSM: it deletes stale-generation Ansible Jobs, resets the
+// transient Conditions, and moves the phase back to ProvisioningVMs. Returns
+// handled=true when it took over the reconcile — the caller must return
+// res/err immediately.
 //
 // One rule for every phase: drift mid-provisioning (or while Unreachable)
 // restarts the run too, so an edit that lands after the Ansible Jobs ran is
@@ -199,7 +202,7 @@ func (r *EnvironmentReconciler) handleGenerationDrift(ctx context.Context,
 	logger := log.FromContext(ctx)
 	logger.Info("generation drift detected — restarting provisioning",
 		"phase", env.Status.Phase,
-		"observed", env.Status.ObservedGeneration, "current", env.Generation)
+		"recorded", recorded, "current", env.Generation)
 	if _, cerr := r.cleanupStaleGenJobs(ctx, env); cerr != nil {
 		logger.Error(cerr, "stale-gen Job cleanup failed")
 	}
@@ -246,7 +249,9 @@ func (r *EnvironmentReconciler) writer() statuswriter.Writer[*dfaasv1.Environmen
 }
 
 // budget builds one named Retry counter with its ceiling. The counters stay
-// generation-scoped (ADR-0003); Budget owns only the policy on top.
+// generation-scoped (ADR-0003,
+// docs/adr/0003-all-retry-counters-generation-scoped.md); Budget owns only the
+// policy on top.
 func (r *EnvironmentReconciler) budget(counter string, limit int) statuswriter.Budget[*dfaasv1.Environment, dfaasv1.EnvironmentPhase] {
 	return statuswriter.Budget[*dfaasv1.Environment, dfaasv1.EnvironmentPhase]{
 		Writer: r.writer(), Counter: counter, Limit: limit,

@@ -33,12 +33,11 @@ import (
 )
 
 // monitoringAttemptsAnnotation persists the consecutive-error counter for
-// the monitoring Helm install across reconciles. P4 mirror of the LoadTest
-// dispatch budget.
+// the monitoring Helm install across reconciles.
 const monitoringAttemptsAnnotation = "dfaas.dfaas.io/monitoring-attempts"
 
 // monitoringRetryBudget is the max consecutive Helm install failures
-// tolerated before the Environment is moved to EnvFailed (P4).
+// tolerated before the Environment is moved to EnvFailed.
 const monitoringRetryBudget = 5
 
 // envDrainBudget bounds how long the Environment finalizer waits for each
@@ -70,7 +69,7 @@ const envDrainBudget = deletionReclaimBudget + time.Minute
 // Environment has already lost "orphan" while a test's cached ownerRef is not
 // yet stripped, and a finished test is deleted. --cascade=foreground still
 // defeats the ordering below by letting GC delete the kubeconfig Secrets in
-// parallel (keep that ponytail).
+// parallel (accepted limitation).
 //
 // The finalizer is dropped only once CleanupTargets succeeds: it is the single
 // piece of state that does NOT cascade (the prometheus-targets ConfigMap is
@@ -165,7 +164,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 		budget := r.budget(sshAttemptsAnnotation, sshRetryBudget)
 		outcome, bumpErr := budget.Attempt(ctx, env)
 		if bumpErr != nil {
-			logger.Error(bumpErr, "bumpSSHAttempts failed; the budget cannot advance")
+			logger.Error(bumpErr, "ssh-attempts counter write failed; the budget cannot advance")
 		}
 		if outcome.Exhausted {
 			logger.Info("VMs not SSH-reachable after fast-retry budget; entering Unreachable (will keep retrying)",
@@ -183,7 +182,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	if rerr := r.budget(sshAttemptsAnnotation, sshRetryBudget).Clear(ctx, env); rerr != nil {
-		logger.Error(rerr, "resetSSHAttempts failed; non-fatal")
+		logger.Error(rerr, "ssh-attempts counter reset failed; non-fatal")
 	}
 	r.cond(ctx, env, dfaasv1.EnvCondVMsReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonSSHReachable,
@@ -259,9 +258,9 @@ func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 	return r.phase(ctx, env, dfaasv1.EnvProvisioningMonitoring)
 }
 
-// reconcileProvisioningMonitoring installs Prometheus + Grafana via Helm,
-// reconciles per-environment scrape targets, and stamps node status. Runs
-// AFTER ProvisioningInfra so worker /metrics endpoints already exist when
+// reconcileProvisioningMonitoring installs Prometheus, Grafana and SeaweedFS
+// via Helm, reconciles per-environment scrape targets, and stamps node status.
+// Runs AFTER ProvisioningInfra so worker /metrics endpoints already exist when
 // the first scrape fires.
 func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
@@ -291,7 +290,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Cont
 	return r.phase(ctx, env, dfaasv1.EnvReady)
 }
 
-// ensureMonitoring drives the Helm monitoring stack install. P4: after
+// ensureMonitoring drives the Helm monitoring stack install. After
 // monitoringRetryBudget consecutive failures, returns failed=true so the
 // caller transitions the Environment to EnvFailed. Resets the counter on
 // every successful round-trip.
@@ -304,7 +303,7 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 		budget := r.budget(monitoringAttemptsAnnotation, monitoringRetryBudget)
 		outcome, bumpErr := budget.Attempt(ctx, env)
 		if bumpErr != nil {
-			logger.Error(bumpErr, "bumpMonitoringAttempts failed; the budget cannot advance")
+			logger.Error(bumpErr, "monitoring-attempts counter write failed; the budget cannot advance")
 		}
 		if outcome.Exhausted {
 			r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
@@ -313,7 +312,7 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 					outcome.Count, condMessage(derr)))
 			return false, true
 		}
-		// P7 + P14: first ever observation is Unknown; subsequent retries
+		// First ever observation is Unknown; subsequent retries
 		// stay False/HelmInstalling. The sanitized message keeps
 		// LastTransitionTime stable across reconciles when the error class
 		// is the same. Outcome.First names what count == 1 meant -- and when
@@ -329,7 +328,7 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 		return false, false
 	}
 	if rerr := r.budget(monitoringAttemptsAnnotation, monitoringRetryBudget).Clear(ctx, env); rerr != nil {
-		logger.Error(rerr, "resetMonitoringAttempts failed; non-fatal")
+		logger.Error(rerr, "monitoring-attempts counter reset failed; non-fatal")
 	}
 	ready, checkErr := mm.Check(ctx)
 	if checkErr != nil {
@@ -356,9 +355,10 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 	return true, false
 }
 
-// syncNodeStatus surfaces k6/dfaas node info into status, for fast lookup by
-// the LoadTestReconciler. The management addresses are read before the
-// write: the Touch reruns on every conflict retry, so it holds no API calls.
+// syncNodeStatus surfaces k6/dfaas node info into status. The
+// LoadTestReconciler reads status.k6Nodes; status.dfaasNodes is informational.
+// The management addresses are read before the write: the Touch reruns on
+// every conflict retry, so it holds no API calls.
 func (r *EnvironmentReconciler) syncNodeStatus(ctx context.Context, env *dfaasv1.Environment) error {
 	addrs, err := r.k6ManagementAddresses(ctx, env)
 	if err != nil {
@@ -490,7 +490,7 @@ func logStatusErr(ctx context.Context, op string, err error) {
 	}
 }
 
-// resetTransientConditions handles generation drift (P8): the spec was edited
+// resetTransientConditions handles generation drift: the spec was edited
 // after a settled run, so every condition is reset to Unknown — none is
 // trustworthy until the fresh provisioning pass re-stamps it. One write.
 func (r *EnvironmentReconciler) resetTransientConditions(ctx context.Context,

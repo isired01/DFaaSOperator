@@ -38,9 +38,8 @@ func (m *Manager) Check(ctx context.Context) (bool, error) {
 			continue
 		}
 
-		// Require BOTH "prometheus" and "server" so the fast-starting sidecars
-		// (prometheus-node-exporter / -alertmanager / -pushgateway /
-		// -kube-state-metrics) don't satisfy readiness before the server pod is up.
+		// Match the server pod only: the chart's other components are disabled
+		// in values/prometheus-values.yaml.
 		name := pod.Name
 		if strings.Contains(name, "prometheus") && strings.Contains(name, "server") {
 			promReady = true

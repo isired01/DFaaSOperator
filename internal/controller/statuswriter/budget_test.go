@@ -88,7 +88,8 @@ func TestBudgetClearRestartsTheCount(t *testing.T) {
 }
 
 // A spec edit restarts every budget from zero: the counter is
-// generation-scoped, which Budget inherits untouched (ADR-0003).
+// generation-scoped, which Budget inherits untouched (ADR-0003,
+// docs/adr/0003-all-retry-counters-generation-scoped.md).
 func TestBudgetRestartsOnANewGeneration(t *testing.T) {
 	c, lt := newLT(t)
 	b := ltBudget(c, 3)

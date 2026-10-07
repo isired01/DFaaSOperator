@@ -25,9 +25,9 @@ import (
 // The helper strips:
 //   - RFC3339 timestamps with optional sub-second component.
 //   - UUID-style identifiers (8-4-4-4-12 hex).
-//   - bare 16/32-char hex blobs (request IDs, pod UIDs).
+//   - bare hex blobs of 16 or more characters (request IDs, pod UIDs).
 //   - IPv4 addresses + :port suffixes.
-//   - bracketed pod-instance suffixes like "-abcde-12345".
+//   - pod-instance suffixes like "-abcde-12345".
 //   - extra runs of whitespace, leading/trailing spaces.
 //
 // Result is a single line, trimmed, with a hard ceiling of 256 chars so

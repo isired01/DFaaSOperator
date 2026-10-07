@@ -54,9 +54,9 @@ func newLT(t *testing.T) (client.Client, *dfaasv1.LoadTest) {
 	return c, lt
 }
 
-// The ordering trap the old setLoadTestPhaseDetail existed for: a specific
-// condition stamped in the same transition as a phase change must survive the
-// aggregate, and the aggregate must carry the override.
+// The ordering trap: a specific condition stamped in the same transition as a
+// phase change must survive the aggregate, and the aggregate must carry the
+// override.
 func TestRecordStampsConditionsBeforeAggregateAndKeepsOverride(t *testing.T) {
 	c, lt := newLT(t)
 	w := ltWriter(c)
