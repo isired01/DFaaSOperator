@@ -152,7 +152,7 @@ func TestK6PlaybookKeepsOnlyAnIPv4Candidate(t *testing.T) {
 		want   bool
 	}{
 		{"100.64.0.11", true},
-		{"192.168.252.10", true},
+		{"192.0.2.10", true},
 		{"fd7a:115c:a1e0::11", false},
 		{"::ffff:100.64.0.11", false},
 		{"fe80::1%eth0", false},

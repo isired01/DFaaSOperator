@@ -530,7 +530,7 @@ var _ = Describe("LoadTest reconcile through the Dispatcher seam", func() {
 			running := reconcileUntil(lt, 12, phaseIs(dfaasv1.LoadTestRunning))
 			before := cond(running, dfaasv1.LTCondK6Dispatched).LastTransitionTime
 			fleet.SetProbe("gen-a", running, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeUnreachable,
-				Detail: "can't connect to remote host (192.168.252.70): Connection timed out"})
+				Detail: "can't connect to remote host (192.0.2.70): Connection timed out"})
 			fleet.SetProbe("gen-b", running, k6dispatch.ProbeOutcome{State: k6dispatch.ProbeReachable})
 			fresh := reconcileUntil(lt, 3, func(l *dfaasv1.LoadTest) bool {
 				return cond(l, dfaasv1.LTCondK6Dispatched).Reason == dfaasv1.LTReasonDispatchedUnreachable
