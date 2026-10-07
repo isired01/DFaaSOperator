@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Derived from unimib-datAI/dfaas k8s/charts/values-prometheus.yaml (The DFaaS Authors)
 
 # Install only prometheus-node-exporter and alertmanager services.
 prometheus-pushgateway:
