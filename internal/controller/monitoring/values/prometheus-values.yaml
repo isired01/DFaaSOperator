@@ -41,7 +41,7 @@ server:
   # verbs, so it cannot let this chart create its own cluster-scoped RBAC. The dfaas
   # chart ships that ClusterRole + ClusterRoleBinding instead
   # (charts/dfaas/templates/monitoring-rbac.yaml) and this name must match the one
-  # declared there. Setting it also suppresses the chart own ClusterRoleBinding.
+  # declared there. Setting it also suppresses the chart's own ClusterRoleBinding.
   useExistingClusterRoleName: dfaas-prometheus-server
   # Past runs have to outlive the pod: with an emptyDir and 1d of retention,
   # a restart or a night was enough to make a finished test unreviewable in
