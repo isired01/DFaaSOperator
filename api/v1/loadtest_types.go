@@ -121,35 +121,34 @@ const (
 	LTReasonDispatching  = "Dispatching"
 )
 
-// PerNodeLoad is the FE-supplied per-k6-machine load. The reconciler creates
-// one remote TestRun per entry against the matching k6-load-generator node's
-// k3s cluster.
+// PerNodeLoad is the load of one k6-load-generator. The reconciler creates one
+// remote TestRun per entry on that generator's k3s cluster.
 type PerNodeLoad struct {
 	// NodeID must match a k6-load-generator node in the target Environment.
-	// Same DNS-1123 constraint as EnvironmentNode.NodeID (embedded in remote
-	// TestRun / ConfigMap names).
+	// Same DNS-1123 constraint as EnvironmentNode.NodeID: it is embedded in
+	// remote TestRun and ConfigMap names.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MaxLength=63
-	// Pattern (not CEL XValidation): CEL cost estimation on unbounded
-	// node arrays blows the schema budget; the OpenAPI pattern is free.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	NodeID string `json:"nodeID"`
 
-	// k6 virtual-users for this machine.
+	// VUs is the virtual-user count declared for this generator. The operator
+	// copies it into no TestRun field: k6 takes its virtual users from the
+	// script's own options.
 	// +kubebuilder:validation:Minimum=1
 	VUs int `json:"vus"`
 
-	// k6 test duration as a Go duration string, e.g. "30s", "5m", "1h30m".
-	// The pattern is the admission-time guard: a human-readable value such as
-	// "5 minutes" used to pass validation and only fail inside the remote k6
-	// runner, after the whole dispatch had already happened.
+	// Duration is the run length declared for this generator, as a Go duration
+	// string ("30s", "5m", "1h30m"). k6 never reads it: the script's options
+	// decide how long it runs. The UI draws the generator's progress bar
+	// against it.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
 	Duration string `json:"duration"`
 
-	// ScriptConfigMap references a ConfigMap in the same namespace exposing
-	// key "script.js" with the k6 script for this machine. The FE writes one
-	// ConfigMap per LoadTest.
+	// ScriptConfigMap references a ConfigMap in the same namespace whose key
+	// "script.js" holds the k6 script for this generator. The UI writes one
+	// ConfigMap per perNodeLoad entry, named <loadtest>-<nodeID>-script.
 	// +kubebuilder:validation:Required
 	ScriptConfigMap corev1.LocalObjectReference `json:"scriptConfigMap"`
 }
@@ -166,10 +165,9 @@ const (
 	MetricTypeCustomPromQL MetricsExportType = "custom-promql"
 )
 
-// MetricExportEntry describes one metric the exporter should query during
-// the LoadTest's Exporting phase. All four fields participate in the CSV
-// output (Type and Comment become metadata columns; MetricName is the alias
-// the CSV uses as identifier; Query is the PromQL string actually executed).
+// MetricExportEntry describes one metric the exporter queries during the
+// LoadTest's Exporting phase. All four fields reach the metrics CSV, as its
+// query_type, query_name, query_expr and query_comment columns.
 //
 // Naming rule: when Type=raw and MetricName is empty, the operator falls
 // back to MetricName = Query (the bare metric name doubles as alias).
@@ -178,13 +176,13 @@ const (
 //
 // +kubebuilder:validation:XValidation:rule="self.type != 'custom-promql' || (has(self.metricName) && size(self.metricName) > 0)",message="metricName is required when type is custom-promql"
 type MetricExportEntry struct {
-	// Type is documentary — it classifies the query for the UI and the
-	// CSV "type" column. The backend executes Query verbatim regardless.
+	// Type is documentary: it classifies the query for the UI and fills the
+	// CSV query_type column. The exporter runs Query verbatim either way.
 	// +kubebuilder:validation:Required
 	Type MetricsExportType `json:"type"`
 
-	// MetricName is the alias / identifier surfaced in the CSV "metric"
-	// column. Required when Type=custom-promql. Optional when Type=raw:
+	// MetricName names the query in the CSV query_name column. Required when
+	// Type=custom-promql. Optional when Type=raw:
 	// if empty, the operator falls back to MetricName = Query (so the
 	// bare metric name doubles as alias).
 	// +optional
@@ -198,24 +196,20 @@ type MetricExportEntry struct {
 	// +kubebuilder:validation:MinLength=1
 	Query string `json:"query"`
 
-	// Comment is free-text human description, surfaced into the CSV
-	// "comment" column for post-test analysis.
+	// Comment is free text, copied into the CSV query_comment column.
 	// +optional
 	Comment string `json:"comment,omitempty"`
 }
 
 // MetricsExportSpec drives the exporter Job that runs after k6 finishes.
 type MetricsExportSpec struct {
-	// Metrics is the structured list of entries to export. Replaces the
-	// old plaintext Queries []string; the new shape carries type, alias
-	// and free-text comment alongside the PromQL string. Passed to the
+	// Metrics is the structured list of entries to export. Passed to the
 	// exporter Job as the JSON-encoded env var METRICS_JSON.
 	// +kubebuilder:validation:MinItems=1
 	Metrics []MetricExportEntry `json:"metrics"`
 
-	// Step for QueryRange, as a Go duration string (e.g. "15s", "1m").
-	// Same admission-time guard as PerNodeLoad.Duration: an unparsable step
-	// would otherwise only surface inside the exporter Job.
+	// Step is the query_range resolution, as a Go duration string (e.g. "15s",
+	// "1m").
 	// +kubebuilder:default="15s"
 	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
 	Step string `json:"step,omitempty"`
@@ -271,14 +265,14 @@ type LoadTestSpec struct {
 	// +optional
 	Stop bool `json:"stop,omitempty"`
 
-	// SyncStart, when true, synchronizes traffic start across all generators:
-	// each remote runner's script blocks in setup() polling a GO-signal URL
-	// (injected as the DFAAS_SYNC_URL runner env var), and the reconciler
-	// publishes the signal on the in-cluster SeaweedFS filer only once every
-	// TestRun reports stage "started". Residual skew ≈ the script's poll
-	// interval (~250ms). Requires the k6 VMs to reach the management node on
-	// the filer NodePort (30901). If any runner fails to start within the
-	// sync wait budget the whole test is aborted and marked Failed.
+	// SyncStart, when true, holds every generator at a barrier: each runner's
+	// script polls a GO-signal URL in setup() (injected as DFAAS_SYNC_URL), and
+	// the operator publishes the signal on the SeaweedFS filer once every
+	// TestRun reports k6-operator's stage "started". That stage can be reported
+	// before a runner's setup() reaches the barrier, so runners can still start
+	// seconds apart. Requires the generators to reach the management node on
+	// the filer NodePort (30901). If a runner errors, or not every runner has
+	// started within 5 minutes, the test fails.
 	// +kubebuilder:default=false
 	// +optional
 	SyncStart bool `json:"syncStart,omitempty"`
