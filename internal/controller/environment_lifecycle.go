@@ -253,15 +253,6 @@ func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 	for _, rs := range roles.All() {
 		r.patchAnsibleJobTTL(ctx, env, rs.JobSuffix, jobTTLSuccessSeconds)
 	}
-	// Record what Ansible just installed. Written here rather than at Ready
-	// because the snapshot is about node installation, and monitoring is not:
-	// an Environment whose infra succeeded but whose Helm monitoring then failed
-	// terminally still HAS its machines installed, and would otherwise be left
-	// with no record at all — so a later node removal would have nothing to diff
-	// against and would silently orphan a live machine. Best-effort: a failed
-	// write degrades safely (no snapshot ⇒ full re-provision, no teardown) and
-	// the settled-Environment seed in Reconcile backfills it on the next tick.
-	logStatusErr(ctx, "save provisioning snapshot", am.SaveSnapshot(ctx, env))
 	r.cond(ctx, env, dfaasv1.EnvCondInfrastructureReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonInfraReady,
 		"dfaas-worker and k6 Ansible Jobs completed")
