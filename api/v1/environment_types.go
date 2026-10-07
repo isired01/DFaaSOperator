@@ -13,11 +13,10 @@ package v1
 import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 // EnvironmentPhase tracks the infrastructure lifecycle.
-// +kubebuilder:validation:Enum=Idle;ProvisioningVMs;ProvisioningInfra;ProvisioningMonitoring;Ready;Failed;Unreachable
+// +kubebuilder:validation:Enum=ProvisioningVMs;ProvisioningInfra;ProvisioningMonitoring;Ready;Failed;Unreachable
 type EnvironmentPhase string
 
 const (
-	EnvIdle                   EnvironmentPhase = "Idle"
 	EnvProvisioningVMs        EnvironmentPhase = "ProvisioningVMs"
 	EnvProvisioningInfra      EnvironmentPhase = "ProvisioningInfra"
 	EnvProvisioningMonitoring EnvironmentPhase = "ProvisioningMonitoring"
@@ -175,9 +174,6 @@ type EnvironmentSpec struct {
 	// +listType=map
 	// +listMapKey=nodeID
 	Nodes []EnvironmentNode `json:"nodes"`
-
-	// +optional
-	Topology Topology `json:"topology,omitempty"`
 
 	// REMOVED: CleanupOnDelete. It was documented as driving the finalizer, but
 	// nothing ever read it: the finalizer in environment_lifecycle.go always

@@ -45,7 +45,7 @@ func TestEnvironmentPhaseDispatchable(t *testing.T) {
 	// dropped because no reconcile path ever produced it. The gateway mirrors
 	// this set, so it must not be looser either.
 	dispatchable := map[EnvironmentPhase]bool{
-		"": false, EnvIdle: false, EnvProvisioningVMs: false, EnvProvisioningInfra: false,
+		"": false, EnvProvisioningVMs: false, EnvProvisioningInfra: false,
 		EnvProvisioningMonitoring: false, EnvReady: true, EnvFailed: false, EnvUnreachable: false,
 	}
 	classify(t, "Dispatchable", dispatchable, phasesOf[EnvironmentPhase](t, "EnvironmentPhase"),

@@ -152,7 +152,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	switch env.Status.Phase {
-	case "", dfaasv1.EnvIdle:
+	case "":
 		return r.phase(ctx, &env, dfaasv1.EnvProvisioningVMs)
 	case dfaasv1.EnvProvisioningVMs:
 		return r.reconcileProvisioningVMs(ctx, &env)
@@ -303,7 +303,7 @@ func stampEnvAggregate(env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase)
 		status = metav1.ConditionFalse
 		reason = dfaasv1.EnvReasonSSHUnreachable
 		message = "nodes unreachable via SSH; retrying automatically — see the NodesReachable / VMsReady condition"
-	case "", dfaasv1.EnvIdle:
+	case "":
 		status = metav1.ConditionUnknown
 		reason = dfaasv1.EnvReasonInitializing
 		message = "awaiting first reconcile"

@@ -224,32 +224,6 @@ spec:
                 required:
                 - name
                 type: object
-              topology:
-                description: |-
-                  Topology declares inter-node network shaping (latency injection).
-
-                  NOT IMPLEMENTED: the field is schema-only. Nothing in the operator or in the
-                  Ansible playbooks reads it, so a declared link's latencyMs is never applied
-                  to any node. It is kept so existing manifests still validate; treat it as
-                  documentation of intent, not as a working feature.
-                properties:
-                  links:
-                    items:
-                      description: Link is one symmetric latency link in the topology.
-                      properties:
-                        latencyMs:
-                          type: integer
-                        nodeA:
-                          type: string
-                        nodeB:
-                          type: string
-                      required:
-                      - latencyMs
-                      - nodeA
-                      - nodeB
-                      type: object
-                    type: array
-                type: object
             required:
             - nodes
             type: object
@@ -370,7 +344,6 @@ spec:
               phase:
                 description: EnvironmentPhase tracks the infrastructure lifecycle.
                 enum:
-                - Idle
                 - ProvisioningVMs
                 - ProvisioningInfra
                 - ProvisioningMonitoring
