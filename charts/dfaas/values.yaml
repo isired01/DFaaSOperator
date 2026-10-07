@@ -1,3 +1,11 @@
+# Chart values for the DFaaS operator and its UI. The README ("Configuration")
+# describes the ones most installs change.
+#
+# Every image tag defaults to the chart's appVersion. A packaged release has the
+# release number there; a checkout has the placeholder 0.0.0, so set
+# operator.image.tag, operator.exporterImage.tag and ui.image.tag when
+# installing from a checkout.
+
 # Global
 fullnameOverride: ""
 
@@ -29,7 +37,7 @@ operator:
                                   #   upload) for a generator with no management address detected at
                                   #   provisioning (status.k6Nodes[].managementAddress wins when set);
                                   #   default when unset: http://<manager hostIP>:30901. Must be
-                                  #   reachable from those generators — on a lab spread over several
+                                  #   reachable from those generators; on a lab spread over several
                                   #   sites, an address of the management node that every generator
                                   #   can route to (for example a VPN address), not a local bridge
                                   #   address.
@@ -70,17 +78,17 @@ ui:
     host: dfaas.local
     annotations: {}
     tls: []                       # list of {secretName, hosts: []}
-  env:                            # free-form key→value, each rendered as a container env var
-                                  # PORT is derived from ui.service.port — do not set it here
+  env:                            # free-form key/value pairs, each rendered as a container env var
+                                  # PORT is derived from ui.service.port, do not set it here
     CORS_ORIGINS: ""              # csv; empty = no CORS headers, not a same-origin check (see the UI README)
-    # SEAWEEDFS_ENDPOINT: ""      # override gateway→SeaweedFS dial endpoint; default: auto
-                                  #   (in-cluster → seaweedfs-all-in-one.monitoring.svc…:8333, dev → <nodeIP>:30900).
+    # SEAWEEDFS_ENDPOINT: ""      # override the endpoint the gateway dials for SeaweedFS; default: auto
+                                  #   (in the cluster: seaweedfs-all-in-one.monitoring.svc.cluster.local:8333; outside it: <nodeIP>:30900).
                                   #   Applies to seaweedfs-default only; an external S3 config keeps its own endpoint.
     # SEAWEEDFS_PUBLIC_URL: ""    # base of the asset URL baked into the k6 script; default: <nodeIP>:30900.
                                   #   Applies to seaweedfs-default only. A runner the operator gave
                                   #   DFAAS_ASSET_BASE (its generator's detected management address)
                                   #   fetches from that instead, so this is the fallback: it must be
-                                  #   reachable from generators without a detected address — on a lab
+                                  #   reachable from generators without a detected address; on a lab
                                   #   spread over several sites, an address of the management node that
                                   #   every generator can route to (for example a VPN address), not a
                                   #   local bridge address.

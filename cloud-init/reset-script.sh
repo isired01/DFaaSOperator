@@ -6,7 +6,7 @@
 # one. Run it from this directory: it passes --cloud-init dfaas-config.yaml.
 # Edit NODES, IMAGE and the CPU, RAM and disk values for your host.
 # `multipass list` shows the addresses to put in spec.nodes[].ipAddress.
-# See "Target VM baseline" in the README for the SSH and user assumptions the
+# See "Requirements" in the README for the SSH and user assumptions the
 # operator makes about these VMs.
 
 # Example VM names.
