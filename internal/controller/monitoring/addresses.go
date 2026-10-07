@@ -49,12 +49,6 @@ func FilerInClusterBase() string {
 	return fmt.Sprintf("http://%s:%d", SeaweedFSService, FilerPort)
 }
 
-// S3InClusterEndpoint is the S3 gateway endpoint from inside the Management
-// cluster.
-func S3InClusterEndpoint() string {
-	return fmt.Sprintf("http://%s:%d", SeaweedFSService, S3Port)
-}
-
 // FilerPublicBase is the filer base URL from outside the Management cluster,
 // for a client that reaches the Management node at host (an IP or a name, an
 // IPv6 literal unbracketed): the filer NodePort on that address. The k6

@@ -266,10 +266,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
 
-	done, failed, err := r.ensureMonitoring(ctx, env)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	done, failed := r.ensureMonitoring(ctx, env)
 	if failed {
 		// Monitoring (incl. the SeaweedFS S3 sink) is required: a terminally
 		// broken monitoring stack fails the Environment rather than degrading it,
@@ -299,7 +296,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Cont
 // caller transitions the Environment to EnvFailed. Resets the counter on
 // every successful round-trip.
 func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
-	env *dfaasv1.Environment) (done bool, failed bool, err error) {
+	env *dfaasv1.Environment) (done bool, failed bool) {
 	logger := log.FromContext(ctx)
 
 	mm := r.monitoringStack()
@@ -314,7 +311,7 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 				metav1.ConditionFalse, dfaasv1.EnvReasonHelmFailed,
 				fmt.Sprintf("monitoring Helm install failed %d consecutive times: %s",
 					outcome.Count, condMessage(derr)))
-			return false, true, nil
+			return false, true
 		}
 		// P7 + P14: first ever observation is Unknown; subsequent retries
 		// stay False/HelmInstalling. The sanitized message keeps
@@ -329,7 +326,7 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 		r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 			condStatus, dfaasv1.EnvReasonHelmInstalling,
 			"monitoring Helm install in progress / retrying: "+condMessage(derr))
-		return false, false, nil
+		return false, false
 	}
 	if rerr := r.budget(monitoringAttemptsAnnotation, monitoringRetryBudget).Clear(ctx, env); rerr != nil {
 		logger.Error(rerr, "resetMonitoringAttempts failed; non-fatal")
@@ -343,20 +340,20 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 		r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 			metav1.ConditionUnknown, dfaasv1.EnvReasonCheckFailed,
 			"monitoring readiness could not be evaluated: "+condMessage(checkErr))
-		return false, false, nil
+		return false, false
 	}
 	if !ready {
 		r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 			metav1.ConditionFalse, dfaasv1.EnvReasonWaitingPods,
 			"monitoring pods not Ready yet")
-		return false, false, nil
+		return false, false
 	}
 
 	r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonPodsRunning,
 		"monitoring stack up")
 	logStatusErr(ctx, "reconcile Prometheus targets", mm.ReconcileTargets(ctx, env))
-	return true, false, nil
+	return true, false
 }
 
 // syncNodeStatus surfaces k6/dfaas node info into status, for fast lookup by

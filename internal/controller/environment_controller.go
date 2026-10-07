@@ -76,7 +76,7 @@ func (r *EnvironmentReconciler) monitoringStack() monitoring.Stack {
 	if r.Monitoring != nil {
 		return r.Monitoring
 	}
-	return &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
+	return &monitoring.Manager{Client: r.Client}
 }
 
 // prober is the nil-safe accessor for Prober.

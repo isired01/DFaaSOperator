@@ -360,8 +360,3 @@ func (r *LoadTestReconciler) ensureMirroredS3Secret(ctx context.Context,
 	}
 	return mirror.Name, nil
 }
-
-// sanitize is k6dispatch.Sanitize: the remote TestRun names and the
-// management-cluster names derived from a nodeID (k6 log ConfigMaps, summary
-// object keys) must agree on the spelling.
-var sanitize = k6dispatch.Sanitize

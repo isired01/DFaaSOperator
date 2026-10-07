@@ -10,7 +10,6 @@ package monitoring
 import (
 	"context"
 
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	dfaasv1 "dfaas-operator/api/v1"
@@ -38,7 +37,6 @@ var _ Stack = (*Manager)(nil)
 // and the reconciliation of Prometheus targets for an environment.
 type Manager struct {
 	client.Client
-	Scheme *runtime.Scheme
 }
 
 // PrometheusTarget is the file-based service discovery unit for Prometheus.
