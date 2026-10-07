@@ -63,15 +63,16 @@ var liveDashboardJSON []byte
 
 // Upstream 4.45.0 with one template patched: its shared/security-configmap.yaml
 // calls `fromToml`, which the Helm engine defines only from 3.16 on, while this
-// operator pins the SDK at 3.14.4 (see the go.mod replace). An undefined function
+// operator pins the SDK at 3.14.4 (go.mod). An undefined function
 // is a PARSE error, so the whole chart failed to render — "install release
 // seaweedfs: parse error at (…/security-configmap.yaml:21)" — even though that
 // block never renders under our values, because seaweedfs.securityConfigEnabled
 // is false. Every published chart from 4.20 up carries the call, and the last one
 // without it (3.59) predates the allInOne layout our values are written against,
 // so downgrading was not an option. The patch replaces the call with `dict`, which
-// is what `fromToml ""` yields on a fresh install anyway. Drop the patch and go
-// back to the pristine archive once the Helm SDK is raised past 3.16.
+// is what `fromToml ""` yields on a fresh install anyway. Once the Helm SDK is
+// past 3.16, drop the patch and embed upstream 4.45.0 again:
+// helm pull seaweedfs --repo https://seaweedfs.github.io/seaweedfs/helm --version 4.45.0
 //
 //go:embed charts/seaweedfs-4.45.0-dfaas1.tgz
 var seaweedfsChartTGZ []byte
