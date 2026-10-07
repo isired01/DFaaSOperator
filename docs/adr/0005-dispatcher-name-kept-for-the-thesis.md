@@ -1,0 +1,3 @@
+# The remote-fleet seam keeps the name `Dispatcher`
+
+When the seam between the LoadTest reconciler and the generators was introduced (an interface, a per-node handle, a `Live` and a fake adapter), the natural new name would have been `Fleet`. The name `Dispatcher` was kept because it was already in use, in the original code and in written descriptions of the operator, and renaming it would have made those descriptions wrong for no behavioural gain. The interface still resolves a node from its kubeconfig Secret and the live adapter still applies TestRuns, so the name remains accurate. The per-node handle is named `Node`.
