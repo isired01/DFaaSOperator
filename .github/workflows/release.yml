@@ -65,18 +65,6 @@ jobs:
             ghcr.io/isired01/dfaas-exporter:${{ env.VERSION_NO_V }}
             ghcr.io/isired01/dfaas-exporter:latest
 
-      - name: Build & push imgproc image
-        uses: docker/build-push-action@v7
-        with:
-          context: imageFunction
-          file: imageFunction/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/isired01/dfaas-imgproc:${{ env.VERSION }}
-            ghcr.io/isired01/dfaas-imgproc:${{ env.VERSION_NO_V }}
-            ghcr.io/isired01/dfaas-imgproc:latest
-
       # The UI repo builds on its own tag push, in parallel with this job. Its
       # multi-arch build is the slow one, so give it a real window rather than
       # the minute it used to get.
@@ -122,3 +110,17 @@ jobs:
             dist/dfaas.dfaas.io_environments.yaml
             dist/dfaas.dfaas.io_loadtests.yaml
           generate_release_notes: true
+
+      # Last on purpose: a 403 on the imgproc package (see docs/releasing.md,
+      # GHCR packages) then cannot leave the chart or the GitHub Release unpublished.
+      - name: Build & push imgproc image
+        uses: docker/build-push-action@v7
+        with:
+          context: imageFunction
+          file: imageFunction/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/isired01/dfaas-imgproc:${{ env.VERSION }}
+            ghcr.io/isired01/dfaas-imgproc:${{ env.VERSION_NO_V }}
+            ghcr.io/isired01/dfaas-imgproc:latest
