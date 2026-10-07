@@ -109,18 +109,3 @@ jobs:
             dist/dfaas-${{ env.VERSION_NO_V }}.tgz
             dist/dfaas.dfaas.io_environments.yaml
             dist/dfaas.dfaas.io_loadtests.yaml
-          generate_release_notes: true
-
-      # Last on purpose: a 403 on the imgproc package (see docs/releasing.md,
-      # GHCR packages) then cannot leave the chart or the GitHub Release unpublished.
-      - name: Build & push imgproc image
-        uses: docker/build-push-action@v7
-        with:
-          context: imageFunction
-          file: imageFunction/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/isired01/dfaas-imgproc:${{ env.VERSION }}
-            ghcr.io/isired01/dfaas-imgproc:${{ env.VERSION_NO_V }}
-            ghcr.io/isired01/dfaas-imgproc:latest

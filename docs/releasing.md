@@ -7,7 +7,7 @@ Both repositories are released together, under the same tag, even when one of th
 | Repository | Trigger | Published |
 | --- | --- | --- |
 | DFaaS_UI | a tag matching `v*` | `ghcr.io/isired01/dfaas-control-plane:vX.Y.Z`, `:X.Y.Z` and `:latest`, multi-arch (`linux/amd64`, `linux/arm64`). |
-| DFaaSOperator | a tag matching `v*` | The images `dfaas-operator`, `dfaas-exporter` and `dfaas-imgproc` under `vX.Y.Z`, `X.Y.Z` and `latest`, multi-arch. The Helm chart as `oci://ghcr.io/isired01/charts/dfaas` version `X.Y.Z`. A GitHub Release with the packaged chart (`dfaas-X.Y.Z.tgz`) and the two CRD files. |
+| DFaaSOperator | a tag matching `v*` | The images `dfaas-operator` and `dfaas-exporter` under `vX.Y.Z`, `X.Y.Z` and `latest`, multi-arch. The Helm chart as `oci://ghcr.io/isired01/charts/dfaas` version `X.Y.Z`. A GitHub Release with the packaged chart (`dfaas-X.Y.Z.tgz`) and the two CRD files. |
 
 The images are published under both `vX.Y.Z` and `X.Y.Z` because the chart defaults every image tag to its `appVersion`, which `helm package` sets without the leading `v`.
 
@@ -42,14 +42,12 @@ Assume the version is `X.Y.Z`. Do each step in both repositories unless it says 
    6. copies the two CRD files into `dist/`;
    7. packages the chart with `--version X.Y.Z --app-version X.Y.Z`;
    8. pushes the chart to `oci://ghcr.io/isired01/charts`;
-   9. creates the GitHub Release with `dist/dfaas-X.Y.Z.tgz` and the two CRD files, with generated release notes;
-   10. builds and pushes the imgproc image. It comes last on purpose: a failure on that package (see [GHCR packages](#ghcr-packages)) then cannot leave the chart or the Release unpublished.
+   9. creates the GitHub Release with `dist/dfaas-X.Y.Z.tgz` and the two CRD files, with generated release notes.
 5. **Verify** from a machine that is not logged in to `ghcr.io`:
 
    ```bash
    docker manifest inspect ghcr.io/isired01/dfaas-operator:X.Y.Z > /dev/null
    docker manifest inspect ghcr.io/isired01/dfaas-exporter:X.Y.Z > /dev/null
-   docker manifest inspect ghcr.io/isired01/dfaas-imgproc:X.Y.Z > /dev/null
    docker manifest inspect ghcr.io/isired01/dfaas-control-plane:X.Y.Z > /dev/null
    helm pull oci://ghcr.io/isired01/charts/dfaas --version X.Y.Z --untar --untardir /tmp/dfaas-X.Y.Z
    diff -r /tmp/dfaas-X.Y.Z/dfaas/crds charts/dfaas/crds
@@ -83,7 +81,7 @@ Everything published sits under the GitHub user `isired01`. The owner is written
 
 | Path | What |
 | --- | --- |
-| `.github/workflows/release.yml` | The image names `ghcr.io/isired01/dfaas-operator`, `dfaas-exporter`, `dfaas-imgproc`; the wait for `ghcr.io/isired01/dfaas-control-plane`; the chart push to `oci://ghcr.io/isired01/charts`. |
+| `.github/workflows/release.yml` | The image names `ghcr.io/isired01/dfaas-operator` and `dfaas-exporter`; the wait for `ghcr.io/isired01/dfaas-control-plane`; the chart push to `oci://ghcr.io/isired01/charts`. |
 | `.github/workflows/test.yml` | The `publish-exporter` job's tag `ghcr.io/isired01/dfaas-exporter:latest`. |
 | `charts/dfaas/values.yaml` | The default image repositories of the operator, the exporter and the UI. |
 | `charts/dfaas/Chart.yaml` | `home`, `sources` and `maintainers`. |
@@ -105,10 +103,11 @@ The embedded playbooks and `exporter_job.go` are compiled into the operator imag
 
 ### Outside the repositories
 
-- **GHCR packages** and their ownership: `dfaas-operator`, `dfaas-exporter`, `dfaas-imgproc`, `dfaas-control-plane`, `charts/dfaas`, `dfaas-agent` and `dfaas-agent-chart`. A package belongs to an owner namespace, so a new owner publishes new ones. The new owner has to pull what exists and push it again for the two that no workflow builds:
+- **GHCR packages** and their ownership: `dfaas-operator`, `dfaas-exporter`, `dfaas-imgproc`, `dfaas-control-plane`, `charts/dfaas`, `dfaas-agent` and `dfaas-agent-chart`. A package belongs to an owner namespace, so a new owner publishes new ones. The new owner has to pull what exists and push it again for the three that no workflow builds:
+  - the imgproc image: `docker pull ghcr.io/isired01/dfaas-imgproc:<tag>`, retag, push, or rebuild it from `imageFunction/` ([imageFunction/README.md](../imageFunction/README.md));
   - the agent image: `docker pull ghcr.io/isired01/dfaas-agent:dev`, retag, push, or rebuild it from upstream ([dfaas-agent.md](dfaas-agent.md));
   - the agent chart, whose source is in no repository: `helm pull oci://ghcr.io/isired01/dfaas-agent-chart --version 0.1.3`, then `helm push` the archive to the new location. Do this while the old packages still exist.
-- **Repository settings**: Actions must be enabled, and the workflows request their own `permissions`, so no secret has to be created. The first publish of a package from a workflow needs the package to be linked to the repository, and an existing package must grant the repository write access (package settings, "Manage Actions access"). The imgproc image was pushed by hand before it was part of `release.yml`, so its package needs that grant.
+- **Repository settings**: Actions must be enabled, and the workflows request their own `permissions`, so no secret has to be created. The first publish of a package from a workflow needs the package to be linked to the repository, and an existing package must grant the repository write access (package settings, "Manage Actions access").
 - **Maintainer metadata**: `Chart.yaml` `maintainers`, the copyright holder (`Copyright 2026 Isaia Del Rosso`) if it changes: it is in `LICENSE`, in `hack/boilerplate.go.txt` (which stamps the generated code) and in the header of the Go files that carry one. The three values files derived from upstream keep their own notice.
 
 ## GHCR packages

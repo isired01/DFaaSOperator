@@ -6,8 +6,9 @@ JPEG: a real but cheap image-processing workload to deploy on the DFaaS nodes
 (`dfaas-worker` role) of an Environment.
 
 **Image:** `ghcr.io/isired01/dfaas-imgproc:<version>`, multi-arch
-(amd64/arm64). `release.yml` publishes it on every `v*` tag, together with the
-operator and exporter images, under `vX.Y.Z`, `X.Y.Z` and `latest`.
+(amd64/arm64). It is not published by `release.yml`: the function almost never
+changes, so it is built and pushed by hand (see [Build and push](#build-and-push))
+when this directory changes. The published tag is the one pushed last.
 
 Design:
 

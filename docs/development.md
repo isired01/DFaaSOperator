@@ -153,7 +153,7 @@ Wait for CI on a pull request before merging.
 
 ## Building and publishing images by hand
 
-The operator image: `make docker-build IMG=<name:tag>` (host platform). The published images are multi-arch and are built by `release.yml` ([releasing.md](releasing.md)). To build one by hand:
+The operator image: `make docker-build IMG=<name:tag>` (host platform). The published operator and exporter images are multi-arch and are built by `release.yml` ([releasing.md](releasing.md)); the imgproc image is only ever built by hand. To build one by hand:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
