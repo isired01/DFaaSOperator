@@ -5,13 +5,10 @@
 *.so
 *.dylib
 bin/*
-Dockerfile.cross
 
-# Compiled companion binaries — each ships as its own image, built from source by
-# its own Dockerfile; the tracked copies are dead weight.
+# Companion binaries: go build inside these module directories writes them here.
 /dataExporter/dfaas-exporter
 /imageFunction/dfaas-imgproc
-.DS_Store
 /out
 .claude
 CLAUDE.md
@@ -26,9 +23,6 @@ log.txt
 # Go workspace file
 go.work
 
-# Kubernetes Generated files - skip generated files, except for vendored files
-!vendor/**/zz_generated.*
-
 # editor and IDE paraphernalia
 .idea
 .vscode
@@ -36,35 +30,25 @@ go.work
 *.swo
 *~
 
-# --- Ambiente Go ---
-# Dipendenze (se usi 'go mod vendor', altrimenti inutile ma consigliato)
+# Go vendor directory
 vendor/
 
-# --- Strumenti di Sviluppo Kubebuilder ---
-# Questa è fondamentale: Kubebuilder scarica binari e asset temporanei qui
-testbin/
-/cover.out
-
-# --- Mac OS ---
-# File di sistema che creano conflitti inutili
+# macOS
 .DS_Store
 .AppleDouble
 .LSOverride
 
-# --- Variabili d'ambiente (SENSITIVE DATA) ---
-# Se mai userai file .env per chiavi API o password, NON devono finire su Git
+# Local env files; may hold credentials
 .env
 *.env
 .env.*
 
-# --- Log e temporanei ---
+# Logs and build output
 *.log
 /dist/
 
-# --- Junk & Secrets ---
+# Junk & Secrets
 id_rsa
 id_rsa.pub
 *.pem
 *.key
-primoEsperimento.yaml
-.DS_Store
