@@ -184,7 +184,7 @@ func (r *LoadTestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			lt.Status.Phase == dfaasv1.LoadTestRunning
 		if inAbortWindow {
 			return r.abortLoadTest(ctx, &lt, dfaasv1.LTReasonUserAborted,
-				"Aborted: spec.stop was set to true.")
+				"The test was aborted: spec.stop was set to true (UI Abort button or kubectl).")
 		}
 	}
 

@@ -124,9 +124,9 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// here. ReconcileTargets writes nothing when the file is current.
 		logStatusErr(ctx, "reconcile Prometheus targets", r.monitoringStack().ReconcileTargets(ctx, &env))
 
-		// No longer idle while Ready: run a periodic SSH liveness probe so a
-		// node that dies after provisioning is noticed instead of only
-		// surfacing when a test fails against it.
+		// While Ready, run a periodic SSH liveness probe so a node that dies
+		// after provisioning is noticed instead of only surfacing when a test
+		// fails against it.
 		return r.reconcileReadyHealth(ctx, &env)
 	}
 

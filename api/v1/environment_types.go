@@ -176,11 +176,6 @@ type EnvironmentSpec struct {
 	// +listMapKey=nodeID
 	Nodes []EnvironmentNode `json:"nodes"`
 
-	// REMOVED: CleanupOnDelete. It was documented as driving the finalizer, but
-	// nothing ever read it: the finalizer in environment_lifecycle.go always
-	// runs CleanupTargets and then drops itself, on every deletion. Keeping the
-	// field made the UI promise a VM teardown that never happened.
-
 	// S3ConfigRef points at a cluster-scoped S3 server configuration
 	// registered in namespace "dfaas-s3" (Secret with label
 	// "dfaas.io/s3-config=true"). When set, LoadTests targeting this

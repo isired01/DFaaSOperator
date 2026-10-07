@@ -205,13 +205,13 @@ func buildInventory(env *dfaasv1.Environment, spec roles.Spec,
 			// Kademlia discovery meant to complete the mesh afterwards never
 			// returns a peer: the agent announces only its pod address
 			// (10.42.0.0/24 — the SAME subnet on every single-node k3s), so a
-			// peer learned through the DHT would be undialable anyway. Measured
-			// 2026-09-09 on a five-node Environment, on the agent build of
-			// 2026-04-30: the seed advertised no /ipfs/kad/1.0.0 protocol at
-			// all, every node's routing table was empty, and not one agent had
-			// ever logged "Found a new peer" — with only the seed's address in
-			// the list the result was a star (seed 4 conns, everyone else 1),
-			// decaying to 0 peers on each node whose single link dropped.
+			// peer learned through the DHT would be undialable anyway. On a
+			// five-node Environment the seed advertised no /ipfs/kad/1.0.0
+			// protocol at all, every node's routing table was empty, and no
+			// agent ever logged "Found a new peer". With only the seed's
+			// address in the list the result was a star (seed 4 conns,
+			// everyone else 1), decaying to 0 peers on each node whose single
+			// link dropped.
 			//
 			// So list nodes 0..i-1 for node i: every pair is dialed exactly
 			// once (a full mesh), and no node ever waits on a node that is
