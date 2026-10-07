@@ -36,7 +36,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	dfaasv1 "dfaas-operator/api/v1"
 	"dfaas-operator/internal/controller"
@@ -76,7 +75,7 @@ func main() {
 	flag.BoolVar(&secureMetrics, "metrics-secure", false,
 		"If set the metrics endpoint is served securely")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
-		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+		"If set, HTTP/2 will be enabled for the metrics server")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -100,10 +99,6 @@ func main() {
 	if !enableHTTP2 {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
-
-	webhookServer := webhook.NewServer(webhook.Options{
-		TLSOpts: tlsOpts,
-	})
 
 	// Bootstrap the dfaas-s3 namespace before the manager starts. Uses a
 	// direct client (cache not yet running) so the very first Environment
@@ -139,7 +134,6 @@ func main() {
 			SecureServing: secureMetrics,
 			TLSOpts:       tlsOpts,
 		},
-		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "42a75d59.dfaas.io",
