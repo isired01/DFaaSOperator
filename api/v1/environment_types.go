@@ -37,18 +37,11 @@ const (
 // up, monitoring down) once qualified too; it was dropped because no reconcile
 // path ever produced it and a test without metrics is worthless to the user.
 // The gateway mirrors this set and must not be looser.
-//
-// It lives here because the comparison was re-typed at four sites inside one
-// reconcile function -- three of them negated -- plus once more in the
-// gateway. Adding EnvUnreachable to the set (plausible: Unreachable is
-// explicitly non-terminal and auto-recovering) meant finding all five by eye,
-// and missing one left the create gate rejecting while the Occupancy gate
-// admitted, with no compile error and no test failure.
 func (p EnvironmentPhase) Dispatchable() bool {
 	return p == EnvReady
 }
 
-// Condition Types stamped on Environment.status.conditions (P15).
+// Condition Types stamped on Environment.status.conditions.
 const (
 	EnvCondReady               = "Ready"
 	EnvCondVMsReady            = "VMsReady"
@@ -61,7 +54,7 @@ const (
 	EnvCondNodesReachable = "NodesReachable"
 )
 
-// Condition Reasons stamped on Environment.status.conditions (P15).
+// Condition Reasons stamped on Environment.status.conditions.
 const (
 	EnvReasonNoWorkers          = "NoWorkers"
 	EnvReasonNoK6Nodes          = "NoK6Nodes"

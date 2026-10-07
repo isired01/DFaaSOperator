@@ -28,12 +28,7 @@ const (
 	LoadTestAborted   LoadTestPhase = "Aborted"
 )
 
-// The two predicates the LoadTest reconciler branches on. They live here, next
-// to the constants they read, because both were re-derived inside one 170-line
-// Reconcile: "terminal" at two sites (one of them an approximation) and the
-// pre-execution window at five. Adding a phase to either set meant finding
-// every raw comparison, with no compile error and no test failure if one was
-// missed.
+// The two predicates the LoadTest reconciler branches on.
 
 // Terminal reports whether the LoadTest has finished for good. A terminal
 // LoadTest is immutable: spec.suspended and spec.stop are no longer read.
@@ -56,7 +51,7 @@ func (p LoadTestPhase) PreExecution() bool {
 	return p == "" || p == LoadTestPending
 }
 
-// Condition Types stamped on LoadTest.status.conditions (P15).
+// Condition Types stamped on LoadTest.status.conditions.
 const (
 	LTCondReady             = "Ready"
 	LTCondEnvironmentLinked = "EnvironmentLinked"
@@ -71,7 +66,7 @@ const (
 	LTCondSyncReady = "SyncReady"
 )
 
-// Condition Reasons stamped on LoadTest.status.conditions (P15).
+// Condition Reasons stamped on LoadTest.status.conditions.
 const (
 	LTReasonScheduledArmed         = "ScheduledArmed"
 	LTReasonScheduledFired         = "ScheduledFired"
