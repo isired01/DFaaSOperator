@@ -60,7 +60,7 @@ Avoid: host IP (`HOST_IP` is the node the operator pod runs on), public URL (the
 ## Remote execution
 
 **Dispatcher**
-The seam between the LoadTest reconciler and the generators' k3s clusters. It resolves a node by `nodeID`; everything about how the node is reached (kubeconfig Secret, remote namespace, TestRun name) lives behind it. Two adapters: `Live` in production and `fake.Fleet` in tests ([ADR-0005](adr/0005-dispatcher-name-kept-for-the-thesis.md), [ADR-0006](adr/0006-dispatcher-seam-at-reach-node-n.md)).
+The seam between the LoadTest reconciler and the generators' k3s clusters. It resolves a node by `nodeID`; everything about how the node is reached (kubeconfig Secret, remote namespace, TestRun name) lives behind it. Two adapters: `Live` in production and `fake.Fleet` in tests ([ADR-0005](adr/0005-dispatcher-name-kept.md), [ADR-0006](adr/0006-dispatcher-seam-at-reach-node-n.md)).
 Avoid: client, k6 client, remote API.
 
 **Node handle**

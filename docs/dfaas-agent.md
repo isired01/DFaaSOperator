@@ -15,7 +15,7 @@ The playbook installs `ghcr.io/isired01/dfaas-agent:dev` with `pullPolicy: Alway
 - **`fix2` and `pre-random`** are an earlier build of 2026-04-30.
 - No workflow in either repository builds or publishes the image, and no other tag has a recorded source.
 
-Because `dev` is mutable and pulled on every start, two provisioning runs can run different agents if the tag is moved. Pinning it to a version tag or a digest is part of the reproducibility issue in the issue tracker ([known-limitations.md](known-limitations.md#provisioning-needs-internet-access-and-installs-unpinned-software)).
+Because `dev` is mutable and pulled on every start, two provisioning runs can run different agents if the tag is moved. Pinning it to a version tag or a digest is tracked in [#37](https://github.com/isired01/DFaaSOperator/issues/37) ([known-limitations.md](known-limitations.md#provisioning-needs-internet-access-and-installs-unpinned-software)).
 
 ### Rebuilding the image from upstream
 
@@ -64,6 +64,6 @@ HAProxy's NodePorts are pinned in `haproxy-values.yaml` for a related reason: an
 
 ## The mesh and the unshipped fix
 
-The agents discover each other only through the bootstrap list that the operator writes: DFaaS node *i* lists nodes `0..i-1` of `spec.nodes`, so every pair is dialled exactly once, and `AGENT_BOOTSTRAP_FORCE` makes a non-seed agent wait at start until every listed peer answers. The agent dials the list once, in `Initialize` (`dfaasagent/agent/discovery/kademlia/kademlia.go` upstream), and the Kademlia discovery that was meant to complete the mesh returns no usable peer because the agent announces only its pod address. So a link that drops is never retried ([known-limitations.md](known-limitations.md#the-agent-mesh-is-exactly-the-bootstrap-list)).
+The agents discover each other only through the bootstrap list that the operator writes: DFaaS node *i* lists the DFaaS nodes `0..i-1` (counting the DFaaS nodes in `spec.nodes` order), so every pair is dialled exactly once, and `AGENT_BOOTSTRAP_FORCE` makes a non-seed agent wait at start until every listed peer answers. The agent dials the list once, in `Initialize` (`dfaasagent/agent/discovery/kademlia/kademlia.go` upstream), and the Kademlia discovery that was meant to complete the mesh returns no usable peer because the agent announces only its pod address. So a link that drops is never retried ([known-limitations.md](known-limitations.md#the-agent-mesh-is-exactly-the-bootstrap-list)).
 
-A patch that makes the agent keep the bootstrap peers and re-dial the ones that are not connected on every pass of `RunDiscovery` exists. It was written against the 2026-04 copy of upstream and was never built into any published image, so the running agents do not contain it. It is not in any repository; its description and the proposed change are in the issue tracker. A change like it belongs upstream, or in a fork whose image you build and reference as above.
+A patch that makes the agent keep the bootstrap peers and re-dial the ones that are not connected on every pass of `RunDiscovery` exists. It was written against the 2026-04 copy of upstream and was never built into any published image, so the running agents do not contain it. It is not in any repository; its description and the proposed change are in [#34](https://github.com/isired01/DFaaSOperator/issues/34). A change like it belongs upstream, or in a fork whose image you build and reference as above.

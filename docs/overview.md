@@ -78,7 +78,7 @@ The bucket is `<environment name>-<first 6 characters of the Environment UID>` (
 
 Browse the default sink with the SeaweedFS filer at `http://<management-node-ip>:30901/buckets/<bucket>/` (no authentication). A completed test's page in the UI links to the two directories. The management Prometheus keeps 7 days or 16 GB, so after that a run survives only in its CSVs. With no usable S3 config at all, the exporter prints the CSVs on its stdout between `----- BEGIN CSV -----` and `----- END CSV -----` markers (`kubectl logs` on the exporter Job's pod).
 
-Two reading rules matter. Counts and rates can be summed over `node_id`, but percentiles in the k6 summary are per generator and cannot be combined. And the summary CSV is empty of k6 numbers when the script has no `handleSummary`. Both are in [known-limitations.md](known-limitations.md).
+Counts and rates can be summed over `node_id`, but percentiles in the k6 summary are per generator and cannot be combined. And the summary CSV is empty of k6 numbers when the script has no `handleSummary`. Both are in [known-limitations.md](known-limitations.md).
 
 ## A first experiment
 

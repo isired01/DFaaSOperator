@@ -31,7 +31,7 @@ Environment variables: `THUMB_SIZE` (default `128`, longest-side cap) and
 `UPSTREAM_PORT` (default `8082`, must match `upstream_url`). The thumbnail keeps
 the aspect ratio (400x300 becomes 128x96) and is a single-channel JPEG.
 
-**Input limits.** Two limits guard different things. The request body is capped
+**Input limits.** The request body is capped
 at 32 MB (`MaxBytesReader`), which bounds the compressed upload. That is not
 enough on its own: a small PNG can declare enormous dimensions, and
 `image.Decode` allocates a pixel buffer sized from the header before it reads

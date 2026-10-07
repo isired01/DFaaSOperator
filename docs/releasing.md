@@ -15,7 +15,7 @@ The chart in the repository is a template: `Chart.yaml` carries the placeholder 
 
 The operator's `test.yml` also publishes `ghcr.io/isired01/dfaas-exporter:latest` on every push to `main`. `latest` of the exporter therefore means "current main", not "last release".
 
-Nothing in either workflow runs the tests. The release workflows lint the chart (the operator's) and build and push; the tests run in `test.yml` on the pull requests. Tag only a commit whose CI run is green. The only secret the workflows use is the automatic `GITHUB_TOKEN`; the operator's `release.yml` has `contents: write` and `packages: write`, the UI's `packages: write`.
+Nothing in either workflow runs the tests. The release workflows lint the chart (the operator's) and build and push; the tests run in `test.yml`, on pull requests and on pushes to `main`. Tag only a commit whose CI run is green. The only secret the workflows use is the automatic `GITHUB_TOKEN`; the operator's `release.yml` has `contents: write` and `packages: write`, the UI's `packages: write`.
 
 The dfaas-agent image and chart are not released by any workflow ([dfaas-agent.md](dfaas-agent.md)).
 
@@ -24,7 +24,7 @@ The dfaas-agent image and chart are not released by any workflow ([dfaas-agent.m
 Assume the version is `X.Y.Z`. Do each step in both repositories unless it says otherwise.
 
 1. **Settle `main`.** Everything for the release is merged and CI is green in both repositories. If the release changes a CRD, the checklist in [cross-repo-contract.md](cross-repo-contract.md#changing-a-crd-field) is complete and the chart's `crds/` equals `config/crd/bases` (CI checks it).
-2. **Bump the pinned versions in the READMEs**, in a pull request merged before the tag: the `--version` and the `--set ...tag=` values in the operator README's install and upgrade commands, and the version in the UI README's upgrade commands (`v4.0.2` in the CRD URLs and `--version 4.0.2`). The history does this as `docs: point the install and upgrade commands at vX.Y.Z`. A version bump that waits until after the tag leaves a tagged tree whose README names the previous release (the UI repository's v4.0.2 was followed by such a pull request). Nothing checks these pins.
+2. **Bump the pinned versions in the operator README**, in a pull request merged before the tag: the `--version` and the `--set ...tag=` values in its install commands (the Upgrade section takes `<version>`). The history does this as `docs: point the install and upgrade commands at vX.Y.Z`. A version bump that waits until after the tag leaves a tagged tree whose README names the previous release. Nothing checks these pins. The UI README carries no version pin: it only links to the operator README.
 3. **Tag the UI repository first**, on the merge commit of `main`:
 
    ```bash
@@ -37,12 +37,13 @@ Assume the version is `X.Y.Z`. Do each step in both repositories unless it says 
    1. computes the version without the `v`;
    2. lints the chart (a template error stops the release before anything is pushed);
    3. logs in to `ghcr.io` with `GITHUB_TOKEN`;
-   4. builds and pushes the operator, exporter and imgproc images;
+   4. builds and pushes the operator and exporter images;
    5. **waits up to 15 minutes** (60 tries, 15 s apart) for `ghcr.io/isired01/dfaas-control-plane:vX.Y.Z` to exist, and fails if it never does: that is why the UI tag comes first, and a private `dfaas-control-plane` package also ends the job here;
    6. copies the two CRD files into `dist/`;
    7. packages the chart with `--version X.Y.Z --app-version X.Y.Z`;
    8. pushes the chart to `oci://ghcr.io/isired01/charts`;
-   9. creates the GitHub Release with `dist/dfaas-X.Y.Z.tgz` and the two CRD files, with generated release notes.
+   9. creates the GitHub Release with `dist/dfaas-X.Y.Z.tgz` and the two CRD files, with generated release notes;
+   10. builds and pushes the imgproc image. It comes last on purpose: a failure on that package (see [GHCR packages](#ghcr-packages)) then cannot leave the chart or the Release unpublished.
 5. **Verify** from a machine that is not logged in to `ghcr.io`:
 
    ```bash
@@ -60,15 +61,7 @@ If the wait for the UI image times out, re-run the failed job from the Actions p
 
 ## Upgrading
 
-Helm applies the contents of a chart's `crds/` on install only, never on upgrade. Before `helm upgrade` to a chart whose schema changed, apply that chart's CRDs. An operator started against the old CRDs has the new status fields pruned by the API server. The commands are in the README ([Upgrade](../README.md#upgrade)):
-
-```bash
-helm pull oci://ghcr.io/isired01/charts/dfaas --version <version> --untar --untardir /tmp/dfaas-<version>
-kubectl apply -f /tmp/dfaas-<version>/dfaas/crds/
-helm upgrade dfaas oci://ghcr.io/isired01/charts/dfaas --version <version> --namespace dfaas-operator-system
-```
-
-From a checkout of the tag, `kubectl apply -f charts/dfaas/crds/` is the same as the pull. The two CRD files are also attached to the GitHub Release, but a release asset URL returns 404 while the repository is private, so the `helm pull` form is the one that does not depend on repository visibility.
+Helm applies the contents of a chart's `crds/` on install only, never on upgrade. Before `helm upgrade` to a chart whose schema changed, apply that chart's CRDs. An operator started against the old CRDs has the new status fields pruned by the API server. The commands are in the README ([Upgrade](../README.md#upgrade)).
 
 Notes that depend on the release being left:
 
@@ -80,32 +73,7 @@ Notes that depend on the release being left:
 
 ## Uninstalling
 
-Both resources carry finalizers that only the running operator removes. Delete them before removing the operator.
-
-```bash
-# 1. While the operator is still running
-kubectl delete loadtests.dfaas.dfaas.io --all -A
-kubectl delete environments.dfaas.dfaas.io --all -A    # wait until they are gone
-
-# 2. The chart (also removes the dfaas-ui namespace)
-helm uninstall dfaas -n dfaas-operator-system
-kubectl delete namespace dfaas-operator-system         # if created with --create-namespace
-
-# 3. What the operator installed at run time. SeaweedFS holds every exported result: copy what you need first.
-helm uninstall -n monitoring prometheus grafana seaweedfs
-kubectl delete namespace monitoring dfaas-s3
-
-# 4. The CRDs, which Helm never removes
-kubectl delete crd environments.dfaas.dfaas.io loadtests.dfaas.dfaas.io
-```
-
-If the operator is already gone and an object hangs in `Terminating`:
-
-```bash
-kubectl patch <kind> <name> -n <namespace> --type=merge -p '{"metadata":{"finalizers":null}}'
-```
-
-Nothing is removed from the VMs. Run `sudo /usr/local/bin/k3s-uninstall.sh` on each one to wipe it.
+The procedure is in the README ([Uninstall](../README.md#uninstall)): the order matters, because both resources carry finalizers that only the running operator removes, and the monitoring stack, SeaweedFS and the VM software stay behind unless you remove them.
 
 ## Moving the project to another owner
 
@@ -117,7 +85,7 @@ Everything published sits under the GitHub user `isired01`. The owner is written
 | --- | --- |
 | `.github/workflows/release.yml` | The image names `ghcr.io/isired01/dfaas-operator`, `dfaas-exporter`, `dfaas-imgproc`; the wait for `ghcr.io/isired01/dfaas-control-plane`; the chart push to `oci://ghcr.io/isired01/charts`. |
 | `.github/workflows/test.yml` | The `publish-exporter` job's tag `ghcr.io/isired01/dfaas-exporter:latest`. |
-| `charts/dfaas/values.yaml` | The default image repositories of the operator, the exporter and the UI; the `helm pull` example in the comments. |
+| `charts/dfaas/values.yaml` | The default image repositories of the operator, the exporter and the UI. |
 | `charts/dfaas/Chart.yaml` | `home`, `sources` and `maintainers`. |
 | `charts/dfaas/templates/NOTES.txt` | The `helm pull` command it prints. |
 | `internal/controller/exporter_job.go` | `exporterImage()`: the fallback image `ghcr.io/isired01/dfaas-exporter:latest` used when `DFAAS_EXPORTER_IMAGE` is unset (a test comment in `exporter_job_name_test.go` mentions it). |
@@ -132,7 +100,7 @@ The embedded playbooks and `exporter_job.go` are compiled into the operator imag
 | Path | What |
 | --- | --- |
 | `.github/workflows/release.yml` | The image name `ghcr.io/isired01/dfaas-control-plane`. |
-| `README.md`, `docs/` | Links to the operator repository and its `docs/`; the install and CRD URLs. |
+| `README.md`, `docs/` | Links to the operator repository, its README sections and its `docs/`. |
 | `ui/src/components/NodeForm.jsx` | A tooltip that names an example image under `ghcr.io/isired01`. |
 
 ### Outside the repositories
@@ -141,7 +109,7 @@ The embedded playbooks and `exporter_job.go` are compiled into the operator imag
   - the agent image: `docker pull ghcr.io/isired01/dfaas-agent:dev`, retag, push, or rebuild it from upstream ([dfaas-agent.md](dfaas-agent.md));
   - the agent chart, whose source is in no repository: `helm pull oci://ghcr.io/isired01/dfaas-agent-chart --version 0.1.3`, then `helm push` the archive to the new location. Do this while the old packages still exist.
 - **Repository settings**: Actions must be enabled, and the workflows request their own `permissions`, so no secret has to be created. The first publish of a package from a workflow needs the package to be linked to the repository, and an existing package must grant the repository write access (package settings, "Manage Actions access"). The imgproc image was pushed by hand before it was part of `release.yml`, so its package needs that grant.
-- **Maintainer metadata**: `Chart.yaml` `maintainers`, the license header holder (`Copyright 2026 Isaia Del Rosso` in `LICENSE` and in every Go file, and in `hack/boilerplate.go.txt` for generated code) if the copyright holder changes. The three values files derived from upstream keep their own notice.
+- **Maintainer metadata**: `Chart.yaml` `maintainers`, the copyright holder (`Copyright 2026 Isaia Del Rosso`) if it changes: it is in `LICENSE`, in `hack/boilerplate.go.txt` (which stamps the generated code) and in the header of the Go files that carry one. The three values files derived from upstream keep their own notice.
 
 ## GHCR packages
 

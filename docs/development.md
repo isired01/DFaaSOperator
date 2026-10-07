@@ -7,7 +7,7 @@ How to build, test and change the operator. The UI repository has its own develo
 - Go 1.26. All three Go modules of this repository (the root operator module, `dataExporter/` and `imageFunction/`) declare `go 1.26.0`, and the Dockerfiles build with `golang:1.26`.
 - Docker, for `make docker-build`. `kubectl` and `helm` (3.8 or later) for installing and linting the chart.
 - Everything else is installed into `./bin/` by `make`, at pinned versions (see the top of the `Makefile`): `controller-gen` v0.20.1 (it matches the generator annotation of the committed CRDs), `kustomize` v5.3.0, `setup-envtest` release-0.19 and the envtest binaries for Kubernetes 1.29.0. `setup-envtest` release-0.17 reads a retired bucket that answers 401, which makes every envtest spec fail in `BeforeSuite` with `exec: "etcd" not found`; keep release-0.19 or later.
-- Main dependencies: controller-runtime v0.17.3, `k8s.io/*` v0.29.2, Helm SDK v3.14.4. `go.mod` carries `replace` directives for `k8s.io/kubectl` (without it three modules fall back to v0.29.0), `golang.org/x/sync` and `golang.org/x/tools`. Keep them when you run `go get`; why the last two are pinned down is not recorded and is in the issue tracker.
+- Main dependencies: controller-runtime v0.17.3, `k8s.io/*` v0.29.2, Helm SDK v3.14.4. `go.mod` carries `replace` directives for `k8s.io/kubectl` (without it three modules fall back to v0.29.0), `golang.org/x/sync` and `golang.org/x/tools`. Keep them when you run `go get`; why the last two are pinned down is not recorded ([#54](https://github.com/isired01/DFaaSOperator/issues/54)).
 
 The repository has no linter configuration. `make fmt` and `make vet` are the gates.
 
@@ -38,7 +38,7 @@ cd dataExporter && go test ./...
 cd imageFunction && go test ./...
 ```
 
-There is no end-to-end suite. The envtest suite starts a real API server and etcd (no kubelet, so no pods run) and applies the CRDs from `config/crd/bases`; most of the logic is tested without it, through the fakes below.
+There is no end-to-end suite. The reconciler specs are Ginkgo specs that run on envtest: a real API server and etcd (no kubelet, so no pods run) with the CRDs from `config/crd/bases` applied. The k6 fleet and the filer are in-memory fakes (`internal/k6dispatch/fake`, `internal/syncchannel/fake`). The plain `Test*` functions in the same package need no API server.
 
 To run one envtest spec after a first `make test` has installed the assets:
 
@@ -46,7 +46,7 @@ To run one envtest spec after a first `make test` has installed the assets:
 go test ./internal/controller/ -run TestControllers -ginkgo.focus '<text of the It>'
 ```
 
-To run everything that does not need envtest, which works without the assets (the Ginkgo specs would fail in `BeforeSuite`):
+To run only the plain `Test*` functions, which work without the assets (the Ginkgo specs would fail in `BeforeSuite`), skip the suite:
 
 ```bash
 go test -skip TestControllers ./api/... ./internal/...
@@ -54,15 +54,15 @@ go test -skip TestControllers ./api/... ./internal/...
 
 What the tests cover:
 
-- `internal/controller/*_test.go` drives both reconcilers through the fakes: `loadtest_seam_test.go` is the large table-driven file for the LoadTest controller and the dispatcher seam; the Environment files cover provisioning, retries, health, deletion, generation drift and the fan-in.
-- `crd_validation_test.go` applies manifests that the CRD must reject, including the CEL cost budget.
+- The Ginkgo files of `internal/controller` run on envtest: `loadtest_seam_test.go` (about 85 specs, the LoadTest controller through the dispatcher seam), `loadtest_queue_test.go`, `loadtest_cooldown_test.go`, `loadtest_fail_message_test.go`, `environment_health_test.go`, `environment_ssh_retry_test.go`, `environment_deletion_test.go` and `crd_validation_test.go`, which applies manifests that the CRD must reject, including the CEL cost budget.
+- The other `*_test.go` files of that package are plain tests: provisioning generations, the fan-in, node status, kubeconfig pruning, probe throttling, the exporter Job name, the export summary and the cool-down against the federation interval.
 - `api/v1/phases_test.go` reads the phase lists from the `+kubebuilder:validation:Enum` markers and requires a classification for each phase.
 - `api/v1/inventory_test.go` classifies every condition reason (see below).
-- `internal/controller/monitoring/*_test.go` pin the embedded values against the address constants, the federation interval and the dashboard.
+- `internal/controller/federation_interval_test.go` fails when two federation intervals no longer fit in the export cool-down. `internal/controller/monitoring/*_test.go` pin the embedded values against the address constants and the dashboard; `prometheus_values_test.go` pins only that the federation interval is not below the 10 s `scrape_timeout`.
 - `internal/controller/ansible/k6_playbook_test.go` parses the embedded generator playbook and pins its structure. No test runs `ansible-playbook`.
 - `dataExporter/main_test.go` checks the CSVs, the object keys and the bucket-name golden table without Prometheus or S3.
 
-Do not run `go test ./...` or a bare `make` target that you have not read against a cluster you care about: the envtest suite uses its own API server, but `make install`, `make uninstall` and `make run` act on the current kubeconfig context.
+Check the current kubeconfig context before `make install`, `make uninstall` or `make run`: they act on it. `make test` uses only envtest's own API server.
 
 ## Code generation and the CRD copy
 
@@ -76,8 +76,6 @@ cp config/crd/bases/dfaas.dfaas.io_*.yaml charts/dfaas/crds/
 No make target performs the copy, and Helm applies `crds/` on install only. The full checklist, including the mirror in the UI repository and the order for applying CRDs on a cluster, is in [cross-repo-contract.md](cross-repo-contract.md#changing-a-crd-field).
 
 If you change a `+kubebuilder:rbac` marker, `make manifests` rewrites `config/rbac/role.yaml`, and you must copy the changed rules into `charts/dfaas/templates/operator-rbac.yaml` by hand. Nothing checks it.
-
-`kubebuilder create api` still scaffolds, but prints errors about the removed `config/default` and `config/rbac` kustomizations (the repository no longer deploys through kustomize; `config/crd`, `config/rbac/role.yaml` and `config/samples` remain).
 
 ## What the API server rejects
 
@@ -139,7 +137,7 @@ Wait for CI on a pull request before merging.
 
 ## Conventions
 
-- **Commit messages**: `<area>: <what changed>`, in lowercase, for example `loadtest: fail a syncStart test whose generator has no GO URL`. The areas in use are `api`, `ansible`, `ci`, `controller`, `docs`, `exporter`, `k6dispatch`, `loadtest`, `monitoring`, `operator`, `repo`.
+- **Commit messages**: `<area>: <what changed>`, in lowercase, for example `loadtest: stop reading the filer probes once their verdicts are consumed`. The areas in use are `ansible`, `api`, `build`, `chart`, `ci`, `controller`, `docs`, `environment`, `exporter`, `k6dispatch`, `loadtest`, `monitoring`, `operator`, `repo`, `statuswriter` and `test`.
 - **English** in code comments, error strings, log text and docs. Technical terms are not translated.
 - **Roles are kebab-case enums**: `dfaas-worker` and `k6-load-generator`. Never change the casing; the CRD rejects anything else.
 - **In prose, a `dfaas-worker` node is a "DFaaS node"** ([glossary.md](glossary.md)).
@@ -170,4 +168,4 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 ## Changing the monitoring charts
 
-Bumping a chart means replacing the `.tgz` under `internal/controller/monitoring/charts/`, updating the `go:embed` path in `assets.go` (the path carries the version), and rebuilding. For SeaweedFS, while the Helm SDK stays at 3.14.4, the archive in use is the upstream 4.45.0 chart with one template patched: `templates/shared/security-configmap.yaml` calls `fromToml`, which the Helm engine defines only from 3.16 on, so the unpatched chart fails to parse. The call is replaced by `dict`. `assets.go` explains the patch and gives the `helm pull` command for the pristine chart. Upgrading the SDK and dropping the patch is in the issue tracker.
+Bumping a chart means replacing the `.tgz` under `internal/controller/monitoring/charts/`, updating the `go:embed` path in `assets.go` (the path carries the version), and rebuilding. For SeaweedFS, while the Helm SDK stays at 3.14.4, the archive in use is the upstream 4.45.0 chart with one template patched: `templates/shared/security-configmap.yaml` calls `fromToml`, which the Helm engine defines only from 3.16 on, so the unpatched chart fails to parse. The call is replaced by `dict`. `assets.go` explains the patch and gives the `helm pull` command for the pristine chart. Upgrading the SDK and dropping the patch is tracked in [#53](https://github.com/isired01/DFaaSOperator/issues/53).
