@@ -154,20 +154,11 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 }
 
 // reconcileProvisioningVMs probes SSH reachability of every node in spec
-// before advancing. P6 (option b): dial each <ip>:22 with a 2s timeout; if
-// any node fails, stamp VMsReady=False/SSHUnreachable and requeue. If the
-// spec has zero nodes (placeholder envs), keep the historical Skipped
-// behavior so empty envs still advance.
+// before advancing: it dials each <ip>:22 with a 2s timeout and, if any node
+// fails, stamps VMsReady=False/SSHUnreachable and requeues.
 func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-
-	if len(env.Spec.Nodes) == 0 {
-		r.cond(ctx, env, dfaasv1.EnvCondVMsReady,
-			metav1.ConditionTrue, dfaasv1.EnvReasonSkipped,
-			"no nodes declared — placeholder phase")
-		return r.phase(ctx, env, dfaasv1.EnvProvisioningInfra)
-	}
 
 	unreachable := r.prober().Unreachable(ctx, env)
 	if len(unreachable) > 0 {

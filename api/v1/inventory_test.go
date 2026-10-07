@@ -158,7 +158,7 @@ var terminalFailure = map[string]bool{
 	LTReasonS3ConfigMissing: true,
 	LTReasonEnvNotFound:     true,
 
-	EnvReasonSkipped:            false, // == LTReasonExportSkipped
+	LTReasonExportSkipped:       false,
 	EnvReasonNoWorkers:          false,
 	EnvReasonNoK6Nodes:          false,
 	EnvReasonVMsProvisioned:     false,

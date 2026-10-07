@@ -115,13 +115,4 @@ var _ = Describe("Ready-state SSH health check", func() {
 		_, count2 := statuswriter.ParseCounter(afterSecond.Annotations[healthMissesAnnotation])
 		Expect(count2).To(Equal(1))
 	})
-
-	It("skips probing and requeues at the health interval when no nodes are declared", func() {
-		// Build (do not persist) a node-less env: reconcileReadyHealth returns
-		// before any client call in that case.
-		empty := &dfaasv1.Environment{Spec: dfaasv1.EnvironmentSpec{}}
-		res, err := reconciler.reconcileReadyHealth(ctx, empty)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(res.RequeueAfter).To(Equal(healthCheckInterval))
-	})
 })

@@ -63,7 +63,6 @@ const (
 
 // Condition Reasons stamped on Environment.status.conditions (P15).
 const (
-	EnvReasonSkipped            = "Skipped"
 	EnvReasonNoWorkers          = "NoWorkers"
 	EnvReasonNoK6Nodes          = "NoK6Nodes"
 	EnvReasonVMsProvisioned     = "VMsProvisioned"

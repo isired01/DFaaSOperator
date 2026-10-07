@@ -77,10 +77,6 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	if len(env.Spec.Nodes) == 0 {
-		return ctrl.Result{RequeueAfter: healthCheckInterval}, nil
-	}
-
 	// Throttle against our own status writes.
 	due := healthCheckInterval
 	if c := meta.FindStatusCondition(env.Status.Conditions, dfaasv1.EnvCondNodesReachable); c != nil &&
