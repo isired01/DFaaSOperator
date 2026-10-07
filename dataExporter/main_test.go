@@ -455,7 +455,7 @@ func TestObjectKeyLayout(t *testing.T) {
 	}
 }
 
-// --- CSV A: the wide Prometheus layout ------------------------------------
+// --- The metrics CSV: the wide Prometheus layout --------------------------
 //
 // Every label of every series becomes a column: the old layout promoted
 // node_id and crushed the rest into one cell as {__name__="x", job="y"},
@@ -638,7 +638,7 @@ func TestMetricsCSVIgnoresFailedQueries(t *testing.T) {
 
 func mustBody(body []byte, _ int) []byte { return body }
 
-// --- CSV B: one row per query, whatever happened ---------------------------
+// --- The query-status CSV: one row per query, whatever happened ------------
 //
 // A query with a typo returns zero series and nothing else says so: the metric
 // is simply absent from every plot. This file is where "did all my queries
@@ -693,7 +693,7 @@ func TestQueryStatusCSVReportsEveryQuery(t *testing.T) {
 	}
 }
 
-// --- CSV C: the k6 summaries, long ----------------------------------------
+// --- The k6 summary CSV: the k6 summaries, long ----------------------------
 //
 // One row per (node, metric, stat), with the k6 type the old layout discarded
 // and without the END_TIME the old rows wore as if it were an instant of

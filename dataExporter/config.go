@@ -8,11 +8,7 @@ import (
 	"time"
 )
 
-// The exporter's whole input, parsed in one place. main() used to read 16
-// os.Getenv calls spread across four functions -- six at the top, six more
-// inside uploadToS3 on every single call, one in exportK6Logs, and the rest
-// mid-main -- so nothing below main() could be exercised without setting
-// process-wide state, and main_test.go could only reach the four pure helpers.
+// The exporter's whole input, parsed in one place.
 
 // PromRange is the query window.
 type PromRange struct {
@@ -98,8 +94,8 @@ func ConfigFromEnv() (Config, error) {
 		return cfg, err
 	}
 
-	// A malformed K6_SUMMARY_SOURCES is NOT fatal, matching the old behaviour:
-	// the Prometheus rows are still valuable on total summary loss.
+	// A malformed K6_SUMMARY_SOURCES is NOT fatal: the Prometheus rows
+	// are still valuable on total summary loss.
 	if src := os.Getenv("K6_SUMMARY_SOURCES"); src != "" {
 		if err := json.Unmarshal([]byte(src), &cfg.Summaries); err != nil {
 			fmt.Printf("K6_SUMMARY_SOURCES parse error: %v\n", err)
