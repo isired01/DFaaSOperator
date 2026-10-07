@@ -334,8 +334,9 @@ func buildTestRun(name string, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad
 			},
 		},
 		// VUs and duration deliberately do not appear here: k6 takes both from
-		// the script's own options, and no TestRun field carries them. spec.perNodeLoad on the LoadTest CR still records both, which
-		// is where the UI reads them from.
+		// the script's own options, and no TestRun field carries them.
+		// spec.perNodeLoad on the LoadTest CR still records both, which is
+		// where the UI reads them from.
 	}
 	runnerEnv := []interface{}{
 		map[string]interface{}{"name": "DFAAS_SUMMARY_URL", "value": env.SummaryURL},

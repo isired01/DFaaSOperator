@@ -179,9 +179,10 @@ func labelColumns(names []string) map[string]string {
 	return cols
 }
 
-// buildMetricsCSV renders the metrics CSV (metrics/<lt>/<stamp>.csv): one row per (series, sample), one column per
-// label seen anywhere in the run. Returns the bytes and the number of data
-// rows, which is what decides whether the export counts as empty.
+// buildMetricsCSV renders the metrics CSV (metrics/<lt>/<stamp>.csv): one row
+// per (series, sample), one column per label seen anywhere in the run. Returns
+// the bytes and the number of data rows, which is what decides whether the
+// export counts as empty.
 func buildMetricsCSV(loadtest string, results []queryResult) ([]byte, int) {
 	seen := map[string]bool{}
 	for _, r := range results {
@@ -265,9 +266,9 @@ func buildQueryStatusCSV(loadtest string, results []queryResult) []byte {
 	return buf.Bytes()
 }
 
-// k6MetaMetric marks the roster rows of the k6 summary CSV: one per Generator the operator
-// told us to expect, value 1 when its summary arrived and 0 when it did not.
-// Without it a node that never answered is simply absent from the file, which
+// k6MetaMetric marks the roster rows of the k6 summary CSV: one per Generator
+// the operator told us to expect, value 1 when its summary arrived and 0 when it
+// did not. Without it a node that never answered is simply absent from the file, which
 // reads exactly like a node that ran and measured nothing.
 const k6MetaMetric = "dfaas_summary_fetched"
 
@@ -429,8 +430,8 @@ func run(ctx context.Context, cfg Config, q Querier, sink Sink) (int, error) {
 		fmt.Printf("metrics export: %d/%d queries failed\n", errored, attempted)
 	}
 
-	// The query-status CSV first, and never fatal: it is what names the query that failed on
-	// the run where the next check ends the Job.
+	// The query-status CSV first, and never fatal: it is what names the query
+	// that failed on the run where the next check ends the Job.
 	if err := sink.Put(ctx, Artifact{
 		Key:         queryStatusKeyFor(cfg.LoadTestName, cfg.Stamp()),
 		Label:       "QUERY STATUS",
