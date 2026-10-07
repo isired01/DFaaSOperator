@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -167,10 +167,11 @@ func testLibp2pKey(t *testing.T) string {
 }
 
 // The bootstrap list is the federation topology for good: the agent dials it
-// once in kademlia.Initialize and its Kademlia discovery never returns a peer
-// (it announces only its pod address, the same 10.42.0.0/24 on every node). A
-// list holding only nodes[0] therefore produced a star, not a mesh — and every
-// node whose single link dropped sat at 0 peers with all Conditions green.
+// once in Initialize (agent/discovery/kademlia in the upstream dfaas repo) and
+// its Kademlia discovery never returns a peer (it announces only its pod
+// address, the same 10.42.0.0/24 on every node). A list holding only nodes[0]
+// therefore produced a star, not a mesh, and every node whose single link
+// dropped sat at 0 peers with all Conditions green.
 // Node i must get nodes 0..i-1: each pair dialed once, no circular wait.
 func TestBuildInventoryBootstrapListIsFullMesh(t *testing.T) {
 	env := &dfaasv1.Environment{

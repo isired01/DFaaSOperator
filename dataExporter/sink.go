@@ -60,7 +60,7 @@ func (s StdoutSink) Put(_ context.Context, a Artifact) error {
 
 // s3UploadAttempts bounds the PutObject tries, and s3RetryBackoff is the pause
 // before the first retry (doubled each round: 2s then 4s, so at most 6s of
-// extra wall time). One flaky PutObject used to fail the exporter Job and with
+// extra wall time). One flaky PutObject must not fail the exporter Job and with
 // it the whole LoadTest, even though the k6 run had already succeeded. The AWS
 // SDK retries connection-level faults on its own; this outer loop also covers
 // what it treats as terminal (e.g. a SeaweedFS bucket still settling right
@@ -71,10 +71,7 @@ const (
 )
 
 // S3Sink stores artifacts in one bucket. The client is built and the bucket
-// ensured ONCE, at construction: uploadToS3 used to re-read six env vars and
-// rebuild both the AWS config and the client on every call -- once for the CSV,
-// once per Generator log, once per Generator summary, so four Generators meant
-// nine config loads and nine clients per run.
+// ensured once, at construction, not per upload.
 type S3Sink struct {
 	client *s3.Client
 	bucket string
@@ -110,9 +107,8 @@ func NewS3Sink(ctx context.Context, cfg S3Config) (*S3Sink, error) {
 }
 
 func (s *S3Sink) Put(ctx context.Context, a Artifact) error {
-	// PutObject consumes the reader, so a retry needs to replay the body. The
-	// old code re-Seeked an *os.File; buffering keeps that property without
-	// requiring every artifact to be a file on disk.
+	// PutObject consumes the reader, so a retry needs to replay the body. Buffering
+	// it avoids requiring every artifact to be a file on disk.
 	body, err := io.ReadAll(a.Body)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", a.Label, err)

@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,23 +33,20 @@ import (
 // exportTailWindow extends the export query past the LoadTest's EndTime by one
 // federation interval: how often the management Prometheus pulls worker
 // metrics through /federate (monitoring.FederationInterval, read from its
-// embedded values). Federation gives the mgmt instance one sample per node per interval, and
-// each node is pulled at its own offset, so the last sample *inside* the k6
-// window can be up to one full interval older than EndTime — and no amount of
-// waiting adds samples to a window that has already closed. A smoke test on
-// 2026-09-11 measured the effect directly: with k6 stopping at 17:43:29 the
-// last exported sample was 17:42:31 for one node and 17:43:16 for another, so
-// the same run gave a different tail, and a different sample count, per node.
+// embedded values). Federation gives the mgmt instance one sample per node per
+// interval, and each node is pulled at its own offset, so the last sample
+// *inside* the k6 window can be up to one full interval older than EndTime —
+// and no amount of waiting adds samples to a window that has already closed.
 // Extending the window by one interval puts at least one sample at or after
 // EndTime for every node. The extra samples are flat: k6 has stopped, and
 // every metric here is a counter.
 var exportTailWindow = monitoring.FederationInterval
 
 // exportCooldown is how long the reconciler waits, after k6 finishes, before
-// creating the exporter Job: one minute, by the author's decision. It must
-// cover the widened window, one interval for the last in-window pull and one
-// more for the pull that lands after EndTime; federation_interval_test.go
-// fails when two intervals no longer fit.
+// creating the exporter Job: fixed at one minute on purpose. It must cover
+// the widened window, one interval for the last in-window pull and one more
+// for the pull that lands after EndTime; federation_interval_test.go fails
+// when two intervals no longer fit.
 const exportCooldown = time.Minute
 
 // observeK6 polls every remote TestRun. When all have reached a terminal
@@ -114,7 +111,7 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 	total := len(lt.Status.TestRuns)
 	runningCount := total - finishedCount - errorCount
 
-	// P9: K6Healthy rollup with a per-node count in the message.
+	// K6Healthy rollup with a per-node count in the message.
 	if !allDone {
 		r.cond(ctx, lt, dfaasv1.LTCondK6Healthy,
 			metav1.ConditionUnknown, dfaasv1.LTReasonRunning,
@@ -123,6 +120,10 @@ func (r *LoadTestReconciler) observeK6(ctx context.Context,
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
+	// Deliberate: a run in which any generator errored is not the experiment
+	// that was asked for, so it fails whole: no export and no log capture. The
+	// runners' logs stay on the generators until the LoadTest is deleted
+	// (runnersMayBeLive, loadtest_end.go).
 	switch {
 	case errorCount == 0:
 		r.cond(ctx, lt, dfaasv1.LTCondK6Healthy,
@@ -218,10 +219,11 @@ func (r *LoadTestReconciler) captureK6Logs(ctx context.Context,
 }
 
 // runExporter creates the in-cluster Job that pulls metrics from Prometheus
-// over [StartTime, EndTime] and uploads to S3. The destination defaults to the
-// in-cluster SeaweedFS sink (DefaultS3ConfigName) when env.spec.s3ConfigRef is
-// unset; an explicit ref selects that config instead. Only if the default
-// config itself is missing does the exporter fall back to a stdout dump.
+// over [StartTime, EndTime+exportTailWindow] and uploads to S3. The
+// destination defaults to the in-cluster SeaweedFS sink (DefaultS3ConfigName)
+// when env.spec.s3ConfigRef is unset; an explicit ref selects that config
+// instead. Only if the default config itself is missing does the exporter fall
+// back to a stdout dump.
 func (r *LoadTestReconciler) runExporter(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)

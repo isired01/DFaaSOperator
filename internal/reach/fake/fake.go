@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -60,12 +60,4 @@ func (n *Nodes) Rounds() [][]string {
 	out := make([][]string, len(n.rounds))
 	copy(out, n.rounds)
 	return out
-}
-
-// SetDown replaces the down set. Use it to bring a Node back between
-// reconciles.
-func (n *Nodes) SetDown(ids ...string) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.Down = ids
 }

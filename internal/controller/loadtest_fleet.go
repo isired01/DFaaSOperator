@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,12 +27,8 @@ import (
 
 // Fleet round: one poll of every generator a LoadTest runs on, per tick.
 //
-// observeK6 used to poll generator by generator, reset the Retry counter
-// after each healthy one and charge it on the first failure, then return. A
-// generator down behind a healthy one therefore swung the counter 0 -> 1
-// every pass and never exhausted it, and the early return dropped the stage
-// of every generator after the failing one. A round polls everything once,
-// never stops early, and the observe counter is charged once per round.
+// A round polls everything once, never stops early, and the observe counter
+// is charged once per round.
 //
 // Bounds, one per wait: observe = fetch-misses (fetchRetryBudget rounds);
 // Sync barrier = syncWaitBudget from K6Dispatched=True, which also bounds the
@@ -40,7 +36,7 @@ import (
 // dispatch = dispatch-attempts. Every failed remote round is paced at
 // remoteRetryInterval, because the counter write's own watch event would
 // otherwise start the next attempt at once and burn a budget in seconds.
-// ponytail: rounds poll generators one after another, so K dead generators
+// Known limitation: rounds poll generators one after another, so K dead generators
 // block the single worker for K remote timeouts per round.
 
 // remoteRetryInterval is the minimum gap between a failed remote round of a
@@ -52,7 +48,7 @@ type stageBucket int
 
 const (
 	stagePending stageBucket = iota // created, initialization, "", anything unknown
-	stageStarted                    // runner up (parked on the barrier, or running)
+	stageStarted                    // k6-operator stage "started" (the script may not be at the barrier yet)
 	stageDone                       // finished or stopped
 	stageErrored                    // error
 )
@@ -149,7 +145,7 @@ func (r *LoadTestReconciler) attempt(ctx context.Context, lt *dfaasv1.LoadTest,
 
 // paced returns how long lt must still wait after its last failed remote
 // round, or 0. It makes no remote call and no write.
-// ponytail: in-memory, so an operator restart forgets the pace; the next
+// Known limitation: in-memory, so an operator restart forgets the pace; the next
 // round then comes one interval early, bounded by the counters anyway.
 func (r *LoadTestReconciler) paced(lt *dfaasv1.LoadTest) time.Duration {
 	key := client.ObjectKeyFromObject(lt)

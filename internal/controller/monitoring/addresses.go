@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,14 +21,9 @@ import (
 // embedded) -- so seaweedfs_values_test.go can pin the values file against
 // them.
 //
-// Before this, the filer NodePort was a literal in three places that could not
-// check each other: the reconciler's own const, the values file, and the values
-// test's own hardcoded copy. The test could not reference the reconciler's
-// const, because controller imports monitoring and the check would have been an
-// import cycle -- so the one fact lived on the side of the package split that
-// forbade verifying it. Change the values file and the test together and the
-// operator silently hands every runner a 404 GO URL: the Sync barrier holds at
-// SyncReady=False/AwaitingRunners for five minutes, then Failed/SyncTimeout.
+// A filer NodePort that differs from the values file hands every runner a 404
+// GO URL: the Sync barrier holds at SyncReady=False/AwaitingRunners for five
+// minutes, then Failed/SyncTimeout.
 const (
 	// SeaweedFSService is the in-cluster Service of the allInOne release.
 	SeaweedFSService = "seaweedfs-all-in-one.monitoring.svc.cluster.local"
@@ -47,12 +42,6 @@ const (
 // FilerInClusterBase is the filer base URL from inside the Management cluster.
 func FilerInClusterBase() string {
 	return fmt.Sprintf("http://%s:%d", SeaweedFSService, FilerPort)
-}
-
-// S3InClusterEndpoint is the S3 gateway endpoint from inside the Management
-// cluster.
-func S3InClusterEndpoint() string {
-	return fmt.Sprintf("http://%s:%d", SeaweedFSService, S3Port)
 }
 
 // FilerPublicBase is the filer base URL from outside the Management cluster,

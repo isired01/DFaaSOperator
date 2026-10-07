@@ -1,12 +1,15 @@
 #cloud-config
+# Example cloud-init for a VM the operator can provision: a sudo user with SSH
+# password authentication. Set your own user and password, and put the same pair
+# in spec.nodes[].username and spec.nodes[].password of the Environment.
 ssh_pwauth: true
 chpasswd:
   list: |
-    isaia:root
+    ubuntu:CHANGE_ME
   expire: False
 
 users:
-  - name: isaia
+  - name: ubuntu
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
 

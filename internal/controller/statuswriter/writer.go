@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -9,12 +9,7 @@ You may obtain a copy of the License at
 */
 
 // Package statuswriter is the one way a reconciler persists state about its
-// own CR. Before it, twenty named entry points shared two primitives and
-// picking the wrong one failed silently: a phase setter that returned
-// requeue and a sibling that did not, a condition stamp that had to be issued
-// through a special variant when a phase change followed it in the same
-// tick (meta.SetStatusCondition overwrites Reason and Message wholesale),
-// two on-disk counter encodings, and a log-and-swallow wrapper at 69 sites.
+// own CR.
 //
 // Record takes a Transition — everything to persist in one write — and owns
 // the retry, the re-fetch that absorbs informer-cache lag, the status
@@ -50,8 +45,7 @@ type Cond struct {
 // Transition is everything one write persists on the CR's status.
 //
 // Conditions are stamped BEFORE the phase aggregate, so a specific diagnostic
-// stamped alongside a phase change survives it — the ordering the old
-// setLoadTestPhaseDetail existed to work around. Reason/Message override the
+// stamped alongside a phase change survives it. Reason/Message override the
 // aggregate's generic per-phase text and are only read when Phase is set.
 // Touch is the escape hatch for status fields the writer does not model
 // (StartTime, TestRuns, LastHealthCheck, …); it runs last, on the fresh copy.

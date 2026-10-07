@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -56,7 +56,7 @@ const fetchRetryBudget = 15
 // error path. Bumps the counter; if it tips the budget, ends the run as Failed
 // with K6Dispatched=False/DispatchFailed, and endRun deletes the TestRuns the
 // other generators already run. Otherwise
-// stamps K6Dispatched=False/<subReason> (P13) and returns a RequeueAfter
+// stamps K6Dispatched=False/<subReason> and returns a RequeueAfter
 // Result. Every path is terminal for the current reconcile: the caller
 // returns whatever this returns.
 func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
@@ -65,11 +65,10 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 	budget := r.budget(dispatchAttemptsAnnotation, dispatchRetryBudget)
 	outcome, bumpErr := r.attempt(ctx, lt, budget)
 	if bumpErr != nil {
-		// The round still happened, so it is still stamped -- this used to
-		// return here, so a persistently conflicting annotation Update left the
-		// LoadTest requeuing every 10s forever with no K6Dispatched Condition
-		// ever written and nothing but a log line to show for it.
-		logger.Error(bumpErr, "bumpDispatchAttempts failed; the budget cannot advance")
+		// The round still happened, so it is still stamped: returning here
+		// would leave a persistently conflicting annotation Update requeuing
+		// the LoadTest forever with no K6Dispatched Condition written.
+		logger.Error(bumpErr, "dispatch-attempts counter write failed; the budget cannot advance")
 	}
 
 	if outcome.Exhausted {
@@ -80,7 +79,7 @@ func (r *LoadTestReconciler) onDispatchError(ctx context.Context,
 			statuswriter.Cond{Type: dfaasv1.LTCondK6Dispatched, Status: metav1.ConditionFalse,
 				Reason: dfaasv1.LTReasonDispatchFailed, Message: detail})
 	}
-	// P13: sub-reason (ScriptMirrorFailed / StaleCleanupFailed / ApplyFailed)
+	// Sub-reason (ScriptMirrorFailed / StaleCleanupFailed / ApplyFailed)
 	// carries the diagnostic detail, retry-budget counter is in the message.
 	r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched,
 		metav1.ConditionFalse, subReason,
@@ -115,7 +114,7 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 		}
 	}
 
-	// P9: first observation — nothing dispatched yet, status is Unknown.
+	// First observation — nothing dispatched yet, status is Unknown.
 	// Subsequent calls below upgrade this to False/InFlight or True/
 	// AllDispatched. SetStatusCondition is idempotent on no transition.
 	if len(lt.Status.TestRuns) == 0 {
@@ -168,9 +167,9 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		// Successful dispatcher round-trip — reset the budget counter and
-		// surface partial progress on K6Dispatched (P9).
+		// surface partial progress on K6Dispatched.
 		if rerr := r.budget(dispatchAttemptsAnnotation, dispatchRetryBudget).Clear(ctx, lt); rerr != nil {
-			log.FromContext(ctx).Error(rerr, "resetDispatchAttempts failed; non-fatal")
+			log.FromContext(ctx).Error(rerr, "dispatch-attempts counter reset failed; non-fatal")
 		}
 		if len(refs) < len(lt.Spec.PerNodeLoad) {
 			r.cond(ctx, lt, dfaasv1.LTCondK6Dispatched,
@@ -189,8 +188,8 @@ func (r *LoadTestReconciler) startK6(ctx context.Context,
 			fmt.Sprintf("dispatched %d remote TestRun(s)", len(refs)))
 	}
 
-	// Synchronized start: hold Running until every runner is parked on the
-	// script barrier, then publish the GO signal (loadtest_sync.go).
+	// Synchronized start: hold Running until every TestRun reports stage
+	// "started", then publish the GO signal (loadtest_sync.go).
 	if lt.Spec.SyncStart {
 		lt.Status.TestRuns = refs
 		return r.awaitSyncBarrier(ctx, lt, env)
@@ -301,7 +300,7 @@ func (r *LoadTestReconciler) runnerEnv(lt *dfaasv1.LoadTest, env *dfaasv1.Enviro
 
 // persistTestRuns writes the cumulative TestRunRef slice into
 // Status.TestRuns with conflict retry. Called incrementally from startK6
-// after each successful ApplyTestRun so a mid-loop failure leaves the
+// after each successful Node.Apply so a mid-loop failure leaves the
 // already-dispatched runs visible to observeK6 / abort / deletion paths.
 func (r *LoadTestReconciler) persistTestRuns(ctx context.Context,
 	lt *dfaasv1.LoadTest, refs []dfaasv1.TestRunRef) error {
@@ -360,8 +359,3 @@ func (r *LoadTestReconciler) ensureMirroredS3Secret(ctx context.Context,
 	}
 	return mirror.Name, nil
 }
-
-// sanitize is k6dispatch.Sanitize: the remote TestRun names and the
-// management-cluster names derived from a nodeID (k6 log ConfigMaps, summary
-// object keys) must agree on the spelling.
-var sanitize = k6dispatch.Sanitize

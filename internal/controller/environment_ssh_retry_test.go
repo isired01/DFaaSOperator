@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,8 +25,8 @@ import (
 	"dfaas-operator/internal/controller/statuswriter"
 )
 
-// 192.0.2.1 is TEST-NET-1 (RFC 5737) — guaranteed unroutable, so probeSSH
-// always returns false and every reconcile counts as an SSH-unreachable round.
+// 192.0.2.1 is TEST-NET-1 (RFC 5737) — guaranteed unroutable, so reach.TCP
+// never connects and every reconcile counts as an SSH-unreachable round.
 const unroutableIP = "192.0.2.1"
 
 var _ = Describe("ProvisioningVMs SSH retry budget", func() {

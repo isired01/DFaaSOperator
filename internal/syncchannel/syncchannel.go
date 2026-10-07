@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -12,17 +12,7 @@ You may obtain a copy of the License at
 // VMs share on the SeaweedFS filer: the GO signal that opens the Sync barrier,
 // and the per-Generator end-of-test summaries.
 //
-// It exists because one SeaweedFS instance had three notions of where it is,
-// chosen per call site: an in-cluster DNS const baked into the exporter Job, a
-// DFAAS_FILER_URL-or-DNS function for the operator's own writes, and a
-// DFAAS_SYNC_PUBLIC_URL-or-HOST_IP function for what the VMs poll. Every
-// operation picked one by hand.
-//
-// The process-wide bases are resolved ONCE, at construction. That is the whole
-// point: the three publish/delete functions were previously reachable in tests
-// only by mutating process-global state with bare os.Setenv, which meant the
-// specs could not run in parallel and a crashed spec leaked the variables into
-// every later spec in the package.
+// The process-wide bases are resolved once, at construction.
 //
 // What a VM dials is per generator: the management address detected for it at
 // provisioning (status.k6Nodes[].managementAddress, carried in by the caller as
@@ -57,8 +47,8 @@ const requestTimeout = 10 * time.Second
 // passes the detected address -- a fact -- rather than a base, so this
 // precedence lives in the adapter and no caller ever picks a base.
 type Channel interface {
-	// PublishGo makes the GO object visible to every parked runner within one
-	// poll interval. Idempotent: a re-PUT rewrites the object.
+	// PublishGo makes the GO object visible to every runner polling the barrier
+	// within one poll interval. Idempotent: a re-PUT rewrites the object.
 	PublishGo(ctx context.Context, lt *dfaasv1.LoadTest) error
 	// DeleteGo and DeleteSummaries are best-effort hygiene: an already-absent
 	// object is success, so a 404 is not an error.

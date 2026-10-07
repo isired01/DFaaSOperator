@@ -8,15 +8,13 @@
 // therefore listens on :8082 and stays resident — no fork-per-request — so it
 // behaves well under sustained k6 load.
 //
-// Input  : raw image bytes (jpeg/png/gif) as the POST body. Matches the k6
+// Input: raw image bytes (jpeg/png/gif) as the POST body. This matches the k6
+// payload feature, which fetches the asset from SeaweedFS and POSTs the bytes
+// directly, with no base64 and no URL indirection.
 //
-//	payload feature, which fetches the asset from SeaweedFS and POSTs the
-//	bytes directly — no base64, no URL indirection.
-//
-// Output : image/jpeg thumbnail (default). With ?meta=1 returns a small JSON
-//
-//	{format,srcWidth,srcHeight,dstWidth,dstHeight} instead, to stress
-//	the agent/network rather than the response path.
+// Output: an image/jpeg thumbnail by default. With ?meta=1 it returns a small
+// JSON object {format,srcWidth,srcHeight,dstWidth,dstHeight} instead, to
+// stress the agent and the network rather than the response path.
 package main
 
 import (

@@ -48,42 +48,21 @@ spec:
             properties:
               nodes:
                 description: |-
-                  Nodes is keyed by nodeID: the API server rejects duplicates at admission
-                  (listType=map). Without it two entries sharing a nodeID collide on every
-                  derived object name (kubeconfig Secret, libp2p key entry, remote TestRun)
-                  and the second silently overwrites the first.
-
-                  ipAddress is unique too, enforced by the CEL rule below: one physical
-                  machine is one node. Two entries sharing an IP used to be valid (the
-                  listMapKey only guards nodeID) and produced two libp2p identities on one
-                  box — the Ansible run installs dfaas-agent twice with different keys, and
-                  whichever lands last leaves every peer dialling a dead peer ID.
-                  MaxItems is what makes the rule admissible at all: CEL cost estimation on
-                  an unbounded array blows the schema budget (same reason nodeID uses an
-                  OpenAPI Pattern instead of CEL), and this comparison is O(n²).
-                  NOTE: scope is one Environment. Nothing stops two *different* Environments
-                  from declaring the same machine — that needs a cross-object check the CRD
-                  schema cannot express.
+                  Nodes are the machines of the federation, keyed by nodeID. Each ipAddress
+                  may appear once (one machine is one node); at most 50 nodes. Uniqueness
+                  is checked within one Environment only.
                 items:
                   description: |-
-                    EnvironmentNode declares one machine in the federation.
-
-                    A dfaas-worker must declare at least one function. A worker with none serves
-                    nothing, and the empty list is worse than useless downstream: buildInventory
-                    marshals a nil slice to the JSON literal `null`, not `[]`, so the inventory
-                    carries node_specific_functions='null' and the playbook's prune task runs
-                    `null | map(attribute='name')` over a four-character string — the play dies
-                    and the Environment lands in Failed with the function still deployed.
-                    Scoped to the role: a k6-load-generator runs k6, not OpenFaaS, and the
-                    inventory emits no function var for it at all.
+                    EnvironmentNode declares one machine in the federation. A dfaas-worker must
+                    declare at least one function.
                   properties:
                     balancingStrategy:
                       description: |-
-                        BalancingStrategy is meaningful only for dfaas-worker nodes.
-                        Accepted values are the canonical strategy names recognised by
-                        dfaas-agent (AGENT_STRATEGY env var). Typos that look like
-                        "alllocal" silently fall back to recalcstrategy and crash on
-                        missing dfaas.maxrate, so the enum guard is the safety net.
+                        BalancingStrategy is the dfaas-agent strategy (AGENT_STRATEGY) of a
+                        dfaas-worker; ignored on a k6-load-generator. Supported: staticstrategy,
+                        alllocalstrategy, recalcstrategy (uses each function's maxRate) and
+                        randomstrategy. nodemarginstrategy and rlagentstrategy pass validation
+                        but are not supported by this platform.
                       enum:
                       - staticstrategy
                       - nodemarginstrategy
@@ -93,8 +72,11 @@ spec:
                       - randomstrategy
                       type: string
                     capacity:
-                      description: NodeCapacity expresses the relative CPU/RAM budget
-                        of a node.
+                      description: |-
+                        NodeCapacity is a size label for a node. The operator sizes nothing with it:
+                        on a dfaas-worker it becomes the node_type label of the node's Prometheus
+                        scrape target, and so a label on its federated series and a column of the
+                        exported metrics CSV.
                       enum:
                       - LOW
                       - MEDIUM
@@ -108,12 +90,20 @@ spec:
                         properties:
                           execTimeout:
                             default: 5
+                            description: ExecTimeout is the function watchdog's exec_timeout,
+                              in seconds.
                             minimum: 1
                             type: integer
                           image:
+                            description: |-
+                              Image is the function's container image. Pin it by digest or an immutable
+                              tag for a reproducible campaign.
                             type: string
                           maxInflight:
                             default: 400
+                            description: |-
+                              MaxInflight is the function watchdog's max_inflight: the concurrent
+                              requests one replica accepts.
                             minimum: 1
                             type: integer
                           maxRate:
@@ -128,20 +118,16 @@ spec:
                             type: integer
                           name:
                             description: |-
-                              Name is templated by the dfaas-agent into HAProxy variable names
-                              (`var(req.rate_local_func_<name>)`), and HAProxy variable names reject
-                              hyphens. A single function called `dfaas-imgproc` therefore made HAProxy
-                              refuse the WHOLE rendered config with a 400 from its Data Plane API —
-                              "invalid syntax at char '-imgproc'" — so every worker kept serving the
-                              placeholder 503 ("Proxy is running, but the DFaaS agent is not!") while
-                              all seven Environment Conditions stayed green and the SSH probe was happy.
-                              The name is also the OpenFaaS/DNS-1123 object name, which rejects
-                              underscores, so the safe intersection is lowercase alphanumerics only.
-                              Rejecting it here turns a silent data-plane death into an apply-time error.
+                              Name is the OpenFaaS function name, invoked at /function/<name> on the
+                              node's HAProxy entrypoint (NodePort 30080). Lowercase letters and digits
+                              only.
                             pattern: ^[a-z0-9]+$
                             type: string
                           timeoutMs:
                             default: 6000
+                            description: |-
+                              TimeoutMs is the per-function timeout in milliseconds, deployed as the
+                              OpenFaaS label dfaas.timeout_ms for the dfaas-agent.
                             minimum: 1
                             type: integer
                         required:
@@ -155,25 +141,21 @@ spec:
                       type: array
                     ipAddress:
                       description: |-
-                        MaxLength is not cosmetic: without it the CEL uniqueness rule on
-                        spec.nodes below is rejected, because the cost estimator assumes the
-                        largest string the request budget allows for every comparison. 45 is the
-                        longest possible textual IP (IPv6 with an embedded IPv4, e.g.
-                        ffff:...:255.255.255.255).
+                        IPAddress is the address the operator reaches this machine on: SSH on :22
+                        and, for a k6-load-generator, the k3s API on :6443. Unique within
+                        spec.nodes.
                       maxLength: 45
                       type: string
                     nodeID:
                       description: |-
-                        NodeID must be DNS-1123 compatible (lowercase): it is embedded in
-                        Kubernetes object names (kubeconfig Secret <env>-<nodeID>-kubeconfig,
-                        remote TestRuns, k6-log ConfigMaps) — an uppercase ID makes the k6
-                        Ansible Job's Secret push fail with a censored 422.
-                        Pattern (not CEL XValidation): CEL cost estimation on unbounded
-                        node arrays blows the schema budget; the OpenAPI pattern is free.
+                        NodeID names the node: a lowercase DNS-1123 label, unique within
+                        spec.nodes. It is embedded in Kubernetes object names (kubeconfig Secret
+                        <env>-<nodeID>-kubeconfig, remote TestRuns, k6-log ConfigMaps).
                       maxLength: 63
                       pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                       type: string
                     password:
+                      description: Password is the SSH password of Username.
                       type: string
                     role:
                       description: |-
@@ -184,8 +166,9 @@ spec:
                       - k6-load-generator
                       type: string
                     username:
-                      description: SSH credentials (inline, matches the FE-produced
-                        manifests).
+                      description: |-
+                        Username is the SSH user the operator logs in as. Username and Password
+                        are stored in plain text in the spec.
                       type: string
                   required:
                   - capacity
@@ -216,39 +199,16 @@ spec:
                   "dfaas.io/s3-config=true"). When set, LoadTests targeting this
                   Environment export their metrics CSV to that S3 endpoint under a
                   bucket derived from the Environment name. When nil, LoadTests export
-                  to the built-in in-cluster SeaweedFS sink ("seaweedfs-default").
+                  to the built-in in-cluster SeaweedFS sink ("seaweedfs-default"). The
+                  Secret must hold the keys endpoint, region, access_key_id,
+                  secret_access_key and force_path_style; every key except endpoint is
+                  required by the exporter Job.
                 properties:
                   name:
                     minLength: 1
                     type: string
                 required:
                 - name
-                type: object
-              topology:
-                description: |-
-                  Topology declares inter-node network shaping (latency injection).
-
-                  NOT IMPLEMENTED: the field is schema-only. Nothing in the operator or in the
-                  Ansible playbooks reads it, so a declared link's latencyMs is never applied
-                  to any node. It is kept so existing manifests still validate; treat it as
-                  documentation of intent, not as a working feature.
-                properties:
-                  links:
-                    items:
-                      description: Link is one symmetric latency link in the topology.
-                      properties:
-                        latencyMs:
-                          type: integer
-                        nodeA:
-                          type: string
-                        nodeB:
-                          type: string
-                      required:
-                      - latencyMs
-                      - nodeA
-                      - nodeB
-                      type: object
-                    type: array
                 type: object
             required:
             - nodes
@@ -314,6 +274,7 @@ spec:
                   type: object
                 type: array
               dfaasNodes:
+                description: DfaasNodes lists the nodeIDs of the dfaas-worker nodes.
                 items:
                   type: string
                 type: array
@@ -370,7 +331,6 @@ spec:
               phase:
                 description: EnvironmentPhase tracks the infrastructure lifecycle.
                 enum:
-                - Idle
                 - ProvisioningVMs
                 - ProvisioningInfra
                 - ProvisioningMonitoring

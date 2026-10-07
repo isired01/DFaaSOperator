@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -10,11 +10,7 @@ You may obtain a copy of the License at
 
 // Package roles is the one table describing what each NodeRole means to
 // provisioning: which playbook, which inventory group, which Job suffix,
-// which Condition. Before it, the two-role split was re-encoded at eleven
-// branch sites and four role-keyed literals across ansible/, monitoring/ and
-// the reconciler, three of which had to agree with no exhaustiveness check —
-// and an unmatched role fell through buildInventory's switch to an empty
-// inventory with a nil error. Here an unknown role is an error.
+// which Condition. An unknown role is an error.
 //
 // Its own package so ansible, monitoring and controller can all import it
 // without monitoring having to import the provisioning tool.

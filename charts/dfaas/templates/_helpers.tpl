@@ -6,10 +6,6 @@ Common helpers.
 {{- default .Release.Name .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{- define "dfaas.name" -}}
-{{- default "dfaas" .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
 {{- define "dfaas.operator.image" -}}
 {{ .Values.operator.image.repository }}:{{ default .Chart.AppVersion .Values.operator.image.tag }}
 {{- end -}}

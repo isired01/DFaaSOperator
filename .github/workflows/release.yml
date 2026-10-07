@@ -22,6 +22,15 @@ jobs:
       - name: Compute version (strip leading v)
         run: echo "VERSION_NO_V=${VERSION#v}" >> "$GITHUB_ENV"
 
+      # Lint before the first push: a template error must stop the release before
+      # any image is published.
+      - uses: azure/setup-helm@v5
+        with:
+          version: v3.15.4
+
+      - name: Helm lint
+        run: helm lint charts/dfaas
+
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
 
@@ -70,17 +79,10 @@ jobs:
             sleep 15
           done
           echo "UI image never appeared after 15 min; failing release."
-          echo "Did you push the tag ${VERSION} to the UI repo too?"
+          echo "Did you push the tag ${VERSION} to the UI repo too? A private dfaas-control-plane package also ends here: it must be public or readable by this repository."
           exit 1
 
-      - uses: azure/setup-helm@v5
-        with:
-          version: v3.15.4
-
-      - name: Helm lint
-        run: helm lint charts/dfaas
-
-      - name: Attach CRDs to release (downloaded manually pre-install)
+      - name: Attach CRDs to release (applied by hand before helm upgrade)
         run: |
           mkdir -p dist
           cp config/crd/bases/dfaas.dfaas.io_environments.yaml dist/
@@ -108,3 +110,17 @@ jobs:
             dist/dfaas.dfaas.io_environments.yaml
             dist/dfaas.dfaas.io_loadtests.yaml
           generate_release_notes: true
+
+      # Last on purpose: a 403 on the imgproc package (see docs/releasing.md,
+      # GHCR packages) then cannot leave the chart or the GitHub Release unpublished.
+      - name: Build & push imgproc image
+        uses: docker/build-push-action@v7
+        with:
+          context: imageFunction
+          file: imageFunction/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/isired01/dfaas-imgproc:${{ env.VERSION }}
+            ghcr.io/isired01/dfaas-imgproc:${{ env.VERSION_NO_V }}
+            ghcr.io/isired01/dfaas-imgproc:latest

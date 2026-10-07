@@ -1,5 +1,8 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Derived from unimib-datAI/dfaas k8s/charts/values-prometheus.yaml (The DFaaS Authors)
 
-# Install only prometheus-node-exporter and alertmanager services.
+# Prometheus server (federated by the management cluster), node-exporter and
+# alertmanager; pushgateway and kube-state-metrics are off.
 prometheus-pushgateway:
   enabled: false
 kube-state-metrics:
@@ -87,9 +90,10 @@ alertmanager:
 # Extra manifests to deploy as an array.
 extraManifests:
   - |
-    # This is a utility NodePort service used to expose the Prometheus Web UI
-    # outside of the Kubernetes cluster to port 30909. Use for debugging in the
-    # PoC version.
+    # NodePort 30909 is how the management Prometheus federates this node:
+    # monitoring/targets.go writes <node-ip>:30909 into the dfaas-nodes scrape
+    # job (metrics_path /federate). Removing or renumbering it empties every
+    # dashboard and export; change targets.go with it.
     apiVersion: v1
     kind: Service
     metadata:

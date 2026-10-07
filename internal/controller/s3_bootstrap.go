@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -56,15 +56,6 @@ func EnsureS3Namespace(ctx context.Context, c client.Client) error {
 // on 8333. Must track the release/values in internal/controller/monitoring.
 const defaultS3Endpoint = "http://seaweedfs-all-in-one.monitoring.svc.cluster.local:8333"
 
-// legacyS3Endpoint is the endpoint of the pre-Helm SeaweedFS, whose Service was
-// plain "seaweedfs". Clusters bootstrapped before the Helm migration still carry
-// it in the default config Secret, which create-if-not-exists would never
-// refresh — leaving the exporter and the UI gateway dialling a Service that no
-// longer exists.
-//
-// ponytail: one-shot migration aid, delete once no cluster carries it.
-const legacyS3Endpoint = "http://seaweedfs.monitoring.svc.cluster.local:8333"
-
 // EnsureDefaultS3Config idempotently creates the dfaas-s3/seaweedfs-default
 // Secret describing the in-cluster SeaweedFS sink
 // (monitoring/seaweedfs-all-in-one). The keys match what the exporter consumes
@@ -74,8 +65,7 @@ const legacyS3Endpoint = "http://seaweedfs.monitoring.svc.cluster.local:8333"
 // monitoring/seaweedfs-s3-secret identity file.
 // Create-if-not-exists semantics: an AlreadyExists is treated as success so an
 // admin who hand-edits the Secret (e.g. to point at an external S3) is never
-// clobbered on restart — with one exception, the legacy endpoint below, which is
-// rewritten because it points at a Service the Helm migration removed.
+// clobbered on restart.
 //
 // Called once at operator startup, after EnsureS3Namespace, using the same
 // bootstrap client. Requires the dfaas-s3 namespace to already exist.
@@ -101,29 +91,6 @@ func EnsureDefaultS3Config(ctx context.Context, c client.Client) error {
 	}
 	if !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create %s/%s secret: %w", S3ConfigNamespace, DefaultS3ConfigName, err)
-	}
-	return healLegacyS3Endpoint(ctx, c)
-}
-
-// healLegacyS3Endpoint rewrites the endpoint of an existing default config
-// Secret, but only when it is exactly legacyS3Endpoint. Comparing the whole
-// value keeps the "never clobber an admin's edit" contract: anything else,
-// including an external S3 endpoint, is left untouched.
-//
-// ponytail: one-shot migration aid, delete along with legacyS3Endpoint.
-func healLegacyS3Endpoint(ctx context.Context, c client.Client) error {
-	existing := &corev1.Secret{}
-	key := client.ObjectKey{Namespace: S3ConfigNamespace, Name: DefaultS3ConfigName}
-	if err := c.Get(ctx, key, existing); err != nil {
-		return fmt.Errorf("get %s/%s secret: %w", S3ConfigNamespace, DefaultS3ConfigName, err)
-	}
-	if string(existing.Data["endpoint"]) != legacyS3Endpoint {
-		return nil
-	}
-	patch := client.MergeFrom(existing.DeepCopy())
-	existing.StringData = map[string]string{"endpoint": defaultS3Endpoint}
-	if err := c.Patch(ctx, existing, patch); err != nil {
-		return fmt.Errorf("patch %s/%s endpoint: %w", S3ConfigNamespace, DefaultS3ConfigName, err)
 	}
 	return nil
 }

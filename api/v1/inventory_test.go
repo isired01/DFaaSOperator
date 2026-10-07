@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -158,7 +158,7 @@ var terminalFailure = map[string]bool{
 	LTReasonS3ConfigMissing: true,
 	LTReasonEnvNotFound:     true,
 
-	EnvReasonSkipped:            false, // == LTReasonExportSkipped
+	LTReasonExportSkipped:       false,
 	EnvReasonNoWorkers:          false,
 	EnvReasonNoK6Nodes:          false,
 	EnvReasonVMsProvisioned:     false,

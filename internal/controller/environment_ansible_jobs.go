@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -45,8 +45,9 @@ const ansibleLogTailLines int64 = 400
 var ansibleTaskHeaderRe = regexp.MustCompile(`^TASK \[(.+?)\]`)
 
 // patchAnsibleJobTTL looks up the role-suffixed Ansible Job for env and sets
-// its post-finish TTL. No-op (logs at V1) if the Job is gone — e.g. a phase
-// that was skipped because the role has no nodes, so no Job was ever created.
+// its post-finish TTL. No-op if the Job is gone — e.g. a phase that was
+// skipped because the role has no nodes, so no Job was ever created; any other
+// read error is logged.
 func (r *EnvironmentReconciler) patchAnsibleJobTTL(ctx context.Context,
 	env *dfaasv1.Environment, suffix string, ttlSec int32) {
 	var job batchv1.Job
@@ -87,7 +88,7 @@ func (r *EnvironmentReconciler) ensureAnsibleJob(ctx context.Context,
 	getErr := r.Get(ctx, client.ObjectKey{Name: jobName, Namespace: env.Namespace}, &job)
 
 	if apierrors.IsNotFound(getErr) {
-		// P7: before kicking off the Job, the observed state is "we haven't
+		// Before kicking off the Job, the observed state is "we haven't
 		// checked yet" — stamp Unknown/JobPending. Replaced by False/
 		// AnsibleRunning once the Job exists.
 		r.cond(ctx, env, spec.CondType,
@@ -98,21 +99,19 @@ func (r *EnvironmentReconciler) ensureAnsibleJob(ctx context.Context,
 		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
 		newJob, secret, jerr := am.CreateJobForRole(ctx, env, spec.Role, libp2pKeys)
 		if jerr != nil {
-			// P2: surface CreateJobForRole failure.
+			// Surface the CreateJobForRole failure.
 			r.cond(ctx, env, spec.CondType,
 				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
 				"build "+spec.Human+" Ansible Job: "+condMessage(jerr))
 			return false, false, jerr
 		}
 		if cerr := r.Create(ctx, secret); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
-			// P2.
 			r.cond(ctx, env, spec.CondType,
 				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
 				"create "+spec.Human+" inventory Secret: "+condMessage(cerr))
 			return false, false, cerr
 		}
 		if cerr := r.Create(ctx, newJob); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
-			// P2.
 			r.cond(ctx, env, spec.CondType,
 				metav1.ConditionFalse, dfaasv1.EnvReasonJobCreationFailed,
 				"create "+spec.Human+" Ansible Job: "+condMessage(cerr))

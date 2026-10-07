@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -10,7 +10,10 @@ You may obtain a copy of the License at
 
 package v1
 
-// NodeCapacity expresses the relative CPU/RAM budget of a node.
+// NodeCapacity is a size label for a node. The operator sizes nothing with it:
+// on a dfaas-worker it becomes the node_type label of the node's Prometheus
+// scrape target, and so a label on its federated series and a column of the
+// exported metrics CSV.
 // +kubebuilder:validation:Enum=LOW;MEDIUM;HIGH
 type NodeCapacity string
 
@@ -44,31 +47,36 @@ const (
 
 // Function describes one OpenFaaS function deployed on a dfaas-worker node.
 type Function struct {
-	// Name is templated by the dfaas-agent into HAProxy variable names
-	// (`var(req.rate_local_func_<name>)`), and HAProxy variable names reject
-	// hyphens. A single function called `dfaas-imgproc` therefore made HAProxy
-	// refuse the WHOLE rendered config with a 400 from its Data Plane API —
-	// "invalid syntax at char '-imgproc'" — so every worker kept serving the
-	// placeholder 503 ("Proxy is running, but the DFaaS agent is not!") while
-	// all seven Environment Conditions stayed green and the SSH probe was happy.
-	// The name is also the OpenFaaS/DNS-1123 object name, which rejects
-	// underscores, so the safe intersection is lowercase alphanumerics only.
-	// Rejecting it here turns a silent data-plane death into an apply-time error.
+	// The dfaas-agent templates the name into HAProxy variable names, which
+	// reject hyphens: HAProxy then refuses the whole rendered config and every
+	// worker keeps serving the placeholder 503. The name is also a DNS-1123
+	// object name, which rejects underscores.
+
+	// Name is the OpenFaaS function name, invoked at /function/<name> on the
+	// node's HAProxy entrypoint (NodePort 30080). Lowercase letters and digits
+	// only.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]+$`
 	Name string `json:"name"`
 
+	// Image is the function's container image. Pin it by digest or an immutable
+	// tag for a reproducible campaign.
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
 
+	// ExecTimeout is the function watchdog's exec_timeout, in seconds.
 	// +kubebuilder:default=5
 	// +kubebuilder:validation:Minimum=1
 	ExecTimeout int `json:"execTimeout"`
 
+	// MaxInflight is the function watchdog's max_inflight: the concurrent
+	// requests one replica accepts.
 	// +kubebuilder:default=400
 	// +kubebuilder:validation:Minimum=1
 	MaxInflight int `json:"maxInflight"`
 
+	// TimeoutMs is the per-function timeout in milliseconds, deployed as the
+	// OpenFaaS label dfaas.timeout_ms for the dfaas-agent.
 	// +kubebuilder:default=6000
 	// +kubebuilder:validation:Minimum=1
 	TimeoutMs int `json:"timeoutMs"`
@@ -80,22 +88,4 @@ type Function struct {
 	// +kubebuilder:default=100
 	// +kubebuilder:validation:Minimum=1
 	MaxRate int32 `json:"maxRate"`
-}
-
-// Topology declares inter-node network shaping (latency injection).
-//
-// NOT IMPLEMENTED: the field is schema-only. Nothing in the operator or in the
-// Ansible playbooks reads it, so a declared link's latencyMs is never applied
-// to any node. It is kept so existing manifests still validate; treat it as
-// documentation of intent, not as a working feature.
-type Topology struct {
-	// +optional
-	Links []Link `json:"links,omitempty"`
-}
-
-// Link is one symmetric latency link in the topology.
-type Link struct {
-	NodeA     string `json:"nodeA"`
-	NodeB     string `json:"nodeB"`
-	LatencyMs int    `json:"latencyMs"`
 }

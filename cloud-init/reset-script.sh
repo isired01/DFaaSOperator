@@ -1,42 +1,36 @@
 #!/bin/bash
 
-# EXAMPLE / local-dev helper — NOT part of the operator runtime.
-# Recreates a few Multipass VMs (on macOS) as the author's local test bed,
-# provisioned from dfaas-config.yaml. It is machine-specific: edit NODES/IPS,
-# the Ubuntu image tag, and CPU/RAM/disk for your host, and note that
-# `multipass launch` here has no --network flag, so the IPS below are only used
-# for known_hosts cleanup — assign/read the real VM IPs yourself and put them in
-# the Environment CR's spec.nodes[].ipAddress. See "Target VM baseline" in the
-# README for the SSH/user assumptions the operator makes about these VMs.
+# Example helper, not part of the operator runtime.
+# Recreates a few Multipass VMs from dfaas-config.yaml. For every name in NODES
+# it deletes and purges the VM of that name without asking, then launches a new
+# one. Run it from this directory: it passes --cloud-init dfaas-config.yaml.
+# Edit NODES, IMAGE and the CPU, RAM and disk values for your host.
+# `multipass list` shows the addresses to put in spec.nodes[].ipAddress.
+# See "Requirements" in the README for the SSH and user assumptions the
+# operator makes about these VMs.
 
-# Configurazione nodi (adatta a IP/nomi della tua rete)
-NODES=("nodoA" "nodoB" "nodoC" "nodoD")
+# Example VM names.
+NODES=("dfaas-node-1" "dfaas-node-2" "k6-gen-1")
 
-# Risorse VM (modifica in base alla tua RAM totale)
+# Ubuntu image to launch.
+IMAGE="26.04"
+
+# VM resources (adjust to your host).
 CPUS="2"
 RAM="4G"
 DISK="20G"
 
-echo "--- Inizio Reset Nodi Multipass ---"
+echo "--- Resetting Multipass VMs ---"
 
-for i in "${!NODES[@]}"; do
-    NAME=${NODES[$i]}
+for NAME in "${NODES[@]}"; do
+    echo "[*] Deleting $NAME..."
+    multipass delete "$NAME" --purge 2>/dev/null
 
-    echo "[*] Eliminazione $NAME..."
-    multipass delete $NAME --purge 2>/dev/null
+    echo "[*] Creating $NAME..."
+    multipass launch --name "$NAME" --cloud-init dfaas-config.yaml \
+        --cpus "$CPUS" --memory "$RAM" --disk "$DISK" "$IMAGE"
 
-    echo "[*] Creazione $NAME con IP $IP..."
-    
-    # Lancio dell'istanza con configurazione di rete specifica
-    # Nota: Assicurati che il bridge sia quello corretto per la tua sottorete
-    multipass launch --name $NAME --cloud-init dfaas-config.yaml --cpus $CPUS --memory $RAM --disk $DISK 26.04
-
-    echo "[V] $NAME creato."
+    echo "[V] $NAME created."
 done
 
-# Pulizia Known Hosts sul tuo Mac per evitare errori SSH
-for IP in "${IPS[@]}"; do
-    ssh-keygen -R $IP 2>/dev/null
-done
-
-echo "--- Fine. Ora puoi rilanciare Ansible ---"
+echo "--- Done ---"

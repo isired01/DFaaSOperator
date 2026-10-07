@@ -8,16 +8,18 @@ spec:
   # suspended: true   # Save-as-Draft: holds phase=Pending (read the draft
   # state from spec.suspended — there is no Suspended
   # condition), no k6 dispatch. PATCH to false to
-  # activate. UI sets this on create; default false for
-  # plain `kubectl apply`. Required if you set startAt.
+  # activate. The UI sets it for drafts and scheduled tests; default false.
+  # Required if you set startAt.
   # stop: true        # Abort: PATCH spec.stop=true to delete every remote
   # TestRun across k6 nodes and transition the CR to
   # the terminal "Aborted" phase (CR persists as
-  # historical record). Only honored from Pending or
-  # Running. Stamps Conditions[Ready]=False
+  # historical record). Honoured while phase is "", Pending or Running.
+  # Stamps Conditions[Ready]=False
   # reason=UserAborted on completion.
   perNodeLoad:
     - nodeID: k6-gen-1
+      # vus and duration are recorded for the UI only: the script's options
+      # decide the load and the run length.
       vus: 50
       duration: 30s
       scriptConfigMap:
@@ -58,6 +60,15 @@ data:
     };
 
     export default function () {
-      http.get('http://192.168.252.60:31112/function/figlet');
+      http.post('http://10.0.0.5:30080/function/figlet', 'dfaas');
       sleep(1);
+    }
+
+    export function handleSummary(data) {
+      if (__ENV.DFAAS_SUMMARY_URL) {
+        http.put(__ENV.DFAAS_SUMMARY_URL, JSON.stringify(data), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return { stdout: JSON.stringify(data) };
     }

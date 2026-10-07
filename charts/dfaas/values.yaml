@@ -1,5 +1,12 @@
+# Chart values for the DFaaS operator and its UI. The README ("Configuration")
+# describes the ones most installs change.
+#
+# Every image tag defaults to the chart's appVersion. A packaged release has the
+# release number there; a checkout has the placeholder 0.0.0, so set
+# operator.image.tag, operator.exporterImage.tag and ui.image.tag when
+# installing from a checkout.
+
 # Global
-nameOverride: ""
 fullnameOverride: ""
 
 operator:
@@ -30,9 +37,10 @@ operator:
                                   #   upload) for a generator with no management address detected at
                                   #   provisioning (status.k6Nodes[].managementAddress wins when set);
                                   #   default when unset: http://<manager hostIP>:30901. Must be
-                                  #   reachable from those generators — on a lab spread over several
-                                  #   sites, that is the management node's tailnet IP, not a local
-                                  #   bridge address.
+                                  #   reachable from those generators; on a lab spread over several
+                                  #   sites, an address of the management node that every generator
+                                  #   can route to (for example a VPN address), not a local bridge
+                                  #   address.
   nodeSelector: {}
   tolerations: []
   affinity: {}
@@ -52,6 +60,10 @@ ui:
     # NodePort by default: the whole testbed is reached by node IP
     # (prometheus 30090, grafana 30300, seaweedfs 30900/30901) and the UI is
     # the one piece a human has to open. Set type: ClusterIP to opt out.
+    # The UI has no authentication: anyone who reaches this port can read every
+    # Environment, node SSH passwords included, and create or delete
+    # Environments and LoadTests. On an untrusted network use type: ClusterIP
+    # and kubectl port-forward.
     type: NodePort
     port: 8082
     nodePort: 30800          # only honoured when type is NodePort; empty = random
@@ -66,19 +78,20 @@ ui:
     host: dfaas.local
     annotations: {}
     tls: []                       # list of {secretName, hosts: []}
-  env:                            # free-form key→value, each rendered as a container env var
-                                  # PORT is derived from ui.service.port — do not set it here
-    CORS_ORIGINS: ""              # csv; empty = same-origin only
-    # SEAWEEDFS_ENDPOINT: ""      # override gateway→SeaweedFS dial endpoint; default: auto
-                                  #   (in-cluster → seaweedfs-all-in-one.monitoring.svc…:8333, dev → <nodeIP>:30900).
+  env:                            # free-form key/value pairs, each rendered as a container env var
+                                  # PORT is derived from ui.service.port, do not set it here
+    CORS_ORIGINS: ""              # csv; empty = no CORS headers, not a same-origin check (see the UI README)
+    # SEAWEEDFS_ENDPOINT: ""      # override the endpoint the gateway dials for SeaweedFS; default: auto
+                                  #   (in the cluster: seaweedfs-all-in-one.monitoring.svc.cluster.local:8333; outside it: <nodeIP>:30900).
                                   #   Applies to seaweedfs-default only; an external S3 config keeps its own endpoint.
     # SEAWEEDFS_PUBLIC_URL: ""    # base of the asset URL baked into the k6 script; default: <nodeIP>:30900.
                                   #   Applies to seaweedfs-default only. A runner the operator gave
                                   #   DFAAS_ASSET_BASE (its generator's detected management address)
                                   #   fetches from that instead, so this is the fallback: it must be
-                                  #   reachable from generators without a detected address — on a lab
-                                  #   spread over several sites, the management node's tailnet IP, not
-                                  #   a local bridge address.
+                                  #   reachable from generators without a detected address; on a lab
+                                  #   spread over several sites, an address of the management node that
+                                  #   every generator can route to (for example a VPN address), not a
+                                  #   local bridge address.
     # SEAWEEDFS_FILER_PUBLIC_URL: ""
                                   # override the base of the result links shown after a
                                   # LoadTest; default: the host the browser opened the UI on,
@@ -86,15 +99,10 @@ ui:
                                   # is loopback or unusable. Set it behind an Ingress or proxy
                                   # whose host does not expose the NodePorts.
 
-# CRDs ship in the chart's crds/ directory, so `helm install` applies them for
-# you. Helm never touches them again: `helm upgrade` does NOT update a CRD, and
-# `helm uninstall` does NOT remove one. After upgrading to a chart whose schema
-# changed, apply the new definitions by hand:
-#
-#   kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_environments.yaml
-#   kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_loadtests.yaml
-#
-# (Both files are attached to every release, and live in config/crd/bases/ in a
-# repo checkout.)
+# The CRDs ship in crds/; Helm installs them and never upgrades or removes
+# them. Apply the target release's CRDs before helm upgrade: see the Upgrade
+# section of the README.
 
+# Covers the operator and UI pods only. Exporter Jobs and the VMs pull without
+# credentials, so the images and charts must be public.
 imagePullSecrets: []

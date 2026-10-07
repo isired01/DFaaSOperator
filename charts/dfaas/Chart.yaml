@@ -1,16 +1,21 @@
 apiVersion: v2
 name: dfaas
-description: DFaaS — operator (CRDs Environment/LoadTest) + UI control plane
+description: DFaaS operator (Environment and LoadTest CRDs) and its web UI
 type: application
+# version and appVersion are placeholders. release.yml packages the chart with
+# --version and --app-version taken from the git tag, and every image tag below
+# defaults to appVersion. Installing from a checkout therefore needs
+# operator.image.tag, operator.exporterImage.tag and ui.image.tag set.
 version: 0.0.0
 appVersion: "0.0.0"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/isired01/DFaaSOperator
 sources:
   - https://github.com/isired01/DFaaSOperator
-  - https://github.com/isired01/UI
+  - https://github.com/isired01/DFaaS_UI
 maintainers:
-  - name: Isaia
+  - name: Isaia Del Rosso
+    url: https://github.com/isired01
 keywords:
   - dfaas
   - kubernetes-operator

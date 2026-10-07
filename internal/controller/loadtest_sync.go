@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,10 +28,11 @@ import (
 //
 // Remote runners start normally (k6-operator's own starter unpauses them per
 // cluster; that is NOT fought here). The generated script's setup() blocks
-// polling the DFAAS_SYNC_URL every ~250ms, so a runner that is "started" is a
-// runner parked on the barrier. Once EVERY TestRun reports stage "started",
-// the reconciler publishes the GO object on the in-cluster SeaweedFS filer;
-// all setups see it within one poll interval and the VUs start together.
+// polling the DFAAS_SYNC_URL every ~250ms. Once EVERY TestRun reports stage
+// "started", the reconciler publishes the GO object on the in-cluster
+// SeaweedFS filer. k6-operator can report "started" before setup() reaches the
+// barrier (a runner may still be fetching a payload image), so runners may
+// still start seconds apart.
 //
 // The filer is used because it is authless on both sides: the operator PUTs
 // via the in-cluster Service DNS, the k6 VMs GET anonymously via the filer
@@ -46,18 +47,18 @@ const syncWaitBudget = 5 * time.Minute
 // syncPollRequeue is the reconcile cadence while waiting on the barrier.
 const syncPollRequeue = 3 * time.Second
 
-// The filer addressing, the object layout and the HTTP calls all live in
-// internal/syncchannel now; the reconciler reaches them through
-// r.syncChannel(). What stays here is the barrier policy: how long to wait,
-// how often to poll, and what to do when a runner never parks.
+// The filer addressing, the object layout and the HTTP calls live in
+// internal/syncchannel; the reconciler reaches them through r.syncChannel().
+// What stays here is the barrier policy: how long to wait, how often to poll,
+// and what to do when a runner never reaches "started".
 
 // awaitSyncBarrier is the post-dispatch gate for syncStart tests. It polls
-// every remote TestRun until all report stage "started" (runner up and parked
-// on the script barrier), then publishes the GO signal and finishes the
-// dispatch (StartTime + phase Running). Failure policy per user decision:
-// any TestRun in stage "error", or the syncWaitBudget expiring, fails the
+// every remote TestRun until all report stage "started" (k6-operator's stage;
+// the script may not be at the barrier yet), then publishes the GO signal and
+// finishes the dispatch (StartTime + phase Running). Failure policy: any
+// TestRun in stage "error", or the syncWaitBudget expiring, fails the
 // LoadTest; the run end (endRun) deletes every remote TestRun in that same
-// pass, so an unreachable generator no longer blocks the Failed transition.
+// pass, so an unreachable generator does not block the Failed transition.
 func (r *LoadTestReconciler) awaitSyncBarrier(ctx context.Context,
 	lt *dfaasv1.LoadTest, env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)

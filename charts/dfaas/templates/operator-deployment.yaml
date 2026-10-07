@@ -35,7 +35,9 @@ spec:
             # provisioning and no DFAAS_SYNC_PUBLIC_URL (operator.extraEnv).
             # Only those generators dial it, and they must reach it: on a lab
             # spread over several sites, HOST_IP is often a local bridge
-            # address, so set DFAAS_SYNC_PUBLIC_URL to the tailnet IP instead.
+            # address, so set DFAAS_SYNC_PUBLIC_URL to an address of the
+            # management node that every generator can route to (for example a
+            # VPN address) instead.
             - name: HOST_IP
               valueFrom:
                 fieldRef:

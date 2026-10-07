@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,7 +24,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	dfaasv1 "dfaas-operator/api/v1"
-	"dfaas-operator/internal/controller/ansible"
 	"dfaas-operator/internal/controller/monitoring"
 	"dfaas-operator/internal/controller/statuswriter"
 	"dfaas-operator/internal/reach"
@@ -35,8 +34,9 @@ const environmentFinalizer = "dfaas.dfaas.io/environment-finalizer"
 // EnvironmentReconciler owns the Environment CRD lifecycle: it walks the
 // infrastructure FSM (ProvisioningVMs → ProvisioningInfra → ProvisioningMonitoring
 // → Ready) by delegating each phase to the helpers in the ansible/ and
-// monitoring/ subpackages. Once an Environment is Ready it stays idle until
-// the spec changes (detected via generation drift).
+// monitoring/ subpackages. Once Ready it re-probes every node on :22 each minute
+// (reconcileReadyHealth, which can move it to Unreachable) and re-provisions
+// when the spec changes (generation drift).
 type EnvironmentReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
@@ -77,7 +77,7 @@ func (r *EnvironmentReconciler) monitoringStack() monitoring.Stack {
 	if r.Monitoring != nil {
 		return r.Monitoring
 	}
-	return &monitoring.Manager{Client: r.Client, Scheme: r.Scheme}
+	return &monitoring.Manager{Client: r.Client}
 }
 
 // prober is the nil-safe accessor for Prober.
@@ -116,19 +116,6 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// Seed the provisioning snapshot for an Environment that settled before this
-	// operator version started recording one. A settled Environment is, by the
-	// FSM's own invariant, installed exactly as spec.nodes describes, so the
-	// spec is a faithful record — and without this seed the FIRST node removal
-	// after an operator upgrade has nothing to diff against and silently leaves
-	// a live machine running k3s and the dfaas-agent. Never clobbers: a real
-	// snapshot knows more than the current spec does.
-	if env.Status.ObservedGeneration > 0 && env.Status.ObservedGeneration == env.Generation &&
-		meta.IsStatusConditionTrue(env.Status.Conditions, dfaasv1.EnvCondInfrastructureReady) {
-		am := &ansible.Manager{Client: r.Client, Scheme: r.Scheme}
-		logStatusErr(ctx, "seed provisioning snapshot", am.SaveSnapshotIfAbsent(ctx, &env))
-	}
-
 	if env.Status.Phase == dfaasv1.EnvReady &&
 		env.Status.ObservedGeneration == env.Generation {
 		// Re-assert this Environment's Prometheus target file on every Ready
@@ -137,22 +124,23 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// here. ReconcileTargets writes nothing when the file is current.
 		logStatusErr(ctx, "reconcile Prometheus targets", r.monitoringStack().ReconcileTargets(ctx, &env))
 
-		// No longer idle while Ready: run a periodic SSH liveness probe so a
-		// node that dies after provisioning is noticed instead of only
-		// surfacing when a test fails against it.
+		// While Ready, run a periodic SSH liveness probe so a node that dies
+		// after provisioning is noticed instead of only surfacing when a test
+		// fails against it.
 		return r.reconcileReadyHealth(ctx, &env)
 	}
 
-	// Generation drift: spec was edited after a settled run. Restart the FSM
-	// from ProvisioningVMs (see handleGenerationDrift). Done in one place so the
-	// stale-Job cleanup runs once per drift, not on every reconcile of the
-	// subsequent re-provisioning window.
+	// Generation drift: the spec was edited after the run that is installed or
+	// in progress. Restart the FSM from ProvisioningVMs (see
+	// handleGenerationDrift). Done in one place so the stale-Job cleanup runs
+	// once per drift, not on every reconcile of the subsequent re-provisioning
+	// window.
 	if handled, res, err := r.handleGenerationDrift(ctx, &env); handled || err != nil {
 		return res, err
 	}
 
 	switch env.Status.Phase {
-	case "", dfaasv1.EnvIdle:
+	case "":
 		return r.phase(ctx, &env, dfaasv1.EnvProvisioningVMs)
 	case dfaasv1.EnvProvisioningVMs:
 		return r.reconcileProvisioningVMs(ctx, &env)
@@ -186,11 +174,12 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{}, nil
 }
 
-// handleGenerationDrift detects a spec edit applied after a settled run
-// (observedGeneration older than the current generation) and restarts the FSM:
-// it deletes stale-generation Ansible Jobs, resets the transient Conditions, and
-// moves the phase back to ProvisioningVMs. Returns handled=true when it took over
-// the reconcile — the caller must return res/err immediately.
+// handleGenerationDrift detects a spec edit (generation ahead of
+// observedGeneration in a settled phase, of provisioningGeneration otherwise)
+// and restarts the FSM: it deletes stale-generation Ansible Jobs, resets the
+// transient Conditions, and moves the phase back to ProvisioningVMs. Returns
+// handled=true when it took over the reconcile — the caller must return
+// res/err immediately.
 //
 // One rule for every phase: drift mid-provisioning (or while Unreachable)
 // restarts the run too, so an edit that lands after the Ansible Jobs ran is
@@ -213,7 +202,7 @@ func (r *EnvironmentReconciler) handleGenerationDrift(ctx context.Context,
 	logger := log.FromContext(ctx)
 	logger.Info("generation drift detected — restarting provisioning",
 		"phase", env.Status.Phase,
-		"observed", env.Status.ObservedGeneration, "current", env.Generation)
+		"recorded", recorded, "current", env.Generation)
 	if _, cerr := r.cleanupStaleGenJobs(ctx, env); cerr != nil {
 		logger.Error(cerr, "stale-gen Job cleanup failed")
 	}
@@ -260,7 +249,9 @@ func (r *EnvironmentReconciler) writer() statuswriter.Writer[*dfaasv1.Environmen
 }
 
 // budget builds one named Retry counter with its ceiling. The counters stay
-// generation-scoped (ADR-0003); Budget owns only the policy on top.
+// generation-scoped (ADR-0003,
+// docs/adr/0003-all-retry-counters-generation-scoped.md); Budget owns only the
+// policy on top.
 func (r *EnvironmentReconciler) budget(counter string, limit int) statuswriter.Budget[*dfaasv1.Environment, dfaasv1.EnvironmentPhase] {
 	return statuswriter.Budget[*dfaasv1.Environment, dfaasv1.EnvironmentPhase]{
 		Writer: r.writer(), Counter: counter, Limit: limit,
@@ -303,7 +294,7 @@ func stampEnvAggregate(env *dfaasv1.Environment, phase dfaasv1.EnvironmentPhase)
 		status = metav1.ConditionFalse
 		reason = dfaasv1.EnvReasonSSHUnreachable
 		message = "nodes unreachable via SSH; retrying automatically — see the NodesReachable / VMsReady condition"
-	case "", dfaasv1.EnvIdle:
+	case "":
 		status = metav1.ConditionUnknown
 		reason = dfaasv1.EnvReasonInitializing
 		message = "awaiting first reconcile"

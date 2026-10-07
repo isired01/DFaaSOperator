@@ -126,10 +126,7 @@ func TestEnsureMonitoringOutcomes(t *testing.T) {
 				seedCounter(t, c, env, monitoringAttemptsAnnotation, tc.priorFailures)
 			}
 
-			done, failed, err := r.ensureMonitoring(context.Background(), env)
-			if err != nil {
-				t.Fatalf("ensureMonitoring: %v", err)
-			}
+			done, failed := r.ensureMonitoring(context.Background(), env)
 			if done != tc.wantDone {
 				t.Errorf("done: want %v, got %v", tc.wantDone, done)
 			}
@@ -163,9 +160,7 @@ func TestEnsureMonitoringDoesNotCheckAfterAFailedDeploy(t *testing.T) {
 	stack := &monfake.Stack{DeployErrs: []error{errors.New("helm: no such host")}}
 	r := &EnvironmentReconciler{Client: c, Monitoring: stack}
 
-	if _, _, err := r.ensureMonitoring(context.Background(), env); err != nil {
-		t.Fatalf("ensureMonitoring: %v", err)
-	}
+	r.ensureMonitoring(context.Background(), env)
 	if stack.Checks() != 0 {
 		t.Errorf("Check was called %d times after a failed Deploy", stack.Checks())
 	}

@@ -5,14 +5,33 @@ UI namespace       : {{ .Values.ui.namespace }}
 Chart version      : {{ .Chart.Version }}
 App version        : {{ .Chart.AppVersion }}
 
-The CRDs (Environment, LoadTest) ship in the chart and were applied by this
-install. Helm never upgrades a CRD, so after moving to a chart whose schema
-changed, apply the new definitions yourself:
+The CRDs (Environment, LoadTest) ship in the chart's crds/ directory.
+{{- if .Release.IsInstall }}
+They were applied by this install.
+{{- end }}
+Helm never upgrades a CRD. Apply the target release's CRDs first, then run
+helm upgrade (the Upgrade section of the README has the details):
+{{- if eq .Chart.Version "0.0.0" }}
 
-  kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v{{ .Chart.AppVersion }}/dfaas.dfaas.io_environments.yaml
-  kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v{{ .Chart.AppVersion }}/dfaas.dfaas.io_loadtests.yaml
+  kubectl apply -f charts/dfaas/crds/
+{{- else }}
+
+  helm pull oci://ghcr.io/isired01/charts/dfaas --version {{ .Chart.Version }} \
+    --untar --untardir /tmp/dfaas-{{ .Chart.Version }}
+  kubectl apply -f /tmp/dfaas-{{ .Chart.Version }}/dfaas/crds/
+
+  helm upgrade {{ .Release.Name }} oci://ghcr.io/isired01/charts/dfaas --version {{ .Chart.Version }} \
+    --namespace {{ .Release.Namespace }}
+{{- end }}
 
 {{- if .Values.ui.enabled }}
+
+The UI has no authentication: anyone who reaches it can read every Environment,
+node SSH passwords included, and create or delete Environments and LoadTests.
+{{- if eq .Values.ui.service.type "NodePort" }}
+Keep it on a trusted network, or install with --set ui.service.type=ClusterIP
+and use kubectl port-forward.
+{{- end }}
 
 Open the UI:
 {{- if eq .Values.ui.service.type "NodePort" }}

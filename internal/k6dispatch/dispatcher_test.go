@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -86,7 +86,7 @@ func TestParseManagementAddress(t *testing.T) {
 		wantOK bool
 	}{
 		{"100.64.0.11", "100.64.0.11", true},
-		{"  192.168.252.63\n", "192.168.252.63", true},
+		{"  192.0.2.63\n", "192.0.2.63", true},
 		{"fd7a:115c:a1e0::11", "fd7a:115c:a1e0::11", true},
 		{"FD7A:115C:A1E0:0:0:0:0:11", "fd7a:115c:a1e0::11", true}, // canonical spelling
 		{"::ffff:100.64.0.11", "100.64.0.11", true},               // v4-mapped, unmapped

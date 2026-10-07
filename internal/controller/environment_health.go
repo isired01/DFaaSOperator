@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -57,9 +57,8 @@ const healthMissesAnnotation = "dfaas.dfaas.io/health-misses"
 const unreachableRetryInterval = 30 * time.Second
 
 // reconcileReadyHealth runs the periodic SSH (:22) liveness probe while an
-// Environment is Ready. It replaces the old idle short-circuit: a node that
-// dies after provisioning is now noticed within ~3 minutes instead of only
-// when a test fails against it.
+// Environment is Ready: a node that dies after provisioning is noticed within
+// ~3 minutes instead of only when a test fails against it.
 //
 // Cadence is driven entirely by the returned RequeueAfter (60s healthy, 20s
 // while confirming a miss). The reconciler advances its own FSM by
@@ -77,10 +76,6 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	if len(env.Spec.Nodes) == 0 {
-		return ctrl.Result{RequeueAfter: healthCheckInterval}, nil
-	}
-
 	// Throttle against our own status writes.
 	due := healthCheckInterval
 	if c := meta.FindStatusCondition(env.Status.Conditions, dfaasv1.EnvCondNodesReachable); c != nil &&
@@ -95,7 +90,7 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 
 	if len(unreachable) == 0 {
 		if rerr := r.budget(healthMissesAnnotation, healthRetryBudget).Clear(ctx, env); rerr != nil {
-			logger.Error(rerr, "resetHealthMisses failed; non-fatal")
+			logger.Error(rerr, "health-misses counter reset failed; non-fatal")
 		}
 		if err := r.markNodesReachable(ctx, env); err != nil {
 			logger.Error(err, "stamp NodesReachable=True failed; retrying")
@@ -106,7 +101,7 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 	budget := r.budget(healthMissesAnnotation, healthRetryBudget)
 	outcome, bumpErr := budget.Attempt(ctx, env)
 	if bumpErr != nil {
-		logger.Error(bumpErr, "bumpHealthMisses failed; the budget cannot advance")
+		logger.Error(bumpErr, "health-misses counter write failed; the budget cannot advance")
 	}
 	if r.Recorder != nil {
 		r.Recorder.Eventf(env, corev1.EventTypeWarning, dfaasv1.EnvReasonSSHUnreachable,
@@ -122,8 +117,8 @@ func (r *EnvironmentReconciler) reconcileReadyHealth(ctx context.Context,
 	}
 	logger.Info("Ready environment nodes unreachable; will retry",
 		"nodes", unreachable, "attempts", outcome.Count)
-	// budget.Attempts renders "?/3" when the counter could not be written --
-	// this message used to say "attempt 0/3", which reads as a measurement.
+	// budget.Attempts renders "?/3" when the counter could not be written,
+	// never "0/3", which would read as a measurement.
 	logStatusErr(ctx, "mark NodesReachable=False (retrying)", r.markNodesUnreachable(ctx, env,
 		fmt.Sprintf("SSH :22 dial failed for %v (attempt %s)", unreachable, budget.Attempts(outcome))))
 	return ctrl.Result{RequeueAfter: healthRetryInterval}, nil
@@ -162,10 +157,10 @@ func (r *EnvironmentReconciler) reconcileUnreachable(ctx context.Context,
 	// All nodes answer again. Clear both unreachable counters (no-op when zero)
 	// and pick the recovery target.
 	if rerr := r.budget(healthMissesAnnotation, healthRetryBudget).Clear(ctx, env); rerr != nil {
-		logger.Error(rerr, "resetHealthMisses failed; non-fatal")
+		logger.Error(rerr, "health-misses counter reset failed; non-fatal")
 	}
 	if rerr := r.budget(sshAttemptsAnnotation, sshRetryBudget).Clear(ctx, env); rerr != nil {
-		logger.Error(rerr, "resetSSHAttempts failed; non-fatal")
+		logger.Error(rerr, "ssh-attempts counter reset failed; non-fatal")
 	}
 
 	// Recover to Ready only when the infra is already up AND the spec hasn't
@@ -186,9 +181,6 @@ func (r *EnvironmentReconciler) reconcileUnreachable(ctx context.Context,
 	return r.phase(ctx, env, dfaasv1.EnvProvisioningInfra)
 }
 
-// markNodesReachable stamps NodesReachable=True and refreshes lastHealthCheck
-// in a single status update (one write per healthy round → one re-enqueue,
-// caught by the throttle).
 // probeThrottle reports how long to wait before the next SSH probe, 0 when one
 // is due now.
 //
@@ -229,6 +221,9 @@ func (r *EnvironmentReconciler) probeThrottle(ctx context.Context,
 	return remaining(fresh.Status.LastHealthCheck)
 }
 
+// markNodesReachable stamps NodesReachable=True and refreshes lastHealthCheck
+// in a single status update (one write per healthy round → one re-enqueue,
+// caught by the throttle).
 func (r *EnvironmentReconciler) markNodesReachable(ctx context.Context,
 	env *dfaasv1.Environment) error {
 	return r.writer().Record(ctx, env, envTransition{Touch: func(latest *dfaasv1.Environment) error {

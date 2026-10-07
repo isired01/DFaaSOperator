@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,12 +32,10 @@ import (
 
 // Run end: the one place a LoadTest reaches Completed, Failed or Aborted.
 //
-// Every exit used to write its terminal phase on its own, and only the Sync
-// barrier tore the remote TestRuns down first. A Failed test could therefore
-// leave runners loading the DFaaS nodes while Occupancy freed the Environment
-// for the next queued test. endRun owns that rule for every outcome: which
-// runners may still be live, which generators to sweep, what the end-of-run
-// Conditions say, and that all of it is one status write.
+// endRun owns, for every outcome, which runners may still be live, which
+// generators to sweep, what the end-of-run Conditions say, and that all of it
+// is one status write. A Failed test must not leave runners loading the DFaaS
+// nodes while Occupancy frees the Environment for the next queued test.
 //
 // The teardown is one bounded pass: the terminal phase is written in the same
 // pass whatever the remote answers, so nothing can wedge a run end. A Delete
@@ -219,7 +217,7 @@ func (r *LoadTestReconciler) reclaimRunners(ctx context.Context, lt *dfaasv1.Loa
 // teardownRemoteTestRuns issues one Delete per target generator (the union of
 // status.testRuns and spec.perNodeLoad, which catches partial-dispatch races)
 // and sorts every target into absent, held or unconfirmed.
-// ponytail: an unusable generator (no kubeconfig) is named, never held --
+// Known limitation: an unusable generator (no kubeconfig) is named, never held --
 // nothing can reach it, so no retry could release the hold; a runner on a
 // generator removed from the Environment keeps loading until its script ends.
 // An Apply that landed while its TestRunRef failed to persist is not held.
@@ -292,7 +290,7 @@ func endRestamps(lt *dfaasv1.LoadTest, p dfaasv1.LoadTestPhase, endReason string
 // retryReclaim re-sweeps a terminal test that still holds its Environment.
 // Still unreclaimed: no write, try again later. Otherwise one write of the new
 // K6Healthy verdict releases the queue.
-// ponytail: paced at remoteRetryInterval (like any failed remote round), so a
+// Known limitation: paced at remoteRetryInterval (like any failed remote round), so a
 // dead k3s API stalls the single LoadTest worker for at most one remote
 // timeout per generator per interval.
 func (r *LoadTestReconciler) retryReclaim(ctx context.Context, lt *dfaasv1.LoadTest) (ctrl.Result, error) {

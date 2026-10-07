@@ -13,10 +13,10 @@
     # --- Version pins (reproducibility) ---
     # Each defaults to empty = current behavior (install the latest available).
     # Set a value to pin that artifact so two provisioning runs build the
-    # identical software stack — recommended for reproducible thesis experiments.
+    # identical software stack — recommended for a reproducible experiment campaign.
     # These are the single place to pin; edit the operator image / re-provision
     # (spec edit → generation drift) to apply changes.
-    # ponytail: latest-by-default keeps existing behavior; pin per your validated versions.
+    # Latest-by-default keeps existing behavior; pin per your validated versions.
     k3s_version: ""               # e.g. "v1.30.4+k3s1"; empty = latest stable channel
     helm_version: ""              # e.g. "v3.15.4"; empty = latest (get-helm-3)
     haproxy_chart_version: ""     # haproxytech/haproxy; empty = latest
@@ -46,8 +46,8 @@
     # The install tasks below are guarded on `stat /usr/local/bin/k3s`, so once
     # this block has run they reinstall k3s with THIS role's flags.
     #
-    # ponytail: duplicated verbatim in the twin playbook. Factoring it into an
-    # included tasks file needs Go plumbing, because EnsurePlaybookConfigMap
+    # Duplicated on purpose: verbatim in the twin playbook. Factoring it into an
+    # included tasks file needs Go plumbing, because ensurePlaybookConfigMap
     # (ansible/config.go) ships only the one playbook for the role being run.
     - name: Check for a recorded role marker
       ansible.builtin.stat:
@@ -174,7 +174,7 @@
     # The dfaas-agent publishes AGENT_NODE_IP to its peers as "forward requests
     # here", and the chart fills that from the kubelet's registered node IP. With
     # no --node-ip k3s picks the default-route address, which on a federation
-    # spanning sites is the site-local one (e.g. a 192.168.252.x lab VM) and is
+    # spanning sites is the site-local one (e.g. a 192.168.1.x LAN address) and is
     # unroutable from the other sites — the mesh can form and offloading still
     # fails. {{ ansible_host }} is by definition the address the operator itself
     # reaches this node on, so it is the right thing to advertise.
@@ -466,12 +466,13 @@
             # Retry the bootstrap dial every 5s until the listed peers answer.
             # Workers are provisioned in PARALLEL, so a non-seed agent routinely
             # starts before its predecessors' agents exist; with FORCE=false the
-            # agent's retry loop has no delay at all (kademlia.go: it logs the
-            # error and immediately re-dials), so a peer that is not up yet
-            # means a hot spin logging one failure per iteration, and no peer
-            # ever appears because Kademlia discovery is dead in this build (the
-            # agent registers no /ipfs/kad/1.0.0 handler, so every routing table
-            # stays empty). Trade-off: if a listed peer is permanently down the
+            # agent's retry loop has no delay at all (see dfaasagent/agent/
+            # discovery/kademlia/kademlia.go in github.com/unimib-datAI/dfaas:
+            # it logs the error and immediately re-dials), so a peer that is not
+            # up yet means a hot spin logging one failure per iteration, and no
+            # peer ever appears because Kademlia discovery yields no dialable
+            # peer (the agent announces only its pod address; see buildInventory
+            # in job.go). Trade-off: if a listed peer is permanently down the
             # pod stays in init rather than running solo, which is the honest
             # state for a node that cannot federate.
             AGENT_BOOTSTRAP_FORCE: "{{ 'true' if is_bootstrap | bool else 'false' }}"
@@ -495,7 +496,8 @@
             AGENT_DATAPLANEAPI_PASSWORD: "admin"
             # Port a node uses to reach a NEIGHBOUR's HAProxy. The default 80
             # is the cluster-internal port: from outside the NodePort is
-            # required. randomstrategy.go carries a FIXME on exactly this.
+            # required. dfaasagent/agent/loadbalancer/randomstrategy.go in
+            # github.com/unimib-datAI/dfaas carries a FIXME on exactly this.
             AGENT_HAPROXY_PORT: "30080"
             # The random template always emits "server rejector": if the host
             # does not resolve, HAProxy refuses to load the configuration. With

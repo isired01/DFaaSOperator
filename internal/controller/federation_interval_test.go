@@ -6,7 +6,7 @@ import (
 	"dfaas-operator/internal/controller/monitoring"
 )
 
-// The cool-down is a fixed minute, by the author's decision, while the
+// The cool-down is a fixed minute on purpose, while the
 // federation interval is read from the embedded Prometheus values. The minute
 // has to cover what the export needs from federation: one interval for the
 // last pull inside the k6 window, one for the pull that lands after EndTime

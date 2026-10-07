@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@ const libp2pBootstrapPort = 31600
 // `curl | sh` install) never fails its pod, so BackoffLimit never trips and the
 // Environment FSM waits on Job completion indefinitely. 30 min is generous for a
 // full k3s + Helm + OpenFaaS install.
-// ponytail: fixed ceiling; lift it if provisioning legitimately runs longer.
+// Known limitation: fixed ceiling; lift it if provisioning legitimately runs longer.
 const ansibleJobDeadlineSeconds int64 = 1800
 
 // CreateJobForRole builds an Ansible Job + inventory Secret for the subset of
@@ -200,23 +200,25 @@ func buildInventory(env *dfaasv1.Environment, spec roles.Spec,
 			peerID := peerIDs[i]
 
 			// The bootstrap list IS the federation topology, permanently. The
-			// agent dials it once, in kademlia.Initialize, and the Kademlia
-			// discovery meant to complete the mesh afterwards never returns a
-			// peer: the agent announces only its pod address (10.42.0.0/24 —
-			// the SAME subnet on every single-node k3s), so a peer learned
-			// through the DHT would be undialable anyway. Measured 2026-09-09
-			// on env `lab`: the seed advertised no /ipfs/kad/1.0.0 protocol at
-			// all, every node's routing table was empty, and not one agent had
-			// ever logged "Found a new peer" — with only the seed's address in
-			// the list the result was a star (seed 4 conns, everyone else 1),
-			// decaying to 0 peers on each node whose single link dropped.
+			// agent dials it once, in Initialize (dfaasagent/agent/discovery/
+			// kademlia/kademlia.go in github.com/unimib-datAI/dfaas), and the
+			// Kademlia discovery meant to complete the mesh afterwards never
+			// returns a peer: the agent announces only its pod address
+			// (10.42.0.0/24 — the SAME subnet on every single-node k3s), so a
+			// peer learned through the DHT would be undialable anyway. On a
+			// five-node Environment the seed advertised no /ipfs/kad/1.0.0
+			// protocol at all, every node's routing table was empty, and no
+			// agent ever logged "Found a new peer". With only the seed's
+			// address in the list the result was a star (seed 4 conns,
+			// everyone else 1), decaying to 0 peers on each node whose single
+			// link dropped.
 			//
 			// So list nodes 0..i-1 for node i: every pair is dialed exactly
 			// once (a full mesh), and no node ever waits on a node that is
 			// waiting on it, which matters because AGENT_BOOTSTRAP_FORCE
 			// blocks Initialize until every listed peer answers. Comma
 			// separated: the agent parses the env var with viper into
-			// []string, which splits on commas. Verified live: node l3 given
+			// []string, which splits on commas. Verified live: a node given
 			// all four addresses reached 4/4 peers in 400ms.
 			var addrs []string
 			for j := 0; j < i; j++ {

@@ -60,8 +60,7 @@ s3:
       secretKey: reader123
 
 allInOne:
-  # One process: master + volume + filer + S3 gateway, one PVC, one pod. Same
-  # topology the operator used to server-side-apply as a raw manifest.
+  # One process: master + volume + filer + S3 gateway, one PVC, one pod.
   enabled: true
   s3:
     enabled: true

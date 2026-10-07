@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -45,7 +45,7 @@ func TestEnvironmentPhaseDispatchable(t *testing.T) {
 	// dropped because no reconcile path ever produced it. The gateway mirrors
 	// this set, so it must not be looser either.
 	dispatchable := map[EnvironmentPhase]bool{
-		"": false, EnvIdle: false, EnvProvisioningVMs: false, EnvProvisioningInfra: false,
+		"": false, EnvProvisioningVMs: false, EnvProvisioningInfra: false,
 		EnvProvisioningMonitoring: false, EnvReady: true, EnvFailed: false, EnvUnreachable: false,
 	}
 	classify(t, "Dispatchable", dispatchable, phasesOf[EnvironmentPhase](t, "EnvironmentPhase"),

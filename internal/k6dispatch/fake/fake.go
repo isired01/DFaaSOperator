@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,10 +28,9 @@ import (
 
 // Applied records one Node.Apply call.
 type Applied struct {
-	NodeID  string
-	Name    string
-	PerNode dfaasv1.PerNodeLoad
-	Env     k6dispatch.RunnerEnv
+	NodeID string
+	Name   string
+	Env    k6dispatch.RunnerEnv
 }
 
 // Fleet implements k6dispatch.Dispatcher.
@@ -214,7 +213,7 @@ func (n *node) DeleteScript(_ context.Context, lt *dfaasv1.LoadTest, name string
 	return nil
 }
 
-func (n *node) Apply(_ context.Context, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad, env k6dispatch.RunnerEnv) error {
+func (n *node) Apply(_ context.Context, lt *dfaasv1.LoadTest, _ dfaasv1.PerNodeLoad, env k6dispatch.RunnerEnv) error {
 	n.f.mu.Lock()
 	defer n.f.mu.Unlock()
 	n.f.calls = append(n.f.calls, "apply:"+n.nodeID)
@@ -222,7 +221,7 @@ func (n *node) Apply(_ context.Context, lt *dfaasv1.LoadTest, perNode dfaasv1.Pe
 		return err
 	}
 	k := key(n.nodeID, lt)
-	n.f.applied = append(n.f.applied, Applied{NodeID: n.nodeID, Name: k6dispatch.TestRunName(lt, n.nodeID), PerNode: perNode, Env: env})
+	n.f.applied = append(n.f.applied, Applied{NodeID: n.nodeID, Name: k6dispatch.TestRunName(lt, n.nodeID), Env: env})
 	if _, ok := n.f.stages[k]; !ok {
 		n.f.stages[k] = "created"
 	}

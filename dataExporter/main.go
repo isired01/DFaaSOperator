@@ -38,7 +38,7 @@ type MetricEntry struct {
 
 // summarySource mirrors the operator's k6SummarySource: one filer URL per k6
 // node, JSON-encoded into K6_SUMMARY_SOURCES. URLs are composed operator-side
-// (they embed the operator's sanitize(nodeID)) — never rebuild them here.
+// (they embed k6dispatch.Sanitize(nodeID)) — never rebuild them here.
 type summarySource struct {
 	NodeID string `json:"nodeId"`
 	URL    string `json:"url"`
@@ -128,7 +128,7 @@ type queryResult struct {
 	err      error
 }
 
-// series and samples are what CSV B reports for this entry.
+// series and samples are what the query-status CSV reports for this entry.
 func (r queryResult) series() int { return len(r.matrix) }
 
 func (r queryResult) samples() int {
@@ -179,9 +179,10 @@ func labelColumns(names []string) map[string]string {
 	return cols
 }
 
-// buildMetricsCSV renders CSV A: one row per (series, sample), one column per
-// label seen anywhere in the run. Returns the bytes and the number of data
-// rows, which is what decides whether the export counts as empty.
+// buildMetricsCSV renders the metrics CSV (metrics/<lt>/<stamp>.csv): one row
+// per (series, sample), one column per label seen anywhere in the run. Returns
+// the bytes and the number of data rows, which is what decides whether the
+// export counts as empty.
 func buildMetricsCSV(loadtest string, results []queryResult) ([]byte, int) {
 	seen := map[string]bool{}
 	for _, r := range results {
@@ -239,7 +240,7 @@ func buildMetricsCSV(loadtest string, results []queryResult) ([]byte, int) {
 	return buf.Bytes(), rows
 }
 
-// buildQueryStatusCSV renders CSV B: the outcome of every entry in
+// buildQueryStatusCSV renders the query-status CSV: the outcome of every entry in
 // spec.metricsExport.metrics, including the ones that worked. Without it a
 // query that matches nothing is indistinguishable from a metric the workers
 // never emitted, and both are invisible until a figure comes out empty.
@@ -265,15 +266,15 @@ func buildQueryStatusCSV(loadtest string, results []queryResult) []byte {
 	return buf.Bytes()
 }
 
-// k6MetaMetric marks the roster rows of CSV C: one per Generator the operator
-// told us to expect, value 1 when its summary arrived and 0 when it did not.
-// Without it a node that never answered is simply absent from the file, which
+// k6MetaMetric marks the roster rows of the k6 summary CSV: one per Generator
+// the operator told us to expect, value 1 when its summary arrived and 0 when it
+// did not. Without it a node that never answered is simply absent from the file, which
 // reads exactly like a node that ran and measured nothing.
 const k6MetaMetric = "dfaas_summary_fetched"
 
-// buildK6CSV renders CSV C. Metric and stat are separate columns (so
-// df[df.stat=="p95"] works across every metric), the k6 type is kept, and the
-// window replaces the END_TIME the old rows wore as a pseudo-timestamp.
+// buildK6CSV renders the k6 summary CSV. Metric and stat are separate columns
+// (so df[df.stat=="p95"] works across every metric), the k6 type is kept, and
+// the test window is carried in the window_start and window_end columns.
 func buildK6CSV(cfg Config, byNode map[string]k6Summary, notes map[string]string) []byte {
 	var buf bytes.Buffer
 	w := csv.NewWriter(&buf)
@@ -363,9 +364,8 @@ func newSink(ctx context.Context, cfg S3Config) (Sink, error) {
 	return NewS3Sink(ctx, cfg)
 }
 
-// Querier is the metrics source. The concrete Prometheus client is a struct
-// with no interface, built inside main from an env var, which is why the query
-// loop and the CSV layout below were unreachable by any test.
+// Querier is the metrics source: the interface lets tests replace the
+// Prometheus client.
 type Querier interface {
 	// Range runs one range query. Prometheus warnings come back separately:
 	// they are not errors, but they explain a partial or truncated result.
@@ -430,8 +430,8 @@ func run(ctx context.Context, cfg Config, q Querier, sink Sink) (int, error) {
 		fmt.Printf("metrics export: %d/%d queries failed\n", errored, attempted)
 	}
 
-	// CSV B first, and never fatal: it is what names the query that failed on
-	// the run where the next check ends the Job.
+	// The query-status CSV first, and never fatal: it is what names the query
+	// that failed on the run where the next check ends the Job.
 	if err := sink.Put(ctx, Artifact{
 		Key:         queryStatusKeyFor(cfg.LoadTestName, cfg.Stamp()),
 		Label:       "QUERY STATUS",
@@ -466,7 +466,7 @@ func run(ctx context.Context, cfg Config, q Querier, sink Sink) (int, error) {
 	}
 
 	// Everything below is per-Generator: a failure warns and the run goes on.
-	// CSV C is written even with no Generators at all — a header-only file
+	// The k6 summary CSV is written even with no Generators at all — a header-only file
 	// keeps a glob honest, while an absent one looks like a lost upload.
 	byNode, summaryRaw, notes := fetchSummaries(ctx, cfg.Summaries)
 	fmt.Printf("k6 summaries: %d/%d nodes fetched\n", len(byNode), len(cfg.Summaries))
@@ -541,8 +541,7 @@ func shipK6Logs(ctx context.Context, cfg Config, sink Sink) {
 }
 
 // ensureBucket runs HeadBucket and, when the bucket is missing, CreateBucket.
-// Called once per run, from NewS3Sink -- the old per-upload memo existed only
-// because every upload redid the probe.
+// Called once per run, from NewS3Sink.
 func ensureBucket(ctx context.Context, client *s3.Client, bucket, region string) error {
 	// HeadBucket. NotFound (404 / *types.NotFound) → try to create.
 	_, err := client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)})

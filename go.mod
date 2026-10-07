@@ -1,11 +1,10 @@
 module dfaas-operator
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/go-logr/logr v1.4.3
 	github.com/libp2p/go-libp2p v0.22.0
-	github.com/libp2p/go-libp2p-core v0.20.1
 	github.com/onsi/ginkgo/v2 v2.14.0
 	github.com/onsi/gomega v1.30.0
 	helm.sh/helm/v3 v3.14.4
@@ -183,21 +182,5 @@ require (
 replace golang.org/x/sync => golang.org/x/sync v0.7.0
 
 replace golang.org/x/tools => golang.org/x/tools v0.21.0
-
-replace helm.sh/helm/v3 => helm.sh/helm/v3 v3.14.4
-
-replace k8s.io/api => k8s.io/api v0.29.2
-
-replace k8s.io/apimachinery => k8s.io/apimachinery v0.29.2
-
-replace k8s.io/client-go => k8s.io/client-go v0.29.2
-
-replace k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.29.2
-
-replace k8s.io/cli-runtime => k8s.io/cli-runtime v0.29.2
-
-replace k8s.io/apiserver => k8s.io/apiserver v0.29.2
-
-replace k8s.io/component-base => k8s.io/component-base v0.29.2
 
 replace k8s.io/kubectl => k8s.io/kubectl v0.29.2

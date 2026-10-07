@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -114,14 +114,5 @@ var _ = Describe("Ready-state SSH health check", func() {
 		Expect(k8sClient.Get(ctx, key, afterSecond)).To(Succeed())
 		_, count2 := statuswriter.ParseCounter(afterSecond.Annotations[healthMissesAnnotation])
 		Expect(count2).To(Equal(1))
-	})
-
-	It("skips probing and requeues at the health interval when no nodes are declared", func() {
-		// Build (do not persist) a node-less env: reconcileReadyHealth returns
-		// before any client call in that case.
-		empty := &dfaasv1.Environment{Spec: dfaasv1.EnvironmentSpec{}}
-		res, err := reconciler.reconcileReadyHealth(ctx, empty)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(res.RequeueAfter).To(Equal(healthCheckInterval))
 	})
 })

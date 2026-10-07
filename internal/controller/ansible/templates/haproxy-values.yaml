@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Derived from unimib-datAI/dfaas k8s/charts/values-haproxy.yaml (The DFaaS Authors)
 
 image:
   image: docker.io/haproxytech/haproxy-alpine
@@ -12,7 +14,7 @@ config: |
     master-worker
 
     # Enable Runtime API. This allows Data Plane API to make some changes
-    # without requiding a reload. We expose the socket as TCP rather than UNIX
+    # without requiring a reload. We expose the socket as TCP rather than UNIX
     # socket to allow Data Plane API to be in a different container than the
     # proxy.
     #
@@ -21,7 +23,7 @@ config: |
     stats socket ipv4@*:6666 mode 660 level admin expose-fd listeners
     log stdout format raw local0
 
-  # An user is required by Dataplane API to work.
+  # A user is required by Dataplane API to work.
   userlist dataplaneapi
     user admin insecure-password admin
 
@@ -94,14 +96,12 @@ args:
 service:
   type: NodePort
 
-  # Let Prometheus to automatically scrape HAProxy metrics.
+  # Let Prometheus automatically scrape HAProxy metrics.
   # See: https://github.com/prometheus-community/helm-charts/tree/main/charts/prometheus#scraping-pod-metrics-via-annotations
   annotations:
     prometheus.io/scrape: "true"
     prometheus.io/port: "8405"
 
-  # We do not intend to expose the Prometheus port, but Kubernetes will still
-  # map it to a random node port regardless.
   # Every published port is pinned, including the ones nothing consumes. An
   # unpinned port gets a random number from the NodePort range, and the range
   # contains 31600 -- the FIXED port of the dfaas-agent's kademlia Service,

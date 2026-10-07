@@ -13,11 +13,11 @@ spec:
   #   name: example-s3
   nodes:
     - nodeID: dfaas-worker-1
-      ipAddress: 192.168.252.60
+      ipAddress: 10.0.0.5   # replace with the DFaaS node VM's address
       role: dfaas-worker
       capacity: MEDIUM
-      username: isaia
-      password: root
+      username: ubuntu
+      password: CHANGE_ME
       balancingStrategy: alllocalstrategy
       functions:
         - name: figlet
@@ -26,13 +26,8 @@ spec:
           maxInflight: 400
           timeoutMs: 6000
     - nodeID: k6-gen-1
-      ipAddress: 192.168.252.61
+      ipAddress: 10.0.0.6   # replace with the generator VM's address
       role: k6-load-generator
       capacity: HIGH
-      username: isaia
-      password: root
-  topology:
-    links:
-      - nodeA: dfaas-worker-1
-        nodeB: k6-gen-1
-        latencyMs: 20
+      username: ubuntu
+      password: CHANGE_ME

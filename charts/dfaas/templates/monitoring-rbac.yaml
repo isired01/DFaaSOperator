@@ -9,9 +9,11 @@
 #   - prometheus: server.useExistingClusterRoleName (suppresses its ClusterRole
 #     *and* its ClusterRoleBinding)
 #   - grafana:    rbac.namespaced=true (namespaced Role only)
-# Both live in internal/controller/monitoring/values/. The names below are
-# hard-coded, not release-derived, because those values files are compiled into
-# the operator binary — rename one, rename all three.
+# Both live in internal/controller/monitoring/values/. The ClusterRole name
+# below and the ServiceAccount name in the binding are hard-coded, not
+# release-derived, because those values files are compiled into the operator
+# binary: the first must equal useExistingClusterRoleName in
+# prometheus-values.yaml, the second server.fullnameOverride in the same file.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

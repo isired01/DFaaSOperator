@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,12 +33,11 @@ import (
 )
 
 // monitoringAttemptsAnnotation persists the consecutive-error counter for
-// the monitoring Helm install across reconciles. P4 mirror of the LoadTest
-// dispatch budget.
+// the monitoring Helm install across reconciles.
 const monitoringAttemptsAnnotation = "dfaas.dfaas.io/monitoring-attempts"
 
 // monitoringRetryBudget is the max consecutive Helm install failures
-// tolerated before the Environment is moved to EnvFailed (P4).
+// tolerated before the Environment is moved to EnvFailed.
 const monitoringRetryBudget = 5
 
 // envDrainBudget bounds how long the Environment finalizer waits for each
@@ -70,7 +69,7 @@ const envDrainBudget = deletionReclaimBudget + time.Minute
 // Environment has already lost "orphan" while a test's cached ownerRef is not
 // yet stripped, and a finished test is deleted. --cascade=foreground still
 // defeats the ordering below by letting GC delete the kubeconfig Secrets in
-// parallel (keep that ponytail).
+// parallel (accepted limitation).
 //
 // The finalizer is dropped only once CleanupTargets succeeds: it is the single
 // piece of state that does NOT cascade (the prometheus-targets ConfigMap is
@@ -154,27 +153,18 @@ func (r *EnvironmentReconciler) handleEnvDeletion(ctx context.Context,
 }
 
 // reconcileProvisioningVMs probes SSH reachability of every node in spec
-// before advancing. P6 (option b): dial each <ip>:22 with a 2s timeout; if
-// any node fails, stamp VMsReady=False/SSHUnreachable and requeue. If the
-// spec has zero nodes (placeholder envs), keep the historical Skipped
-// behavior so empty envs still advance.
+// before advancing: it dials each <ip>:22 with a 2s timeout and, if any node
+// fails, stamps VMsReady=False/SSHUnreachable and requeues.
 func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-
-	if len(env.Spec.Nodes) == 0 {
-		r.cond(ctx, env, dfaasv1.EnvCondVMsReady,
-			metav1.ConditionTrue, dfaasv1.EnvReasonSkipped,
-			"no nodes declared — placeholder phase")
-		return r.phase(ctx, env, dfaasv1.EnvProvisioningInfra)
-	}
 
 	unreachable := r.prober().Unreachable(ctx, env)
 	if len(unreachable) > 0 {
 		budget := r.budget(sshAttemptsAnnotation, sshRetryBudget)
 		outcome, bumpErr := budget.Attempt(ctx, env)
 		if bumpErr != nil {
-			logger.Error(bumpErr, "bumpSSHAttempts failed; the budget cannot advance")
+			logger.Error(bumpErr, "ssh-attempts counter write failed; the budget cannot advance")
 		}
 		if outcome.Exhausted {
 			logger.Info("VMs not SSH-reachable after fast-retry budget; entering Unreachable (will keep retrying)",
@@ -192,7 +182,7 @@ func (r *EnvironmentReconciler) reconcileProvisioningVMs(ctx context.Context,
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	if rerr := r.budget(sshAttemptsAnnotation, sshRetryBudget).Clear(ctx, env); rerr != nil {
-		logger.Error(rerr, "resetSSHAttempts failed; non-fatal")
+		logger.Error(rerr, "ssh-attempts counter reset failed; non-fatal")
 	}
 	r.cond(ctx, env, dfaasv1.EnvCondVMsReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonSSHReachable,
@@ -262,32 +252,20 @@ func (r *EnvironmentReconciler) reconcileProvisioningInfra(ctx context.Context,
 	for _, rs := range roles.All() {
 		r.patchAnsibleJobTTL(ctx, env, rs.JobSuffix, jobTTLSuccessSeconds)
 	}
-	// Record what Ansible just installed. Written here rather than at Ready
-	// because the snapshot is about node installation, and monitoring is not:
-	// an Environment whose infra succeeded but whose Helm monitoring then failed
-	// terminally still HAS its machines installed, and would otherwise be left
-	// with no record at all — so a later node removal would have nothing to diff
-	// against and would silently orphan a live machine. Best-effort: a failed
-	// write degrades safely (no snapshot ⇒ full re-provision, no teardown) and
-	// the settled-Environment seed in Reconcile backfills it on the next tick.
-	logStatusErr(ctx, "save provisioning snapshot", am.SaveSnapshot(ctx, env))
 	r.cond(ctx, env, dfaasv1.EnvCondInfrastructureReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonInfraReady,
 		"dfaas-worker and k6 Ansible Jobs completed")
 	return r.phase(ctx, env, dfaasv1.EnvProvisioningMonitoring)
 }
 
-// reconcileProvisioningMonitoring installs Prometheus + Grafana via Helm,
-// reconciles per-environment scrape targets, and stamps node status. Runs
-// AFTER ProvisioningInfra so worker /metrics endpoints already exist when
+// reconcileProvisioningMonitoring installs Prometheus, Grafana and SeaweedFS
+// via Helm, reconciles per-environment scrape targets, and stamps node status.
+// Runs AFTER ProvisioningInfra so worker /metrics endpoints already exist when
 // the first scrape fires.
 func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Context,
 	env *dfaasv1.Environment) (ctrl.Result, error) {
 
-	done, failed, err := r.ensureMonitoring(ctx, env)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	done, failed := r.ensureMonitoring(ctx, env)
 	if failed {
 		// Monitoring (incl. the SeaweedFS S3 sink) is required: a terminally
 		// broken monitoring stack fails the Environment rather than degrading it,
@@ -312,12 +290,12 @@ func (r *EnvironmentReconciler) reconcileProvisioningMonitoring(ctx context.Cont
 	return r.phase(ctx, env, dfaasv1.EnvReady)
 }
 
-// ensureMonitoring drives the Helm monitoring stack install. P4: after
+// ensureMonitoring drives the Helm monitoring stack install. After
 // monitoringRetryBudget consecutive failures, returns failed=true so the
 // caller transitions the Environment to EnvFailed. Resets the counter on
 // every successful round-trip.
 func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
-	env *dfaasv1.Environment) (done bool, failed bool, err error) {
+	env *dfaasv1.Environment) (done bool, failed bool) {
 	logger := log.FromContext(ctx)
 
 	mm := r.monitoringStack()
@@ -325,16 +303,16 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 		budget := r.budget(monitoringAttemptsAnnotation, monitoringRetryBudget)
 		outcome, bumpErr := budget.Attempt(ctx, env)
 		if bumpErr != nil {
-			logger.Error(bumpErr, "bumpMonitoringAttempts failed; the budget cannot advance")
+			logger.Error(bumpErr, "monitoring-attempts counter write failed; the budget cannot advance")
 		}
 		if outcome.Exhausted {
 			r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 				metav1.ConditionFalse, dfaasv1.EnvReasonHelmFailed,
 				fmt.Sprintf("monitoring Helm install failed %d consecutive times: %s",
 					outcome.Count, condMessage(derr)))
-			return false, true, nil
+			return false, true
 		}
-		// P7 + P14: first ever observation is Unknown; subsequent retries
+		// First ever observation is Unknown; subsequent retries
 		// stay False/HelmInstalling. The sanitized message keeps
 		// LastTransitionTime stable across reconciles when the error class
 		// is the same. Outcome.First names what count == 1 meant -- and when
@@ -347,10 +325,10 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 		r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 			condStatus, dfaasv1.EnvReasonHelmInstalling,
 			"monitoring Helm install in progress / retrying: "+condMessage(derr))
-		return false, false, nil
+		return false, false
 	}
 	if rerr := r.budget(monitoringAttemptsAnnotation, monitoringRetryBudget).Clear(ctx, env); rerr != nil {
-		logger.Error(rerr, "resetMonitoringAttempts failed; non-fatal")
+		logger.Error(rerr, "monitoring-attempts counter reset failed; non-fatal")
 	}
 	ready, checkErr := mm.Check(ctx)
 	if checkErr != nil {
@@ -361,25 +339,26 @@ func (r *EnvironmentReconciler) ensureMonitoring(ctx context.Context,
 		r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 			metav1.ConditionUnknown, dfaasv1.EnvReasonCheckFailed,
 			"monitoring readiness could not be evaluated: "+condMessage(checkErr))
-		return false, false, nil
+		return false, false
 	}
 	if !ready {
 		r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 			metav1.ConditionFalse, dfaasv1.EnvReasonWaitingPods,
 			"monitoring pods not Ready yet")
-		return false, false, nil
+		return false, false
 	}
 
 	r.cond(ctx, env, dfaasv1.EnvCondMonitoringReady,
 		metav1.ConditionTrue, dfaasv1.EnvReasonPodsRunning,
 		"monitoring stack up")
 	logStatusErr(ctx, "reconcile Prometheus targets", mm.ReconcileTargets(ctx, env))
-	return true, false, nil
+	return true, false
 }
 
-// syncNodeStatus surfaces k6/dfaas node info into status, for fast lookup by
-// the LoadTestReconciler. The management addresses are read before the
-// write: the Touch reruns on every conflict retry, so it holds no API calls.
+// syncNodeStatus surfaces k6/dfaas node info into status. The
+// LoadTestReconciler reads status.k6Nodes; status.dfaasNodes is informational.
+// The management addresses are read before the write: the Touch reruns on
+// every conflict retry, so it holds no API calls.
 func (r *EnvironmentReconciler) syncNodeStatus(ctx context.Context, env *dfaasv1.Environment) error {
 	addrs, err := r.k6ManagementAddresses(ctx, env)
 	if err != nil {
@@ -511,7 +490,7 @@ func logStatusErr(ctx context.Context, op string, err error) {
 	}
 }
 
-// resetTransientConditions handles generation drift (P8): the spec was edited
+// resetTransientConditions handles generation drift: the spec was edited
 // after a settled run, so every condition is reset to Unknown — none is
 // trustworthy until the fresh provisioning pass re-stamps it. One write.
 func (r *EnvironmentReconciler) resetTransientConditions(ctx context.Context,

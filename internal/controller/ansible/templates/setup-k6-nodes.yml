@@ -124,8 +124,8 @@
     # The install tasks below are guarded on `stat /usr/local/bin/k3s`, so once
     # this block has run they reinstall k3s with THIS role's flags.
     #
-    # ponytail: duplicated verbatim in the twin playbook. Factoring it into an
-    # included tasks file needs Go plumbing, because EnsurePlaybookConfigMap
+    # Duplicated on purpose: verbatim in the twin playbook. Factoring it into an
+    # included tasks file needs Go plumbing, because ensurePlaybookConfigMap
     # (ansible/config.go) ships only the one playbook for the role being run.
     - name: Check for a recorded role marker
       ansible.builtin.stat:

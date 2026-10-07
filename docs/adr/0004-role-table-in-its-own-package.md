@@ -1,0 +1,3 @@
+# Per-role provisioning facts live in `internal/controller/roles`, not in `ansible` or `api/v1`
+
+The two-role split (`dfaas-worker` and `k6-load-generator`) was encoded at eleven branch sites and four string literals; three switches had to agree by hand, and an unknown role fell through to an empty inventory with a nil error. The table has to be read by the `ansible` package, the `monitoring` package and the reconciler. Putting it in `ansible` would make `monitoring` import the provisioning tool for one lookup; putting it in `api/v1` would publish Ansible playbook file names as part of the CRD API package. A small dedicated package avoids both. An unknown role is an error, never a zero value.

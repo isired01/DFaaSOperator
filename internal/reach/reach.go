@@ -1,15 +1,7 @@
 // Package reach answers one question about an Environment: which of its Nodes
 // do not answer on :22?
 //
-// It exists because the answer used to come from a package-scope net.DialTimeout
-// with no injection point, and the same loop -- for every declared Node, dial
-// :22, collect the unreachable nodeIDs -- was written out three times in the
-// reconciler. The only way a test could steer it was by choosing an IP address,
-// and no test anywhere stood up a listener, so every Environment spec used the
-// unroutable 192.0.2.1 and ONLY the unreachable branch was reachable at all.
-// The whole auto-recovery path (reconcileUnreachable, both of its arms) was
-// referenced in zero test files as a direct consequence, and each unroutable
-// dial burned its full timeout.
+// Prober is the seam a test replaces; TCP is the production implementation.
 package reach
 
 import (

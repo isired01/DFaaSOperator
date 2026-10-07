@@ -1,7 +1,7 @@
 {
   "uid": "dfaas-live",
-  "title": "dFaaS — run in corso",
-  "description": "Andamento di un LoadTest mentre gira. Una sola datasource: il Prometheus di management, che federa i nodi.",
+  "title": "dFaaS live run",
+  "description": "Progress of a LoadTest while it runs. One datasource: the management Prometheus, which federates the nodes.",
   "tags": [
     "dfaas"
   ],
@@ -55,7 +55,7 @@
       },
       {
         "name": "node",
-        "label": "Nodo",
+        "label": "Node",
         "type": "query",
         "datasource": {
           "type": "prometheus",
@@ -80,7 +80,7 @@
       },
       {
         "name": "function",
-        "label": "Funzione",
+        "label": "Function",
         "type": "query",
         "datasource": {
           "type": "prometheus",
@@ -109,7 +109,7 @@
     {
       "id": 100,
       "type": "row",
-      "title": "Carico",
+      "title": "Load",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -122,8 +122,8 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "Richieste al secondo per nodo",
-      "description": "Invocazioni viste dal gateway OpenFaaS di ogni nodo. Con Nodo=All e' il totale della federazione.",
+      "title": "Requests per second per node",
+      "description": "Invocations seen by each node's OpenFaaS gateway. With Node=All it is the federation total.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -182,7 +182,7 @@
     {
       "id": 2,
       "type": "timeseries",
-      "title": "Richieste al secondo per funzione",
+      "title": "Requests per second per function",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -242,8 +242,8 @@
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Risposte non 2xx",
-      "description": "Il gateway etichetta ogni invocazione col codice di risposta. 429 = rifiutata per rate limit.",
+      "title": "Non-2xx responses",
+      "description": "The gateway labels each invocation with its response code. 429 = rejected by the rate limit.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -302,7 +302,7 @@
     {
       "id": 101,
       "type": "row",
-      "title": "Latenza e repliche",
+      "title": "Latency and replicas",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -315,8 +315,8 @@
     {
       "id": 4,
       "type": "timeseries",
-      "title": "Latenza media per funzione",
-      "description": "Media, non percentile: il gateway OpenFaaS CE espone un summary senza quantili. I p95 veri stanno nel CSV di k6 a fine test.",
+      "title": "Mean latency per function",
+      "description": "Mean, not a percentile: the OpenFaaS CE gateway exposes a summary without quantiles. The p95 values are in the k6 summary CSV at the end of the test.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -375,7 +375,7 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Repliche per funzione",
+      "title": "Replicas per function",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -435,7 +435,7 @@
     {
       "id": 102,
       "type": "row",
-      "title": "Saturazione",
+      "title": "Saturation",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -448,7 +448,7 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "CPU per nodo",
+      "title": "CPU per node",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -508,7 +508,7 @@
     {
       "id": 7,
       "type": "timeseries",
-      "title": "Memoria usata per nodo",
+      "title": "Memory used per node",
       "description": "",
       "datasource": {
         "type": "prometheus",
@@ -568,7 +568,7 @@
     {
       "id": 103,
       "type": "row",
-      "title": "Federazione",
+      "title": "Federation",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -581,8 +581,8 @@
     {
       "id": 8,
       "type": "timeseries",
-      "title": "Traffico per backend HAProxy (locale contro peer)",
-      "description": "HAProxy e' cio' che l'agent riconfigura a ogni ricalcolo: i suoi backend sono i peer. I nomi di proxy/server li genera l'agent, da verificare al primo run.",
+      "title": "Traffic per HAProxy backend (local vs peers)",
+      "description": "HAProxy is what the agent reconfigures at each recalculation: its backends are the peers. The agent generates the proxy and server names.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -641,8 +641,8 @@
     {
       "id": 9,
       "type": "timeseries",
-      "title": "Richieste rifiutate",
-      "description": "Rifiuti lato proxy: denied dal frontend piu' le risposte 4xx dei backend (il rate limit risponde 429).",
+      "title": "Rejected requests",
+      "description": "Rejections on the proxy side: requests denied by the frontend plus 4xx responses from the backends (the rate limit answers 429).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -712,8 +712,8 @@
     {
       "id": 10,
       "type": "timeseries",
-      "title": "Iterazioni della strategia dell'agent",
-      "description": "Se va a zero il ricalcolo si e' fermato: i pesi restano congelati e la federazione si spegne in silenzio.",
+      "title": "Agent strategy iterations",
+      "description": "If this drops to zero, the agents stopped recalculating: the weights stay frozen and the federation stops forwarding without any error.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -772,7 +772,7 @@
     {
       "id": 11,
       "type": "timeseries",
-      "title": "Durata di una iterazione della strategia",
+      "title": "Duration of one strategy iteration",
       "description": "",
       "datasource": {
         "type": "prometheus",

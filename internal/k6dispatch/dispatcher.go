@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -113,7 +113,7 @@ type RunnerEnv struct {
 var ErrNotFound = errors.New("remote TestRun not found")
 
 // remoteNamespace is where TestRuns and mirrored ConfigMaps live on every k6
-// node's k3s. One place, instead of a literal at seven call sites.
+// node's k3s.
 const remoteNamespace = "default"
 
 // remoteRequestTimeout caps each remote-cluster API request (dial + round
@@ -192,9 +192,8 @@ func K6LogConfigMap(lt *dfaasv1.LoadTest, nodeID string) string {
 // TargetNodeIDs is spec.perNodeLoad union status.testRuns, sorted. The abort
 // sweep and the deletion finalizer's NotFound poll MUST agree on this set: a
 // poll set smaller than the sweep set releases the CR while a remote TestRun is
-// still live, which is the exact gap the finalizer exists to close. Sorted
-// because both callers used to iterate a Go map, so per-node log order was
-// non-deterministic across reconciles.
+// still live, which is the exact gap the finalizer exists to close. Sorted so
+// per-node log order is deterministic across reconciles.
 func TargetNodeIDs(lt *dfaasv1.LoadTest) []string {
 	seen := make(map[string]struct{}, len(lt.Status.TestRuns)+len(lt.Spec.PerNodeLoad))
 	for _, ref := range lt.Status.TestRuns {
@@ -243,8 +242,7 @@ func k6NodeStatus(env *dfaasv1.Environment, nodeID string) (dfaasv1.K6NodeStatus
 // ResolveKubeconfig applies the node-usability policy and returns the
 // management-cluster Secret holding nodeID's kubeconfig. Shared by Live and
 // the fake so both adapters agree on what "unusable" means. The Secret lives
-// in the Environment's namespace — the playbook pushes it there — which the
-// old call sites approximated with the LoadTest's namespace. An empty
+// in the Environment's namespace — the playbook pushes it there. An empty
 // managementAddress is not part of the policy: it only moves that
 // generator's URLs onto the fallback base (GeneratorOf).
 func ResolveKubeconfig(env *dfaasv1.Environment, nodeID string) (types.NamespacedName, error) {
@@ -336,9 +334,9 @@ func buildTestRun(name string, lt *dfaasv1.LoadTest, perNode dfaasv1.PerNodeLoad
 			},
 		},
 		// VUs and duration deliberately do not appear here: k6 takes both from
-		// options.scenarios inside the script, and no TestRun field carries
-		// them. spec.perNodeLoad on the LoadTest CR still records both, which
-		// is where the UI reads them from.
+		// the script's own options, and no TestRun field carries them.
+		// spec.perNodeLoad on the LoadTest CR still records both, which is
+		// where the UI reads them from.
 	}
 	runnerEnv := []interface{}{
 		map[string]interface{}{"name": "DFAAS_SUMMARY_URL", "value": env.SummaryURL},
@@ -394,7 +392,9 @@ func (n *liveNode) Ref(lt *dfaasv1.LoadTest) dfaasv1.TestRunRef {
 
 // restConfig reads the kubeconfig Secret (key "kubeconfig") and parses it
 // into a *rest.Config with the remote-request timeout applied. Shared by the
-// controller-runtime client and the typed clientset used for logs.
+// controller-runtime client and the typed clientset used for logs. The remote
+// client is rebuilt on every call on purpose, so a kubeconfig Secret rewritten
+// by a re-provision is never served stale.
 func (n *liveNode) restConfig(ctx context.Context) (*rest.Config, error) {
 	var sec corev1.Secret
 	if err := n.local.Get(ctx, n.secretRef, &sec); err != nil {
@@ -535,7 +535,9 @@ func (n *liveNode) Delete(ctx context.Context, lt *dfaasv1.LoadTest) error {
 
 // k6LogLimitBytes caps the per-pod log read so a runaway runner log cannot
 // blow up the operator's memory or the downstream ConfigMap (1 MiB etcd
-// limit). 256 KiB comfortably covers a k6 end-of-test summary.
+// limit). A large summary can exceed the cap (283 KB measured on 2026-08-29),
+// and LimitBytes keeps the head of the log, so the summary printed last is
+// what gets cut.
 const k6LogLimitBytes int64 = 262144
 
 // Logs streams the k6 end-of-test summary from the runner Pod(s). k6-operator

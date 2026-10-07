@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 Isaia Del Rosso.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,11 +13,10 @@ package v1
 import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 // EnvironmentPhase tracks the infrastructure lifecycle.
-// +kubebuilder:validation:Enum=Idle;ProvisioningVMs;ProvisioningInfra;ProvisioningMonitoring;Ready;Failed;Unreachable
+// +kubebuilder:validation:Enum=ProvisioningVMs;ProvisioningInfra;ProvisioningMonitoring;Ready;Failed;Unreachable
 type EnvironmentPhase string
 
 const (
-	EnvIdle                   EnvironmentPhase = "Idle"
 	EnvProvisioningVMs        EnvironmentPhase = "ProvisioningVMs"
 	EnvProvisioningInfra      EnvironmentPhase = "ProvisioningInfra"
 	EnvProvisioningMonitoring EnvironmentPhase = "ProvisioningMonitoring"
@@ -38,18 +37,11 @@ const (
 // up, monitoring down) once qualified too; it was dropped because no reconcile
 // path ever produced it and a test without metrics is worthless to the user.
 // The gateway mirrors this set and must not be looser.
-//
-// It lives here because the comparison was re-typed at four sites inside one
-// reconcile function -- three of them negated -- plus once more in the
-// gateway. Adding EnvUnreachable to the set (plausible: Unreachable is
-// explicitly non-terminal and auto-recovering) meant finding all five by eye,
-// and missing one left the create gate rejecting while the Occupancy gate
-// admitted, with no compile error and no test failure.
 func (p EnvironmentPhase) Dispatchable() bool {
 	return p == EnvReady
 }
 
-// Condition Types stamped on Environment.status.conditions (P15).
+// Condition Types stamped on Environment.status.conditions.
 const (
 	EnvCondReady               = "Ready"
 	EnvCondVMsReady            = "VMsReady"
@@ -62,9 +54,8 @@ const (
 	EnvCondNodesReachable = "NodesReachable"
 )
 
-// Condition Reasons stamped on Environment.status.conditions (P15).
+// Condition Reasons stamped on Environment.status.conditions.
 const (
-	EnvReasonSkipped            = "Skipped"
 	EnvReasonNoWorkers          = "NoWorkers"
 	EnvReasonNoK6Nodes          = "NoK6Nodes"
 	EnvReasonVMsProvisioned     = "VMsProvisioned"
@@ -93,34 +84,35 @@ const (
 	EnvReasonCheckFailed = "CheckFailed"
 )
 
-// EnvironmentNode declares one machine in the federation.
-//
-// A dfaas-worker must declare at least one function. A worker with none serves
-// nothing, and the empty list is worse than useless downstream: buildInventory
-// marshals a nil slice to the JSON literal `null`, not `[]`, so the inventory
-// carries node_specific_functions='null' and the playbook's prune task runs
-// `null | map(attribute='name')` over a four-character string — the play dies
-// and the Environment lands in Failed with the function still deployed.
-// Scoped to the role: a k6-load-generator runs k6, not OpenFaaS, and the
-// inventory emits no function var for it at all.
+// A worker with no function serves nothing, and the empty list breaks the
+// playbook: buildInventory marshals a nil slice to the JSON literal `null`, so
+// the prune task runs `null | map(attribute='name')` over a string, the play
+// dies and the Environment lands in Failed. The rule is scoped to the role: a
+// k6-load-generator runs k6, not OpenFaaS, and gets no function var.
+
+// EnvironmentNode declares one machine in the federation. A dfaas-worker must
+// declare at least one function.
 // +kubebuilder:validation:XValidation:rule="self.role != 'dfaas-worker' || (has(self.functions) && size(self.functions) > 0)",message="a dfaas-worker node must declare at least one function"
 type EnvironmentNode struct {
-	// NodeID must be DNS-1123 compatible (lowercase): it is embedded in
-	// Kubernetes object names (kubeconfig Secret <env>-<nodeID>-kubeconfig,
-	// remote TestRuns, k6-log ConfigMaps) — an uppercase ID makes the k6
-	// Ansible Job's Secret push fail with a censored 422.
+	// The check is an OpenAPI Pattern, not a CEL rule: CEL cost estimation on
+	// unbounded node arrays blows the schema budget.
+
+	// NodeID names the node: a lowercase DNS-1123 label, unique within
+	// spec.nodes. It is embedded in Kubernetes object names (kubeconfig Secret
+	// <env>-<nodeID>-kubeconfig, remote TestRuns, k6-log ConfigMaps).
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MaxLength=63
-	// Pattern (not CEL XValidation): CEL cost estimation on unbounded
-	// node arrays blows the schema budget; the OpenAPI pattern is free.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	NodeID string `json:"nodeID"`
 
-	// MaxLength is not cosmetic: without it the CEL uniqueness rule on
-	// spec.nodes below is rejected, because the cost estimator assumes the
-	// largest string the request budget allows for every comparison. 45 is the
-	// longest possible textual IP (IPv6 with an embedded IPv4, e.g.
-	// ffff:...:255.255.255.255).
+	// MaxLength is what keeps the CEL uniqueness rule on spec.nodes admissible:
+	// the cost estimator assumes the largest string the request budget allows
+	// for every comparison. 45 is the longest textual IP (IPv6 with an embedded
+	// IPv4, e.g. ffff:...:255.255.255.255).
+
+	// IPAddress is the address the operator reaches this machine on: SSH on :22
+	// and, for a k6-load-generator, the k3s API on :6443. Unique within
+	// spec.nodes.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MaxLength=45
 	IPAddress string `json:"ipAddress"`
@@ -131,17 +123,24 @@ type EnvironmentNode struct {
 	// +kubebuilder:validation:Required
 	Capacity NodeCapacity `json:"capacity"`
 
-	// SSH credentials (inline, matches the FE-produced manifests).
+	// Username is the SSH user the operator logs in as. Username and Password
+	// are stored in plain text in the spec.
 	// +kubebuilder:validation:Required
 	Username string `json:"username"`
+
+	// Password is the SSH password of Username.
 	// +kubebuilder:validation:Required
 	Password string `json:"password"`
 
-	// BalancingStrategy is meaningful only for dfaas-worker nodes.
-	// Accepted values are the canonical strategy names recognised by
-	// dfaas-agent (AGENT_STRATEGY env var). Typos that look like
-	// "alllocal" silently fall back to recalcstrategy and crash on
-	// missing dfaas.maxrate, so the enum guard is the safety net.
+	// The enum is the safety net: a misspelt name such as "alllocal" silently
+	// falls back to recalcstrategy in the dfaas-agent and crashes on the missing
+	// dfaas.maxrate label.
+
+	// BalancingStrategy is the dfaas-agent strategy (AGENT_STRATEGY) of a
+	// dfaas-worker; ignored on a k6-load-generator. Supported: staticstrategy,
+	// alllocalstrategy, recalcstrategy (uses each function's maxRate) and
+	// randomstrategy. nodemarginstrategy and rlagentstrategy pass validation
+	// but are not supported by this platform.
 	// +kubebuilder:validation:Enum=staticstrategy;nodemarginstrategy;recalcstrategy;alllocalstrategy;rlagentstrategy;randomstrategy
 	// +optional
 	BalancingStrategy BalancingStrategy `json:"balancingStrategy,omitempty"`
@@ -153,22 +152,23 @@ type EnvironmentNode struct {
 
 // EnvironmentSpec is the desired federation infrastructure.
 type EnvironmentSpec struct {
-	// Nodes is keyed by nodeID: the API server rejects duplicates at admission
-	// (listType=map). Without it two entries sharing a nodeID collide on every
-	// derived object name (kubeconfig Secret, libp2p key entry, remote TestRun)
-	// and the second silently overwrites the first.
-	//
-	// ipAddress is unique too, enforced by the CEL rule below: one physical
-	// machine is one node. Two entries sharing an IP used to be valid (the
-	// listMapKey only guards nodeID) and produced two libp2p identities on one
-	// box — the Ansible run installs dfaas-agent twice with different keys, and
-	// whichever lands last leaves every peer dialling a dead peer ID.
-	// MaxItems is what makes the rule admissible at all: CEL cost estimation on
-	// an unbounded array blows the schema budget (same reason nodeID uses an
-	// OpenAPI Pattern instead of CEL), and this comparison is O(n²).
-	// NOTE: scope is one Environment. Nothing stops two *different* Environments
-	// from declaring the same machine — that needs a cross-object check the CRD
-	// schema cannot express.
+	// The list is keyed by nodeID (listType=map), so the API server rejects
+	// duplicates at admission: two entries sharing a nodeID would collide on
+	// every derived object name (kubeconfig Secret, libp2p key entry, remote
+	// TestRun) and the second would silently overwrite the first.
+	// The CEL rule keeps ipAddress unique too. Two entries sharing an IP would
+	// give one machine two libp2p identities: Ansible installs dfaas-agent twice
+	// with different keys, and whichever lands last leaves every peer dialling a
+	// dead peer ID.
+	// MaxItems is what makes the rule admissible: CEL cost estimation on an
+	// unbounded array blows the schema budget (the same reason nodeID uses an
+	// OpenAPI Pattern), and the comparison is O(n²).
+	// Two different Environments can still declare the same machine: that needs
+	// a cross-object check the CRD schema cannot express.
+
+	// Nodes are the machines of the federation, keyed by nodeID. Each ipAddress
+	// may appear once (one machine is one node); at most 50 nodes. Uniqueness
+	// is checked within one Environment only.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=50
 	// +kubebuilder:validation:XValidation:rule="self.all(n, self.exists_one(m, m.ipAddress == n.ipAddress))",message="each ipAddress must appear at most once: one machine is one node"
@@ -176,20 +176,15 @@ type EnvironmentSpec struct {
 	// +listMapKey=nodeID
 	Nodes []EnvironmentNode `json:"nodes"`
 
-	// +optional
-	Topology Topology `json:"topology,omitempty"`
-
-	// REMOVED: CleanupOnDelete. It was documented as driving the finalizer, but
-	// nothing ever read it: the finalizer in environment_lifecycle.go always
-	// runs CleanupTargets and then drops itself, on every deletion. Keeping the
-	// field made the UI promise a VM teardown that never happened.
-
 	// S3ConfigRef points at a cluster-scoped S3 server configuration
 	// registered in namespace "dfaas-s3" (Secret with label
 	// "dfaas.io/s3-config=true"). When set, LoadTests targeting this
 	// Environment export their metrics CSV to that S3 endpoint under a
 	// bucket derived from the Environment name. When nil, LoadTests export
-	// to the built-in in-cluster SeaweedFS sink ("seaweedfs-default").
+	// to the built-in in-cluster SeaweedFS sink ("seaweedfs-default"). The
+	// Secret must hold the keys endpoint, region, access_key_id,
+	// secret_access_key and force_path_style; every key except endpoint is
+	// required by the exporter Job.
 	// +optional
 	S3ConfigRef *S3ConfigRef `json:"s3ConfigRef,omitempty"`
 }
@@ -257,6 +252,7 @@ type EnvironmentStatus struct {
 	// +optional
 	K6Nodes []K6NodeStatus `json:"k6Nodes,omitempty"`
 
+	// DfaasNodes lists the nodeIDs of the dfaas-worker nodes.
 	// +optional
 	DfaasNodes []string `json:"dfaasNodes,omitempty"`
 
