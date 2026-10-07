@@ -100,13 +100,8 @@ ui:
                                   # whose host does not expose the NodePorts.
 
 # The CRDs ship in crds/; Helm installs them and never upgrades or removes
-# them. Before upgrading to a chart whose schema changed, apply its CRDs first
-# (an operator started against the old CRDs has its new status fields pruned):
-#
-#   helm pull oci://ghcr.io/isired01/charts/dfaas --version <version> --untar --untardir /tmp/dfaas-<version>
-#   kubectl apply -f /tmp/dfaas-<version>/dfaas/crds/
-#
-# (From a checkout of tag v<version>: kubectl apply -f charts/dfaas/crds/.)
+# them. Apply the target release's CRDs before helm upgrade: see the Upgrade
+# section of the README.
 
 # Covers the operator and UI pods only. Exporter Jobs and the VMs pull without
 # credentials, so the images and charts must be public.
