@@ -30,8 +30,9 @@ operator:
                                   #   provisioning (status.k6Nodes[].managementAddress wins when set);
                                   #   default when unset: http://<manager hostIP>:30901. Must be
                                   #   reachable from those generators — on a lab spread over several
-                                  #   sites, that is the management node's tailnet IP, not a local
-                                  #   bridge address.
+                                  #   sites, an address of the management node that every generator
+                                  #   can route to (for example a VPN address), not a local bridge
+                                  #   address.
   nodeSelector: {}
   tolerations: []
   affinity: {}
@@ -51,6 +52,10 @@ ui:
     # NodePort by default: the whole testbed is reached by node IP
     # (prometheus 30090, grafana 30300, seaweedfs 30900/30901) and the UI is
     # the one piece a human has to open. Set type: ClusterIP to opt out.
+    # The UI has no authentication: anyone who reaches this port can read every
+    # Environment, node SSH passwords included, and create or delete
+    # Environments and LoadTests. On an untrusted network use type: ClusterIP
+    # and kubectl port-forward.
     type: NodePort
     port: 8082
     nodePort: 30800          # only honoured when type is NodePort; empty = random
@@ -67,7 +72,7 @@ ui:
     tls: []                       # list of {secretName, hosts: []}
   env:                            # free-form key→value, each rendered as a container env var
                                   # PORT is derived from ui.service.port — do not set it here
-    CORS_ORIGINS: ""              # csv; empty = same-origin only
+    CORS_ORIGINS: ""              # csv; empty = no CORS headers, not a same-origin check (see the UI README)
     # SEAWEEDFS_ENDPOINT: ""      # override gateway→SeaweedFS dial endpoint; default: auto
                                   #   (in-cluster → seaweedfs-all-in-one.monitoring.svc…:8333, dev → <nodeIP>:30900).
                                   #   Applies to seaweedfs-default only; an external S3 config keeps its own endpoint.
@@ -76,8 +81,9 @@ ui:
                                   #   DFAAS_ASSET_BASE (its generator's detected management address)
                                   #   fetches from that instead, so this is the fallback: it must be
                                   #   reachable from generators without a detected address — on a lab
-                                  #   spread over several sites, the management node's tailnet IP, not
-                                  #   a local bridge address.
+                                  #   spread over several sites, an address of the management node that
+                                  #   every generator can route to (for example a VPN address), not a
+                                  #   local bridge address.
     # SEAWEEDFS_FILER_PUBLIC_URL: ""
                                   # override the base of the result links shown after a
                                   # LoadTest; default: the host the browser opened the UI on,
@@ -85,15 +91,15 @@ ui:
                                   # is loopback or unusable. Set it behind an Ingress or proxy
                                   # whose host does not expose the NodePorts.
 
-# CRDs ship in the chart's crds/ directory, so `helm install` applies them for
-# you. Helm never touches them again: `helm upgrade` does NOT update a CRD, and
-# `helm uninstall` does NOT remove one. After upgrading to a chart whose schema
-# changed, apply the new definitions by hand:
+# The CRDs ship in crds/; Helm installs them and never upgrades or removes
+# them. Before upgrading to a chart whose schema changed, apply its CRDs first
+# (an operator started against the old CRDs has its new status fields pruned):
 #
-#   kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_environments.yaml
-#   kubectl apply -f https://github.com/isired01/DFaaSOperator/releases/download/v<version>/dfaas.dfaas.io_loadtests.yaml
+#   helm pull oci://ghcr.io/isired01/charts/dfaas --version <version> --untar --untardir /tmp/dfaas-<version>
+#   kubectl apply -f /tmp/dfaas-<version>/dfaas/crds/
 #
-# (Both files are attached to every release, and live in config/crd/bases/ in a
-# repo checkout.)
+# (From a checkout of tag v<version>: kubectl apply -f charts/dfaas/crds/.)
 
+# Covers the operator and UI pods only. Exporter Jobs and the VMs pull without
+# credentials, so the images and charts must be public.
 imagePullSecrets: []
