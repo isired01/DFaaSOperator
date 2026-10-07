@@ -1,7 +1,7 @@
 # Build the manager binary — pin builder to native BUILDPLATFORM and use
 # Go cross-compile (GOARCH=${TARGETARCH}) instead of QEMU-emulating the
 # whole compile stage. Cuts arm64 build time from ~30m to ~3m.
-FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -13,20 +13,13 @@ COPY go.sum go.sum
 # and so that source changes don't invalidate our downloaded layer
 RUN go mod download
 
-# Copy the go source. Whole directories, never a file list: this COPY block
-# used to name each internal/ package, so adding internal/reach and
-# internal/syncchannel built fine locally and failed only here, at docker
-# build, after every Go check had passed. The UI image already does it this
-# way.
+# Copy whole directories, never a file list: a new internal/ package must not
+# break only the image build.
 COPY cmd/ cmd/
 COPY api/ api/
 COPY internal/ internal/
 
 # Build
-# the GOARCH has not a default value to allow the binary be built according to the host where the command
-# was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
-# the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
-# by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager ./cmd
 
 # Use distroless as minimal base image to package the manager binary

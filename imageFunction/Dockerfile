@@ -1,11 +1,12 @@
 # syntax=docker/dockerfile:1
 #
 # Multi-arch OpenFaaS function image (of-watchdog http mode).
-# Build + push both arches in one shot (no --load for multi-arch):
+# release.yml publishes the image on every v* tag. Manual multi-arch build and
+# push (no --load for multi-arch), from the repo root:
 #   docker buildx build --platform linux/amd64,linux/arm64 \
-#     -t ghcr.io/isired01/dfaas-imgproc:latest -f Dockerfile . --push
+#     -t ghcr.io/isired01/dfaas-imgproc:<tag> -f imageFunction/Dockerfile imageFunction --push
 
-FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.25-alpine AS build
+FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.26-alpine3.22 AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
@@ -18,7 +19,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # of-watchdog ships the fwatchdog binary; image is multi-arch (amd64/arm64).
 FROM --platform=${TARGETPLATFORM:-linux/amd64} ghcr.io/openfaas/of-watchdog:0.11.4 AS watchdog
 
-FROM alpine:3.20
+FROM alpine:3.22
 RUN apk add --no-cache ca-certificates \
     && addgroup -S app && adduser -S -G app app
 WORKDIR /home/app
