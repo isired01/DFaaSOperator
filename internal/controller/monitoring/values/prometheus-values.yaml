@@ -15,17 +15,11 @@ prometheus-pushgateway:
 # /etc/config, the chart's own prometheus.yml, and calls
 # POST http://localhost:9090/-/reload when that file changes: a change to the
 # Prometheus config (the retention block below included) never restarts the
-# pod. The file_sd mount below is inert, since without extraVolumeDirs the
-# sidecar does not watch it; Prometheus picks up the operator's target files
-# on its own (file_sd watches the directory, refresh_interval is the fallback).
-# ponytail: drop this mount with the next change that restarts the pod anyway;
-# removing it on its own would restart the shared Prometheus for nothing.
+# pod. Prometheus picks up the operator's target files on its own (file_sd
+# watches the directory, refresh_interval is the fallback).
 configmapReload:
   prometheus:
     enabled: true
-    extraVolumeMounts:
-      - name: dfaas-targets
-        mountPath: /etc/prometheus/file_sd
 
 server:
   fullnameOverride: "prometheus-server"
