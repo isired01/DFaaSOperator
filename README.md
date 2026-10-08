@@ -200,9 +200,10 @@ form does not depend on that.
 
 Upgrading from 4.0.x:
 
-- `spec.topology` (Environment) and the phase `Idle` are removed from the CRD.
-  Apply the CRDs before the new operator starts, and delete any `topology`
-  block from your manifests: `kubectl apply` rejects an unknown field.
+- The Environment phase `Idle`, which the operator never wrote, is removed
+  from the CRD. Apply the CRDs before the new operator starts. `spec.topology`
+  stays: it is declared, not applied (see
+  [docs/known-limitations.md](docs/known-limitations.md#spectopology-is-not-applied)).
 - The management Prometheus restarts once, at the next provisioning of an
   Environment after the upgrade.
 - Clusters bootstrapped before v2.5, which still have the pre-Helm SeaweedFS
@@ -410,6 +411,8 @@ the `alpine/ansible:2.18.6` image. Grafana ships one dashboard, `dfaas-live`.
   never re-dial a dropped peer, so a lost link stays down until the agents are
   restarted. Put the most reliable machine first. Reordering `spec.nodes`
   re-provisions every node.
+- **`spec.topology` is not applied.** The latency links it declares are in the
+  CRD and the UI, but the operator does not read them and injects no latency.
 - **Percentiles are per generator.** Counts and rates can be summed over
   `node_id`; `med`, `p90` and `p95` cannot be combined into a run-wide value.
   The start barrier of `syncStart` and the payload-image fetch are ordinary k6
