@@ -176,6 +176,9 @@ type EnvironmentSpec struct {
 	// +listMapKey=nodeID
 	Nodes []EnvironmentNode `json:"nodes"`
 
+	// +optional
+	Topology Topology `json:"topology,omitempty"`
+
 	// S3ConfigRef points at a cluster-scoped S3 server configuration
 	// registered in namespace "dfaas-s3" (Secret with label
 	// "dfaas.io/s3-config=true"). When set, LoadTests targeting this
