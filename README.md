@@ -368,13 +368,14 @@ public-read policy on `assets/*`.
 | ------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------- |
 | Operator (both controllers)           | `cmd/`, `internal/`, root `Dockerfile`   | `ghcr.io/isired01/dfaas-operator:<version>`                                 |
 | Exporter (Prometheus to CSV to S3)    | [dataExporter/](dataExporter/)           | `ghcr.io/isired01/dfaas-exporter:<version>`                                 |
-| `dfaas-imgproc`, an image-processing function for load tests | [imageFunction/](imageFunction/README.md) | `ghcr.io/isired01/dfaas-imgproc:<version>`              |
+| `dfaas-imgproc`, an image-processing function for load tests (pushed by hand) | [imageFunction/](imageFunction/README.md) | `ghcr.io/isired01/dfaas-imgproc:<version>`              |
 | UI and REST gateway                   | [DFaaS_UI](https://github.com/isired01/DFaaS_UI) | `ghcr.io/isired01/dfaas-control-plane:<version>`                    |
 | dfaas-agent, the system under test    | built outside this repository, see [docs/dfaas-agent.md](docs/dfaas-agent.md) | `ghcr.io/isired01/dfaas-agent:dev` |
 
-`release.yml` publishes the operator, exporter and imgproc images on every `v*`
-tag, under `vX.Y.Z`, `X.Y.Z` and `latest`; the UI repository publishes its own
-image on its tag. The chart pins the exporter through `DFAAS_EXPORTER_IMAGE`;
+`release.yml` publishes the operator and exporter images on every `v*` tag,
+under `vX.Y.Z`, `X.Y.Z` and `latest`; the UI repository publishes its own image
+on its tag. `dfaas-imgproc` is not part of a release: it is built and pushed by
+hand when [imageFunction/](imageFunction/README.md) changes. The chart pins the exporter through `DFAAS_EXPORTER_IMAGE`;
 `:latest` is used only by an operator started without it.
 
 The Ansible playbooks, the Helm values for HAProxy, OpenFaaS and Prometheus, and

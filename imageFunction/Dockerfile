@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # Multi-arch OpenFaaS function image (of-watchdog http mode).
-# release.yml publishes the image on every v* tag. Manual multi-arch build and
+# Not published by release.yml: built and pushed by hand. Multi-arch build and
 # push (no --load for multi-arch), from the repo root:
 #   docker buildx build --platform linux/amd64,linux/arm64 \
 #     -t ghcr.io/isired01/dfaas-imgproc:<tag> -f imageFunction/Dockerfile imageFunction --push

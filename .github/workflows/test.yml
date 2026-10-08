@@ -82,9 +82,9 @@ jobs:
   # `make run` and no DFAAS_EXPORTER_IMAGE set. Publishing it from main makes
   # that local dev path built from real export code, instead of a manual
   # buildx run. Deliberately only this image: release.yml publishes the
-  # operator, exporter and imgproc images under the version tags on a v* tag,
-  # and the job above only *builds* all three, on every PR, as the Dockerfile
-  # gate.
+  # operator and exporter images under the version tags on a v* tag, and the
+  # job above only *builds* all three (imgproc included, which is pushed by hand,
+  # see imageFunction/README.md), on every PR, as the Dockerfile gate.
   #
   # Consequence to keep in mind: :latest now means "current main" for the
   # exporter, not "last release" -- a `make run` operator started right after
