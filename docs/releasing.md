@@ -64,7 +64,6 @@ Helm applies the contents of a chart's `crds/` on install only, never on upgrade
 Notes that depend on the release being left:
 
 - A release that adds a CRD status field (`status.provisioningGeneration`, `status.k6Nodes[].managementAddress`) is the reason the order matters. An Environment that was `Ready` before the field existed gets its value on its next provisioning run, that is, after a spec edit.
-- A release that removes a CRD field (`spec.topology` of the Environment) makes `kubectl apply` reject a manifest that still sets it. Remove the block from your manifests.
 - The operator no longer writes the Secret `<env>-provisioned-nodes`; existing ones are garbage-collected with their Environment.
 - The management Prometheus restarts once, at the next provisioning of an Environment after an upgrade that changes its pod spec.
 - A management cluster bootstrapped before v2.5, which still has the SeaweedFS objects of the pre-Helm install (the Service `seaweedfs` and so on), is no longer migrated automatically. Upgrade it through a release that still contains the migration first.

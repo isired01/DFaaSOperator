@@ -110,6 +110,10 @@ An empty result means the fallbacks apply. The provisioning Job logs `recorded <
 
 If the generator lays out scenarios differently, or an executor is added, its `durationMs` entry in `scenarios.js` must still total it. If the operator ever gives `duration` a real use, the UI must stop treating it as advisory.
 
+## spec.topology is declared, not applied
+
+`Environment.spec.topology.links[]` (`nodeA`, `nodeB`, `latencyMs`) is in the CRD and mirrored by the UI: the Environment DTO in `internal/api/types.go` and the SPA's link editor (UI repo). The operator never reads it, so no latency is injected ([known-limitations.md](known-limitations.md#spectopology-is-not-applied)). The UI must present a link as a declaration, not as applied latency. If the operator ever applies the field, change the UI wording and these docs with it.
+
 ## Condition reasons
 
 The operator writes Condition messages (for example the name of the failing Ansible task) that the SPA renders verbatim in `ui/src/components/ConditionsList.jsx`. There is no dedicated CRD field; change the message format here and the panel changes with it. The UI cannot import the operator's constants, so it matches strings. These couplings ride on reason strings rather than message text:

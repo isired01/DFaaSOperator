@@ -59,7 +59,7 @@ While an Environment is `Ready` and its generation is settled, each pass re-asse
 
 ### Generation drift: how a spec edit restarts provisioning
 
-A spec edit increments `metadata.generation`. At the top of every reconcile (after the Ready health route), `handleGenerationDrift` applies one rule to every phase. In a settled phase it compares `status.observedGeneration`; in any other phase it compares `status.provisioningGeneration`, the generation the current run applies. A recorded value of 0 means "no record" and is never drift. On drift the operator:
+A spec edit increments `metadata.generation`, whichever field changed: an edit of `spec.topology` alone, which nothing reads, also re-provisions. At the top of every reconcile (after the Ready health route), `handleGenerationDrift` applies one rule to every phase. In a settled phase it compares `status.observedGeneration`; in any other phase it compares `status.provisioningGeneration`, the generation the current run applies. A recorded value of 0 means "no record" and is never drift. On drift the operator:
 
 1. deletes the Ansible Jobs of older generations (matched by the label `dfaas.io/generation`, listed through the uncached reader, deleted with foreground propagation so a Job outlives its pods) and the inventory Secrets of those generations, which hold node credentials;
 2. sets `Ready`, `VMsReady`, `DFaaSNodesReady`, `K6Ready`, `InfrastructureReady`, `MonitoringReady` and `NodesReachable` to `Unknown` with the reason `Updating`;

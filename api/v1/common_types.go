@@ -89,3 +89,28 @@ type Function struct {
 	// +kubebuilder:validation:Minimum=1
 	MaxRate int32 `json:"maxRate"`
 }
+
+// Topology declares inter-node network shaping (latency injection).
+//
+// NOT IMPLEMENTED: the field is schema-only. Nothing in the operator or in the
+// Ansible playbooks reads it, so a declared link's latencyMs is never applied
+// to any node. It is kept so existing manifests still validate; treat it as
+// documentation of intent, not as a working feature.
+type Topology struct {
+	// Links are the declared latency links. None of them is applied.
+	// +optional
+	Links []Link `json:"links,omitempty"`
+}
+
+// Link is one symmetric latency link in the topology.
+type Link struct {
+	// NodeA is one end of the link, a nodeID of spec.nodes. It is not checked
+	// against the node list.
+	NodeA string `json:"nodeA"`
+	// NodeB is the other end of the link, a nodeID of spec.nodes. It is not
+	// checked against the node list.
+	NodeB string `json:"nodeB"`
+	// LatencyMs is the latency declared for the link, in milliseconds. It is
+	// not applied to either node.
+	LatencyMs int `json:"latencyMs"`
+}

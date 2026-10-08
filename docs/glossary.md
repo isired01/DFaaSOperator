@@ -110,6 +110,10 @@ The process, on each DFaaS node, that discovers its peers and decides where to s
 **Federation (two meanings)**
 The libp2p mesh the dfaas-agents form (the peers are the bootstrap list, see [known-limitations.md](known-limitations.md#the-agent-mesh-is-exactly-the-bootstrap-list)), and the Prometheus federation: the management Prometheus pulls the metrics of every DFaaS node through `/federate` once per `server.global.scrape_interval` (10 s). The word "federation interval" always means the second one.
 
+**Topology**
+`Environment.spec.topology.links[]`: latency links declared between pairs of nodes (`nodeA`, `nodeB`, `latencyMs`). Declared only: the operator does not read it, no latency is injected, and the agent mesh is the bootstrap list ([known-limitations.md](known-limitations.md#spectopology-is-not-applied)).
+Avoid: mesh (that is what the agents form), network shaping (nothing shapes the network).
+
 **Balancing strategy**
 The dfaas-agent policy on a DFaaS node, set by `spec.nodes[].balancingStrategy` and passed to the agent as `AGENT_STRATEGY`. Supported: `staticstrategy`, `alllocalstrategy`, `recalcstrategy` and `randomstrategy`. The CRD also accepts `nodemarginstrategy` and `rlagentstrategy`; this platform does not support them.
 

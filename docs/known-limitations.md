@@ -84,6 +84,12 @@ Each DFaaS node dials every DFaaS node listed before it in `spec.nodes`, once, w
 
 What to do: put the most reliable machine first in `spec.nodes`. Reordering `spec.nodes` re-provisions every node. Before a measurement, check that each agent has the peers you expect (the agent logs the connected peers), and restart the agents if a link was lost. Wait a few minutes after an Environment edit before a run you intend to keep: the agents and the per-node Prometheus restart, so the first minutes are not representative.
 
+### `spec.topology` is not applied
+
+An Environment can declare `spec.topology.links[]`, each link a pair of nodeIDs (`nodeA`, `nodeB`) and a `latencyMs`. The field is in the CRD and in the UI, but the operator does not read it and no playbook shapes traffic: no latency is injected between nodes, and the agent mesh is still the bootstrap list. The CRD does not check that `nodeA` and `nodeB` name nodes of `spec.nodes`. Editing the field is a spec edit like any other, so it re-provisions the Environment.
+
+What to do: treat a declared link as a record of intent, not as a condition of the run. The latency between the machines is whatever the network gives; measure it if a result depends on it.
+
 ### Percentiles are per generator
 
 The k6 summary CSV has one row per generator, metric and statistic. Counts and rates can be summed over `node_id`. The median, `p(90)` and `p(95)` of different generators cannot be combined into a run-wide percentile. A run-wide percentile would need k6 to stream raw samples into Prometheus, which is not implemented.
