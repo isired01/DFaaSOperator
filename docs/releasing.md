@@ -2,6 +2,8 @@
 
 Both repositories are released together, under the same tag, even when one of them did not change: the chart defaults the UI image tag to its own `appVersion`. This document describes the procedure as the two release workflows and the git history show it, then upgrading, uninstalling, and what to change to move the project to another owner.
 
+Versioning restarted at 0.5.0 on 2026-10-12. The earlier tags (`v0.1.0` to `v4.0.2`) and their GitHub Releases were deleted, and their images and charts are removed from GHCR, so that Helm, which resolves to the highest version, never picks one of them over the current line. Their commits are still on `main`: a version name in an older commit message or issue (`v2.5`, `v3.6.0`, `v4.0.x`) refers to one of those commits, not to a tag.
+
 ## What a release publishes
 
 | Repository | Trigger | Published |
@@ -32,7 +34,7 @@ Assume the version is `X.Y.Z`. Do each step in both repositories unless it says 
    git push origin vX.Y.Z
    ```
 
-   The existing tags are annotated, with the tag name as the message. The UI's `release.yml` builds and pushes `dfaas-control-plane`. It is the slow build (two architectures).
+   Tags are annotated, with the tag name as the message. The UI's `release.yml` builds and pushes `dfaas-control-plane`. It is the slow build (two architectures).
 4. **Tag the operator repository** the same way. Its `release.yml` runs in this order:
    1. computes the version without the `v`;
    2. lints the chart (a template error stops the release before anything is pushed);
@@ -55,7 +57,7 @@ Assume the version is `X.Y.Z`. Do each step in both repositories unless it says 
 
 6. **Edit the release body** to open with two lines, because the workflow uses only generated notes: `CRDs changed: yes/no (apply them before helm upgrade)` and `Export format changed: yes/no`.
 
-If the wait for the UI image times out, re-run the failed job from the Actions page once the UI image exists. **Never move or re-push a tag**: a push re-triggers the publish workflow, and the tag moves under people who already pulled it. The history shows `v4.0.0` and `v4.0.1` on the same commit, which is what re-tagging leaves behind. If a published release is wrong, fix it in a new patch release.
+If the wait for the UI image times out, re-run the failed job from the Actions page once the UI image exists. **Never move or re-push a tag**: a push re-triggers the publish workflow, and the tag moves under people who already pulled it. If a published release is wrong, fix it in a new patch release.
 
 ## Upgrading
 
@@ -66,7 +68,7 @@ Notes that depend on the release being left:
 - A release that adds a CRD status field (`status.provisioningGeneration`, `status.k6Nodes[].managementAddress`) is the reason the order matters. An Environment that was `Ready` before the field existed gets its value on its next provisioning run, that is, after a spec edit.
 - The operator no longer writes the Secret `<env>-provisioned-nodes`; existing ones are garbage-collected with their Environment.
 - The management Prometheus restarts once, at the next provisioning of an Environment after an upgrade that changes its pod spec.
-- A management cluster bootstrapped before v2.5, which still has the SeaweedFS objects of the pre-Helm install (the Service `seaweedfs` and so on), is no longer migrated automatically. Upgrade it through a release that still contains the migration first.
+- A management cluster bootstrapped before SeaweedFS became a Helm release still has the objects of the pre-Helm install. Nothing migrates them any more, and no published release does. Delete them by hand before upgrading (the Service `seaweedfs`, which holds 30900 and 30901, the Deployment `seaweedfs-deployment`, its PVC and its Secret), or the install fails with `provided port is already allocated`.
 
 ## Uninstalling
 
